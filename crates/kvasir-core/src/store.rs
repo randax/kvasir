@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{Connection, params};
@@ -13,13 +14,13 @@ use crate::usage::{
     TokenUsageRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
-const NATIVE_COST_SOURCE: &str = "native";
-const ESTIMATED_COST_SOURCE: &str = "estimated";
-const MIXED_COST_SOURCE: &str = "mixed";
+const NATIVE_COST_SOURCE: i64 = 1;
+const ESTIMATED_COST_SOURCE: i64 = 2;
+const MIXED_COST_SOURCE: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -131,7 +132,6 @@ impl UsageStore {
             &transaction,
             &self.price_table,
             &token_deltas,
-            &[],
         )?;
         transaction.commit()?;
         Ok(())
@@ -145,7 +145,6 @@ impl UsageStore {
             &transaction,
             &self.price_table,
             &token_deltas,
-            &records.cost_usage,
         )?;
         Self::ingest_cost_usage_in_transaction(&transaction, &records.cost_usage)?;
         transaction.commit()?;
@@ -255,7 +254,7 @@ impl UsageStore {
                 SUM(cost_usd_nanos) AS cost_usd_nanos,
                 CASE
                     WHEN MIN(cost_source) = MAX(cost_source) THEN MIN(cost_source)
-                    ELSE 'mixed'
+                    ELSE ?6
                 END AS cost_source
              FROM canonical_cost_usage
              WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
@@ -272,6 +271,7 @@ impl UsageStore {
                 repo_name_filter,
                 repo_path_filter,
                 repo_bucket_filter,
+                MIXED_COST_SOURCE,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -311,15 +311,12 @@ impl UsageStore {
         }
 
         let transaction = self.connection.transaction()?;
-        if schema_version < CURRENT_SCHEMA_VERSION {
-            transaction.execute_batch(
-                "DROP TABLE IF EXISTS canonical_token_usage;
-                DROP TABLE IF EXISTS canonical_cost_usage;
-                DROP TABLE IF EXISTS cumulative_counter_snapshots;
-                DROP TABLE IF EXISTS cost_counter_snapshots;
-                DROP TABLE IF EXISTS token_rollups;
-                DROP TABLE IF EXISTS cost_rollups;",
-            )?;
+        match schema_version {
+            CURRENT_SCHEMA_VERSION => {}
+            3 => migrate_v3_to_v4(&transaction)?,
+            2 => migrate_v2_to_v4(&transaction)?,
+            _ if schema_version < 2 => drop_incompatible_usage_tables(&transaction)?,
+            _ => {}
         }
 
         transaction.execute_batch(
@@ -350,14 +347,14 @@ impl UsageStore {
             CREATE TABLE IF NOT EXISTS canonical_cost_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_at_ms INTEGER NOT NULL,
-                counter_start_ms INTEGER NOT NULL,
+                counter_start_ms INTEGER,
                 day TEXT NOT NULL,
                 repo_bucket TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
                 model TEXT NOT NULL,
                 cost_usd_nanos INTEGER NOT NULL,
-                cost_source TEXT NOT NULL,
+                cost_source INTEGER NOT NULL,
                 estimated_token_count INTEGER,
                 estimated_token_price_nanos INTEGER
             );
@@ -395,6 +392,19 @@ impl UsageStore {
                 estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
             );",
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_cost_usage_native_lookup
+             ON canonical_cost_usage (
+                repo_bucket,
+                repo_name,
+                repo_path,
+                model,
+                counter_start_ms,
+                cost_source,
+                occurred_at_ms
+             )",
+            [],
         )?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -530,7 +540,7 @@ impl UsageStore {
                 AND repo_name = ?2
                 AND repo_path = ?3
                 AND model = ?4
-                AND counter_start_ms = ?5
+                AND (counter_start_ms = ?5 OR counter_start_ms IS NULL)
                 AND occurred_at_ms <= ?6
                 AND cost_source = ?7
              GROUP BY day, repo_bucket, repo_name, repo_path, model",
@@ -586,7 +596,7 @@ impl UsageStore {
                 AND repo_name = ?2
                 AND repo_path = ?3
                 AND model = ?4
-                AND counter_start_ms = ?5
+                AND (counter_start_ms = ?5 OR counter_start_ms IS NULL)
                 AND occurred_at_ms <= ?6
                 AND cost_source = ?7",
             params![
@@ -606,12 +616,10 @@ impl UsageStore {
         transaction: &rusqlite::Transaction<'_>,
         price_table: &PriceTable,
         token_deltas: &[TokenUsageDelta],
-        native_cost_records: &[CostUsageRecord],
     ) -> Result<(), StoreError> {
+        let native_cost_coverage = NativeCostCoverage::load(transaction, token_deltas)?;
         for delta in token_deltas {
-            if has_matching_native_cost(native_cost_records, delta)
-                || Self::has_stored_native_cost(transaction, delta)?
-            {
+            if native_cost_coverage.covers(delta) {
                 continue;
             }
             let Some(model_prices) = price_table.price_for(&delta.model) else {
@@ -660,35 +668,6 @@ impl UsageStore {
             )?;
         }
         Ok(())
-    }
-
-    fn has_stored_native_cost(
-        transaction: &rusqlite::Transaction<'_>,
-        token_delta: &TokenUsageDelta,
-    ) -> Result<bool, StoreError> {
-        let stored_repo = StoredRepo::from_bucket(&token_delta.repo);
-        let native_count: i64 = transaction.query_row(
-            "SELECT COUNT(*)
-             FROM canonical_cost_usage
-             WHERE repo_bucket = ?1
-                AND repo_name = ?2
-                AND repo_path = ?3
-                AND model = ?4
-                AND counter_start_ms = ?5
-                AND occurred_at_ms >= ?6
-                AND cost_source = ?7",
-            params![
-                stored_repo.bucket,
-                stored_repo.name,
-                stored_repo.path,
-                token_delta.model.as_str(),
-                token_delta.counter_start.value(),
-                token_delta.occurred_at.value(),
-                NATIVE_COST_SOURCE,
-            ],
-            |row| row.get(0),
-        )?;
-        Ok(native_count > 0)
     }
 
     fn counter_delta(
@@ -814,6 +793,109 @@ impl UsageStore {
     }
 }
 
+fn drop_incompatible_usage_tables(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS canonical_token_usage;
+        DROP TABLE IF EXISTS canonical_cost_usage;
+        DROP TABLE IF EXISTS cumulative_counter_snapshots;
+        DROP TABLE IF EXISTS cost_counter_snapshots;
+        DROP TABLE IF EXISTS token_rollups;
+        DROP TABLE IF EXISTS cost_rollups;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v2_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "ALTER TABLE canonical_cost_usage ADD COLUMN counter_start_ms INTEGER;
+        ALTER TABLE canonical_cost_usage ADD COLUMN cost_source INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE canonical_cost_usage ADD COLUMN estimated_token_count INTEGER;
+        ALTER TABLE canonical_cost_usage ADD COLUMN estimated_token_price_nanos INTEGER;
+        ALTER TABLE cost_rollups ADD COLUMN native_cost_usd_nanos INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE cost_rollups ADD COLUMN estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0;
+        UPDATE cost_rollups SET native_cost_usd_nanos = cost_usd_nanos;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if cost_source_column_type(transaction)? != Some("TEXT".to_owned()) {
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        "ALTER TABLE canonical_cost_usage RENAME TO canonical_cost_usage_v3_text_source;
+
+        CREATE TABLE canonical_cost_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at_ms INTEGER NOT NULL,
+            counter_start_ms INTEGER,
+            day TEXT NOT NULL,
+            repo_bucket TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            model TEXT NOT NULL,
+            cost_usd_nanos INTEGER NOT NULL,
+            cost_source INTEGER NOT NULL,
+            estimated_token_count INTEGER,
+            estimated_token_price_nanos INTEGER
+        );
+
+        INSERT INTO canonical_cost_usage (
+            id,
+            occurred_at_ms,
+            counter_start_ms,
+            day,
+            repo_bucket,
+            repo_name,
+            repo_path,
+            model,
+            cost_usd_nanos,
+            cost_source,
+            estimated_token_count,
+            estimated_token_price_nanos
+        )
+        SELECT
+            id,
+            occurred_at_ms,
+            counter_start_ms,
+            day,
+            repo_bucket,
+            repo_name,
+            repo_path,
+            model,
+            cost_usd_nanos,
+            CASE cost_source
+                WHEN 'native' THEN 1
+                WHEN 'estimated' THEN 2
+                WHEN 'mixed' THEN 3
+            END,
+            estimated_token_count,
+            estimated_token_price_nanos
+        FROM canonical_cost_usage_v3_text_source
+        WHERE cost_source IN ('native', 'estimated', 'mixed');
+
+        DROP TABLE canonical_cost_usage_v3_text_source;",
+    )?;
+    Ok(())
+}
+
+fn cost_source_column_type(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<Option<String>, StoreError> {
+    let mut statement = transaction.prepare("PRAGMA table_info(canonical_cost_usage)")?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns
+        .into_iter()
+        .find_map(|(name, column_type)| (name == "cost_source").then_some(column_type)))
+}
+
 fn apply_database_key(connection: &Connection, key: &StoreKey) -> Result<(), StoreError> {
     let raw_key = key.sqlcipher_raw_key();
     let sql = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", raw_key.as_str()));
@@ -853,6 +935,19 @@ struct TokenUsageDelta {
     token_count: TokenCount,
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct NativeCostKey {
+    repo_bucket: &'static str,
+    repo_name: String,
+    repo_path: String,
+    model: String,
+    counter_start_ms: i64,
+}
+
+struct NativeCostCoverage {
+    latest_occurred_at_by_key: HashMap<NativeCostKey, i64>,
+}
+
 struct EstimatedCostRollup {
     day: String,
     repo_bucket: String,
@@ -860,6 +955,72 @@ struct EstimatedCostRollup {
     repo_path: String,
     model: String,
     cost_usd_nanos: i64,
+}
+
+impl NativeCostCoverage {
+    fn load(
+        transaction: &rusqlite::Transaction<'_>,
+        token_deltas: &[TokenUsageDelta],
+    ) -> Result<Self, StoreError> {
+        let mut keys = HashSet::new();
+        for delta in token_deltas {
+            keys.insert(NativeCostKey::from_delta(delta));
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT MAX(occurred_at_ms)
+             FROM canonical_cost_usage
+             WHERE repo_bucket = ?1
+                AND repo_name = ?2
+                AND repo_path = ?3
+                AND model = ?4
+                AND (counter_start_ms = ?5 OR counter_start_ms IS NULL)
+                AND cost_source = ?6",
+        )?;
+        let mut latest_occurred_at_by_key = HashMap::new();
+        for key in keys {
+            let latest_occurred_at_ms = statement.query_row(
+                params![
+                    key.repo_bucket,
+                    key.repo_name.as_str(),
+                    key.repo_path.as_str(),
+                    key.model.as_str(),
+                    key.counter_start_ms,
+                    NATIVE_COST_SOURCE,
+                ],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+            if let Some(latest_occurred_at_ms) = latest_occurred_at_ms {
+                latest_occurred_at_by_key.insert(key, latest_occurred_at_ms);
+            }
+        }
+
+        Ok(Self {
+            latest_occurred_at_by_key,
+        })
+    }
+
+    fn covers(&self, token_delta: &TokenUsageDelta) -> bool {
+        let key = NativeCostKey::from_delta(token_delta);
+        self.latest_occurred_at_by_key
+            .get(&key)
+            .is_some_and(|latest_occurred_at_ms| {
+                *latest_occurred_at_ms >= token_delta.occurred_at.value()
+            })
+    }
+}
+
+impl NativeCostKey {
+    fn from_delta(delta: &TokenUsageDelta) -> Self {
+        let stored_repo = StoredRepo::from_bucket(&delta.repo);
+        Self {
+            repo_bucket: stored_repo.bucket,
+            repo_name: stored_repo.name.to_owned(),
+            repo_path: stored_repo.path.to_owned(),
+            model: delta.model.as_str().to_owned(),
+            counter_start_ms: delta.counter_start.value(),
+        }
+    }
 }
 
 impl<'a> StoredRepo<'a> {
@@ -927,29 +1088,17 @@ fn cost_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<crate:
 }
 
 fn cost_source_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<CostSource> {
-    let value = row.get::<_, String>(index)?;
-    match value.as_str() {
+    let value = row.get::<_, i64>(index)?;
+    match value {
         NATIVE_COST_SOURCE => Ok(CostSource::Native),
         ESTIMATED_COST_SOURCE => Ok(CostSource::Estimated),
         MIXED_COST_SOURCE => Ok(CostSource::Mixed),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             index,
-            rusqlite::types::Type::Text,
+            rusqlite::types::Type::Integer,
             "cost source must be native, estimated, or mixed".into(),
         )),
     }
-}
-
-fn has_matching_native_cost(
-    native_cost_records: &[CostUsageRecord],
-    token_delta: &TokenUsageDelta,
-) -> bool {
-    native_cost_records.iter().any(|record| {
-        record.repo == token_delta.repo
-            && record.model == token_delta.model
-            && record.counter_start == token_delta.counter_start
-            && record.occurred_at >= token_delta.occurred_at
-    })
 }
 
 #[cfg(test)]
@@ -1489,8 +1638,8 @@ mod tests {
         let (token_count, token_price): (i64, i64) = connection.query_row(
             "SELECT estimated_token_count, estimated_token_price_nanos
              FROM canonical_cost_usage
-             WHERE cost_source = 'estimated'",
-            [],
+             WHERE cost_source = ?1",
+            params![ESTIMATED_COST_SOURCE],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!((token_count, token_price), (1_000, 3_000));
@@ -1695,6 +1844,56 @@ mod tests {
     }
 
     #[test]
+    fn zero_delta_native_record_does_not_suppress_estimated_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: vec![cost_record_for_repo(
+                kvasir_repo("/not/persisted"),
+                "claude-sonnet-4-20250514",
+                1_781_956_800_000,
+                1_781_956_700_000,
+                "0.2",
+            )],
+        })?;
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Output,
+                1_781_960_400_000,
+                1_781_956_700_000,
+                200,
+            )],
+            cost_usage: vec![cost_record_for_repo(
+                kvasir_repo("/not/persisted"),
+                "claude-sonnet-4-20250514",
+                1_781_960_400_000,
+                1_781_956_700_000,
+                "0.2",
+            )],
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.203"),
+                source: CostSource::Mixed,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn computes_estimated_cost_from_user_supplied_price_table()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -1746,6 +1945,316 @@ mod tests {
                 cost_usd: CostUsd::from_nanos(1_220).unwrap(),
                 source: CostSource::Estimated,
             }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_v2_schema_preserves_usage_and_adds_cost_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE canonical_token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                measure TEXT NOT NULL,
+                token_count INTEGER NOT NULL
+            );
+
+            CREATE TABLE cumulative_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                measure TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, model, measure, counter_start_ms)
+            );
+
+            CREATE TABLE canonical_cost_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                cost_usd_nanos INTEGER NOT NULL
+            );
+
+            CREATE TABLE cost_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, model, counter_start_ms)
+            );
+
+            CREATE TABLE token_rollups (
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
+            );
+
+            CREATE TABLE cost_rollups (
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
+            );
+
+            INSERT INTO canonical_token_usage (
+                occurred_at_ms, day, repo_bucket, repo_name, repo_path, model, measure, token_count
+            ) VALUES (
+                1781956800000, '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                'claude-opus-4-20250514', 'input', 100
+            );
+
+            INSERT INTO token_rollups (
+                day, repo_bucket, repo_name, repo_path, model, input_tokens, output_tokens, cache_tokens
+            ) VALUES (
+                '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                'claude-opus-4-20250514', 100, 0, 0
+            );
+
+            INSERT INTO canonical_cost_usage (
+                occurred_at_ms, day, repo_bucket, repo_name, repo_path, model, cost_usd_nanos
+            ) VALUES (
+                1781956800000, '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                'claude-sonnet-4-20250514', 200000000
+            );
+
+            INSERT INTO cost_rollups (
+                day, repo_bucket, repo_name, repo_path, model, cost_usd_nanos
+            ) VALUES (
+                '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                'claude-sonnet-4-20250514', 200000000
+            );
+
+            PRAGMA user_version = 2;",
+        )?;
+        drop(connection);
+
+        let mut store = open_test_store(&database_path)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.2"),
+                source: CostSource::Native,
+            }]
+        );
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![usage_record(
+            "claude-sonnet-4-20250514",
+            TokenMeasure::Output,
+            1_781_956_750_000,
+            1_781_956_700_000,
+            200,
+        )]))?;
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.2"),
+                source: CostSource::Native,
+            }]
+        );
+        drop(store);
+
+        let connection = open_raw_test_connection(database_path)?;
+        let (counter_start, source): (Option<i64>, i64) = connection.query_row(
+            "SELECT counter_start_ms, cost_source FROM canonical_cost_usage",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let native_rollup: i64 = connection.query_row(
+            "SELECT native_cost_usd_nanos FROM cost_rollups",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(counter_start, None);
+        assert_eq!(source, NATIVE_COST_SOURCE);
+        assert_eq!(native_rollup, 200_000_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_v3_schema_converts_text_cost_sources_to_typed_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE canonical_token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                measure TEXT NOT NULL,
+                token_count INTEGER NOT NULL
+            );
+
+            CREATE TABLE cumulative_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                measure TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, model, measure, counter_start_ms)
+            );
+
+            CREATE TABLE canonical_cost_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_ms INTEGER NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                cost_usd_nanos INTEGER NOT NULL,
+                cost_source TEXT NOT NULL,
+                estimated_token_count INTEGER,
+                estimated_token_price_nanos INTEGER
+            );
+
+            CREATE TABLE cost_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, model, counter_start_ms)
+            );
+
+            CREATE TABLE token_rollups (
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
+            );
+
+            CREATE TABLE cost_rollups (
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                native_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
+            );
+
+            INSERT INTO canonical_cost_usage (
+                occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, model,
+                cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos
+            ) VALUES
+                (
+                    1781956800000, 1781956700000, '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                    'claude-sonnet-4-20250514', 200000000, 'native', NULL, NULL
+                ),
+                (
+                    1781956900000, 1781956700000, '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                    'claude-sonnet-4-20250514', 3000000, 'estimated', 200, 15000
+                );
+
+            INSERT INTO cost_rollups (
+                day, repo_bucket, repo_name, repo_path, model, native_cost_usd_nanos, estimated_cost_usd_nanos
+            ) VALUES (
+                '2026-06-20', 'repo', 'kvasir', '/not/persisted',
+                'claude-sonnet-4-20250514', 200000000, 3000000
+            );
+
+            PRAGMA user_version = 3;",
+        )?;
+        drop(connection);
+
+        let store = open_test_store(&database_path)?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.203"),
+                source: CostSource::Mixed,
+            }]
+        );
+        drop(store);
+
+        let connection = open_raw_test_connection(database_path)?;
+        let cost_sources = connection
+            .prepare("SELECT cost_source FROM canonical_cost_usage ORDER BY cost_source")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            cost_sources,
+            vec![NATIVE_COST_SOURCE, ESTIMATED_COST_SOURCE]
         );
 
         Ok(())
@@ -1824,7 +2333,7 @@ mod tests {
         connection.execute_batch(
             "CREATE TABLE keep_me (value TEXT NOT NULL);
             INSERT INTO keep_me (value) VALUES ('still here');
-            PRAGMA user_version = 4;",
+            PRAGMA user_version = 5;",
         )?;
         drop(connection);
 
@@ -1833,7 +2342,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(StoreError::IncompatibleSchema {
-                found: 4,
+                found: 5,
                 supported: CURRENT_SCHEMA_VERSION,
             })
         ));
