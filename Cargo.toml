@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/kvasir-core", "crates/kvasird"]
+members = [
+    "crates/kvasir-client",
+    "crates/kvasir-core",
+    "crates/kvasir-uniffi-bindgen",
+    "crates/kvasird",
+]
 resolver = "3"
 
 [workspace.package]
@@ -25,4 +30,5 @@ tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tower = "0.5.2"
+uniffi = "0.31.2"
 zeroize = { version = "1.9.0", features = ["derive"] }

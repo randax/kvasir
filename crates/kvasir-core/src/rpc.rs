@@ -33,6 +33,10 @@ impl ModelName {
 pub struct TimestampMillis(i64);
 
 impl TimestampMillis {
+    pub fn from_millis(value: i64) -> Self {
+        Self(value)
+    }
+
     pub fn from_datetime(value: DateTime<Utc>) -> Self {
         Self(value.timestamp_millis())
     }
@@ -151,6 +155,7 @@ pub struct CostRollup {
 pub enum RpcRequest {
     TokenRollup { query: RollupQuery },
     CostRollup { query: CostRollupQuery },
+    SubscribeTokenRollup { query: RollupQuery },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,10 +167,18 @@ pub enum RpcResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum RpcStreamEvent {
+    TokenRollup { rollups: Vec<TokenRollup> },
+    Error { error: RpcError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RpcError {
     InvalidRequest,
     Internal,
+    ResponseTooLarge,
 }
 
 #[cfg(test)]
@@ -219,6 +232,58 @@ mod tests {
                         "repo": { "kind": "no_repo" },
                         "model": "claude-opus-4-20250514",
                         "cost_usd": { "nanos": 100000000u64 }
+                    }]
+                }
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscription_rpc_contract_serializes_typed_query_and_stream_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        )
+        .with_repo(RepoBucket::no_repo());
+
+        assert_eq!(
+            serde_json::to_value(RpcRequest::SubscribeTokenRollup { query })?,
+            json!({
+                "type": "subscribe_token_rollup",
+                "payload": {
+                    "query": {
+                        "start": 1781956000000i64,
+                        "end": 1781970000000i64,
+                        "repo": { "kind": "no_repo" }
+                    }
+                }
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RpcStreamEvent::TokenRollup {
+                rollups: vec![TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: RepoBucket::no_repo(),
+                    model: ModelName::new("claude-opus-4-20250514"),
+                    input_tokens: 1100,
+                    output_tokens: 500,
+                    cache_tokens: 100,
+                }],
+            })?,
+            json!({
+                "type": "token_rollup",
+                "payload": {
+                    "rollups": [{
+                        "day": "2026-06-20",
+                        "repo": { "kind": "no_repo" },
+                        "model": "claude-opus-4-20250514",
+                        "input_tokens": 1100u64,
+                        "output_tokens": 500u64,
+                        "cache_tokens": 100u64
                     }]
                 }
             })

@@ -1,13 +1,14 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 
 use base64::Engine;
 use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
-    BearerToken, CostRollup, CostRollupQuery, ModelName, RollupDay, RollupQuery, TimestampMillis,
-    TokenRollup,
+    BearerToken, CostRollup, CostRollupQuery, ModelName, RollupDay, RollupQuery, RpcRequest,
+    RpcStreamEvent, TimestampMillis, TokenRollup,
 };
 use kvasir_core::{CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath};
 use kvasird::{
@@ -15,6 +16,7 @@ use kvasird::{
     start_with_store_key_source,
 };
 use tempfile::tempdir;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
 async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::Result<()> {
@@ -530,6 +532,84 @@ async fn rpc_client_rejects_oversized_responses() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn rpc_subscription_closes_when_extra_input_arrives_after_subscribe_request()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+    })
+    .await?;
+
+    let mut stream = tokio::net::UnixStream::connect(rpc_socket_path).await?;
+    let request = RpcRequest::SubscribeTokenRollup {
+        query: RollupQuery::new(
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        ),
+    };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    request_bytes.extend_from_slice(b"unexpected-client-input");
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = Vec::new();
+    reader.read_until(b'\n', &mut response).await?;
+    assert_eq!(
+        serde_json::from_slice::<RpcStreamEvent>(&response)?,
+        RpcStreamEvent::TokenRollup {
+            rollups: Vec::new()
+        }
+    );
+
+    let mut eof = [0_u8; 1];
+    let bytes_read = tokio::time::timeout(Duration::from_secs(2), reader.read(&mut eof)).await??;
+    assert_eq!(bytes_read, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_returns_bounded_error_for_oversized_rpc_query_response() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(many_model_token_usage_fixture(700))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let err = query_token_rollup(
+        rpc_socket_path,
+        RollupQuery::new(
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        ),
+    )
+    .await
+    .expect_err("oversized query response should return a bounded rpc error");
+
+    assert!(err.to_string().contains("ResponseTooLarge"));
+
+    Ok(())
+}
+
 fn claude_token_usage_protobuf_fixture() -> anyhow::Result<Vec<u8>> {
     let encoded = include_str!("fixtures/claude_token_usage_otlp.pb.base64").trim();
     Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
@@ -697,4 +777,45 @@ fn native_cost_usage_fixture() -> &'static str {
             }
         ]
     }"#
+}
+
+fn many_model_token_usage_fixture(model_count: usize) -> String {
+    let mut data_points = String::new();
+    for index in 0..model_count {
+        if index > 0 {
+            data_points.push(',');
+        }
+        data_points.push_str(&format!(
+            r#"{{
+                "startTimeUnixNano": "1781956700000000000",
+                "timeUnixNano": "1781956800000000000",
+                "asInt": "1",
+                "attributes": [
+                    {{ "key": "model", "value": {{ "stringValue": "model-{index:04}" }} }},
+                    {{ "key": "token.type", "value": {{ "stringValue": "input" }} }}
+                ]
+            }}"#
+        ));
+    }
+
+    format!(
+        r#"{{
+            "resourceMetrics": [{{
+                "resource": {{
+                    "attributes": [
+                        {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                        {{ "key": "repo.path", "value": {{ "stringValue": "/Users/oyr/projects/kvasir" }} }}
+                    ]
+                }},
+                "scopeMetrics": [{{
+                    "metrics": [{{
+                        "name": "token.usage",
+                        "sum": {{
+                            "dataPoints": [{data_points}]
+                        }}
+                    }}]
+                }}]
+            }}]
+        }}"#
+    )
 }
