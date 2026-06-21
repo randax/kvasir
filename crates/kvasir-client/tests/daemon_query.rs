@@ -9,6 +9,7 @@ use kvasir_client::{
     KvasirRollupQuery, KvasirSocketPath, KvasirTimestampMillis, KvasirTokenRollup,
     KvasirTokenRollupUpdate,
 };
+use kvasir_core::PriceTable;
 use kvasir_core::rpc::BearerToken;
 use kvasird::{DaemonConfig, StoreKeySource, start_with_store_key_source};
 use tempfile::tempdir;
@@ -23,6 +24,7 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
             rpc_socket_path: rpc_socket_path.clone(),
             database_path: temp.path().join("usage.sqlite3"),
             bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -105,6 +107,7 @@ async fn client_subscription_delivers_live_token_rollup_updates() -> anyhow::Res
             rpc_socket_path: rpc_socket_path.clone(),
             database_path: temp.path().join("usage.sqlite3"),
             bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -227,6 +230,7 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
             rpc_socket_path: rpc_socket_path.clone(),
             database_path: temp.path().join("usage.sqlite3"),
             bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -309,6 +313,7 @@ async fn client_connect_retries_until_daemon_socket_is_available() -> anyhow::Re
             rpc_socket_path,
             database_path: temp.path().join("usage.sqlite3"),
             bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -329,6 +334,7 @@ async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyho
             rpc_socket_path: rpc_socket_path.clone(),
             database_path: temp.path().join("usage.sqlite3"),
             bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )

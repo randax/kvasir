@@ -3,16 +3,23 @@ use std::path::Path;
 use rusqlite::{Connection, params};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::rpc::{CostRollup, CostRollupQuery, ModelName, RollupDay, RollupQuery, TokenRollup};
+use crate::pricing::PriceTable;
+use crate::rpc::{
+    CostRollup, CostRollupQuery, CostSource, ModelName, RollupDay, RollupQuery, TimestampMillis,
+    TokenRollup,
+};
 use crate::usage::{
-    CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenMeasure, TokenUsageRecord,
-    UsageRecords,
+    CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure,
+    TokenUsageRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
+const NATIVE_COST_SOURCE: &str = "native";
+const ESTIMATED_COST_SOURCE: &str = "estimated";
+const MIXED_COST_SOURCE: &str = "mixed";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -34,6 +41,7 @@ pub enum StoreKeyError {
 
 pub struct UsageStore {
     connection: Connection,
+    price_table: PriceTable,
 }
 
 #[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
@@ -93,21 +101,52 @@ impl UsageStore {
     pub fn open(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         apply_database_key(&connection, key)?;
-        let mut store = Self { connection };
+        let mut store = Self {
+            connection,
+            price_table: PriceTable::bundled_defaults(),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn open_with_price_table(
+        path: impl AsRef<Path>,
+        key: &StoreKey,
+        price_table: PriceTable,
+    ) -> Result<Self, StoreError> {
+        let connection = Connection::open(path)?;
+        apply_database_key(&connection, key)?;
+        let mut store = Self {
+            connection,
+            price_table,
+        };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn ingest_token_usage(&mut self, records: &[TokenUsageRecord]) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
-        Self::ingest_token_usage_in_transaction(&transaction, records)?;
+        let token_deltas = Self::ingest_token_usage_in_transaction(&transaction, records)?;
+        Self::ingest_estimated_cost_usage_in_transaction(
+            &transaction,
+            &self.price_table,
+            &token_deltas,
+            &[],
+        )?;
         transaction.commit()?;
         Ok(())
     }
 
     pub fn ingest_usage(&mut self, records: &UsageRecords) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
-        Self::ingest_token_usage_in_transaction(&transaction, &records.token_usage)?;
+        let token_deltas =
+            Self::ingest_token_usage_in_transaction(&transaction, &records.token_usage)?;
+        Self::ingest_estimated_cost_usage_in_transaction(
+            &transaction,
+            &self.price_table,
+            &token_deltas,
+            &records.cost_usage,
+        )?;
         Self::ingest_cost_usage_in_transaction(&transaction, &records.cost_usage)?;
         transaction.commit()?;
         Ok(())
@@ -213,7 +252,11 @@ impl UsageStore {
                 repo_name,
                 repo_path,
                 model,
-                SUM(cost_usd_nanos) AS cost_usd_nanos
+                SUM(cost_usd_nanos) AS cost_usd_nanos,
+                CASE
+                    WHEN MIN(cost_source) = MAX(cost_source) THEN MIN(cost_source)
+                    ELSE 'mixed'
+                END AS cost_source
              FROM canonical_cost_usage
              WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
                 AND (?3 IS NULL OR repo_name = ?3)
@@ -247,6 +290,7 @@ impl UsageStore {
                     repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
                     model: ModelName::new(model),
                     cost_usd: cost_column(row, 5)?,
+                    source: cost_source_column(row, 6)?,
                 })
             },
         )?;
@@ -306,12 +350,16 @@ impl UsageStore {
             CREATE TABLE IF NOT EXISTS canonical_cost_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_at_ms INTEGER NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
                 day TEXT NOT NULL,
                 repo_bucket TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
                 model TEXT NOT NULL,
-                cost_usd_nanos INTEGER NOT NULL
+                cost_usd_nanos INTEGER NOT NULL,
+                cost_source TEXT NOT NULL,
+                estimated_token_count INTEGER,
+                estimated_token_price_nanos INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS cost_counter_snapshots (
@@ -343,7 +391,8 @@ impl UsageStore {
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
                 model TEXT NOT NULL,
-                cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                native_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
             );",
         )?;
@@ -355,7 +404,8 @@ impl UsageStore {
     fn ingest_token_usage_in_transaction(
         transaction: &rusqlite::Transaction<'_>,
         records: &[TokenUsageRecord],
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<TokenUsageDelta>, StoreError> {
+        let mut token_deltas = Vec::new();
         for record in records {
             let Some(delta) = Self::counter_delta(transaction, record)? else {
                 continue;
@@ -402,8 +452,16 @@ impl UsageStore {
                     cache_tokens
                 ],
             )?;
+            token_deltas.push(TokenUsageDelta {
+                occurred_at: record.occurred_at,
+                counter_start: record.counter_start,
+                repo: record.repo.clone(),
+                model: record.model.clone(),
+                measure: record.measure,
+                token_count: TokenCount::new(u64::try_from(delta).expect("delta is positive")),
+            });
         }
-        Ok(())
+        Ok(token_deltas)
     }
 
     fn ingest_cost_usage_in_transaction(
@@ -414,29 +472,33 @@ impl UsageStore {
             let Some(delta) = Self::cost_counter_delta(transaction, record)? else {
                 continue;
             };
+            Self::remove_estimated_cost_for_native_record(transaction, record)?;
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
             transaction.execute(
                 "INSERT INTO canonical_cost_usage (
-                    occurred_at_ms, day, repo_bucket, repo_name, repo_path, model, cost_usd_nanos
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, model,
+                    cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
                 params![
                     record.occurred_at.value(),
+                    record.counter_start.value(),
                     day,
                     stored_repo.bucket,
                     stored_repo.name,
                     stored_repo.path,
                     record.model.as_str(),
                     delta,
+                    NATIVE_COST_SOURCE,
                 ],
             )?;
 
             transaction.execute(
                 "INSERT INTO cost_rollups (
-                    day, repo_bucket, repo_name, repo_path, model, cost_usd_nanos
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    day, repo_bucket, repo_name, repo_path, model, native_cost_usd_nanos, estimated_cost_usd_nanos
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
                 ON CONFLICT(day, repo_bucket, repo_name, repo_path, model) DO UPDATE SET
-                    cost_usd_nanos = cost_usd_nanos + excluded.cost_usd_nanos",
+                    native_cost_usd_nanos = native_cost_usd_nanos + excluded.native_cost_usd_nanos",
                 params![
                     day,
                     stored_repo.bucket,
@@ -448,6 +510,185 @@ impl UsageStore {
             )?;
         }
         Ok(())
+    }
+
+    fn remove_estimated_cost_for_native_record(
+        transaction: &rusqlite::Transaction<'_>,
+        record: &CostUsageRecord,
+    ) -> Result<(), StoreError> {
+        let stored_repo = StoredRepo::from_bucket(&record.repo);
+        let mut statement = transaction.prepare(
+            "SELECT
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                model,
+                SUM(cost_usd_nanos) AS cost_usd_nanos
+             FROM canonical_cost_usage
+             WHERE repo_bucket = ?1
+                AND repo_name = ?2
+                AND repo_path = ?3
+                AND model = ?4
+                AND counter_start_ms = ?5
+                AND occurred_at_ms <= ?6
+                AND cost_source = ?7
+             GROUP BY day, repo_bucket, repo_name, repo_path, model",
+        )?;
+        let estimated_rollups = statement
+            .query_map(
+                params![
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    record.model.as_str(),
+                    record.counter_start.value(),
+                    record.occurred_at.value(),
+                    ESTIMATED_COST_SOURCE,
+                ],
+                |row| {
+                    Ok(EstimatedCostRollup {
+                        day: row.get(0)?,
+                        repo_bucket: row.get(1)?,
+                        repo_name: row.get(2)?,
+                        repo_path: row.get(3)?,
+                        model: row.get(4)?,
+                        cost_usd_nanos: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        for rollup in estimated_rollups {
+            transaction.execute(
+                "UPDATE cost_rollups
+                 SET estimated_cost_usd_nanos = estimated_cost_usd_nanos - ?1
+                 WHERE day = ?2
+                    AND repo_bucket = ?3
+                    AND repo_name = ?4
+                    AND repo_path = ?5
+                    AND model = ?6",
+                params![
+                    rollup.cost_usd_nanos,
+                    rollup.day,
+                    rollup.repo_bucket,
+                    rollup.repo_name,
+                    rollup.repo_path,
+                    rollup.model,
+                ],
+            )?;
+        }
+
+        transaction.execute(
+            "DELETE FROM canonical_cost_usage
+             WHERE repo_bucket = ?1
+                AND repo_name = ?2
+                AND repo_path = ?3
+                AND model = ?4
+                AND counter_start_ms = ?5
+                AND occurred_at_ms <= ?6
+                AND cost_source = ?7",
+            params![
+                stored_repo.bucket,
+                stored_repo.name,
+                stored_repo.path,
+                record.model.as_str(),
+                record.counter_start.value(),
+                record.occurred_at.value(),
+                ESTIMATED_COST_SOURCE,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn ingest_estimated_cost_usage_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        price_table: &PriceTable,
+        token_deltas: &[TokenUsageDelta],
+        native_cost_records: &[CostUsageRecord],
+    ) -> Result<(), StoreError> {
+        for delta in token_deltas {
+            if has_matching_native_cost(native_cost_records, delta)
+                || Self::has_stored_native_cost(transaction, delta)?
+            {
+                continue;
+            }
+            let Some(model_prices) = price_table.price_for(&delta.model) else {
+                continue;
+            };
+            let token_price = model_prices.price_for_measure(delta.measure);
+            let Some(cost) = token_price.checked_mul(delta.token_count.value()) else {
+                continue;
+            };
+            let day = delta.occurred_at.day().as_date().to_string();
+            let stored_repo = StoredRepo::from_bucket(&delta.repo);
+            transaction.execute(
+                "INSERT INTO canonical_cost_usage (
+                    occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, model,
+                    cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    delta.occurred_at.value(),
+                    delta.counter_start.value(),
+                    day,
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    delta.model.as_str(),
+                    cost.storage_value(),
+                    ESTIMATED_COST_SOURCE,
+                    delta.token_count.storage_value(),
+                    token_price.storage_value(),
+                ],
+            )?;
+
+            transaction.execute(
+                "INSERT INTO cost_rollups (
+                    day, repo_bucket, repo_name, repo_path, model, native_cost_usd_nanos, estimated_cost_usd_nanos
+                ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                ON CONFLICT(day, repo_bucket, repo_name, repo_path, model) DO UPDATE SET
+                    estimated_cost_usd_nanos = estimated_cost_usd_nanos + excluded.estimated_cost_usd_nanos",
+                params![
+                    day,
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    delta.model.as_str(),
+                    cost.storage_value(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn has_stored_native_cost(
+        transaction: &rusqlite::Transaction<'_>,
+        token_delta: &TokenUsageDelta,
+    ) -> Result<bool, StoreError> {
+        let stored_repo = StoredRepo::from_bucket(&token_delta.repo);
+        let native_count: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM canonical_cost_usage
+             WHERE repo_bucket = ?1
+                AND repo_name = ?2
+                AND repo_path = ?3
+                AND model = ?4
+                AND counter_start_ms = ?5
+                AND occurred_at_ms >= ?6
+                AND cost_source = ?7",
+            params![
+                stored_repo.bucket,
+                stored_repo.name,
+                stored_repo.path,
+                token_delta.model.as_str(),
+                token_delta.counter_start.value(),
+                token_delta.occurred_at.value(),
+                NATIVE_COST_SOURCE,
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(native_count > 0)
     }
 
     fn counter_delta(
@@ -603,6 +844,24 @@ struct StoredRepo<'a> {
     path: &'a str,
 }
 
+struct TokenUsageDelta {
+    occurred_at: TimestampMillis,
+    counter_start: TimestampMillis,
+    repo: RepoBucket,
+    model: ModelName,
+    measure: TokenMeasure,
+    token_count: TokenCount,
+}
+
+struct EstimatedCostRollup {
+    day: String,
+    repo_bucket: String,
+    repo_name: String,
+    repo_path: String,
+    model: String,
+    cost_usd_nanos: i64,
+}
+
 impl<'a> StoredRepo<'a> {
     fn from_bucket(repo: &'a RepoBucket) -> Self {
         match repo {
@@ -667,11 +926,38 @@ fn cost_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<crate:
     })
 }
 
+fn cost_source_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<CostSource> {
+    let value = row.get::<_, String>(index)?;
+    match value.as_str() {
+        NATIVE_COST_SOURCE => Ok(CostSource::Native),
+        ESTIMATED_COST_SOURCE => Ok(CostSource::Estimated),
+        MIXED_COST_SOURCE => Ok(CostSource::Mixed),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            "cost source must be native, estimated, or mixed".into(),
+        )),
+    }
+}
+
+fn has_matching_native_cost(
+    native_cost_records: &[CostUsageRecord],
+    token_delta: &TokenUsageDelta,
+) -> bool {
+    native_cost_records.iter().any(|record| {
+        record.repo == token_delta.repo
+            && record.model == token_delta.model
+            && record.counter_start == token_delta.counter_start
+            && record.occurred_at >= token_delta.occurred_at
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::pricing::ModelTokenPrices;
     use crate::rpc::TimestampMillis;
     use crate::usage::{CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount};
 
@@ -1067,24 +1353,28 @@ mod tests {
                     repo: other_kvasir.clone(),
                     model: ModelName::new("claude-opus-4-20250514"),
                     cost_usd: cost_usd("0.375"),
+                    source: CostSource::Native,
                 },
                 CostRollup {
                     day: RollupDay::parse("2026-06-20")?,
                     repo: kvasir.clone(),
                     model: ModelName::new("claude-opus-4-20250514"),
                     cost_usd: cost_usd("1.5"),
+                    source: CostSource::Native,
                 },
                 CostRollup {
                     day: RollupDay::parse("2026-06-20")?,
                     repo: kvasir.clone(),
                     model: ModelName::new("claude-sonnet-4-20250514"),
                     cost_usd: cost_usd("0.2"),
+                    source: CostSource::Native,
                 },
                 CostRollup {
                     day: RollupDay::parse("2026-06-21")?,
                     repo: kvasir.clone(),
                     model: ModelName::new("claude-opus-4-20250514"),
                     cost_usd: cost_usd("0.5"),
+                    source: CostSource::Native,
                 },
             ]
         );
@@ -1097,20 +1387,365 @@ mod tests {
                     repo: kvasir.clone(),
                     model: ModelName::new("claude-opus-4-20250514"),
                     cost_usd: cost_usd("1.5"),
+                    source: CostSource::Native,
                 },
                 CostRollup {
                     day: RollupDay::parse("2026-06-20")?,
                     repo: kvasir.clone(),
                     model: ModelName::new("claude-sonnet-4-20250514"),
                     cost_usd: cost_usd("0.2"),
+                    source: CostSource::Native,
                 },
                 CostRollup {
                     day: RollupDay::parse("2026-06-21")?,
                     repo: kvasir,
                     model: ModelName::new("claude-opus-4-20250514"),
                     cost_usd: cost_usd("0.5"),
+                    source: CostSource::Native,
                 },
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn computes_estimated_cost_from_priced_token_usage() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                1_000,
+            ),
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Output,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                200,
+            ),
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Cache,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                50,
+            ),
+        ]))?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: CostUsd::from_nanos(6_015_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_only_ingest_api_also_computes_estimated_cost() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let mut store = open_test_store(&database_path)?;
+
+        store.ingest_token_usage(&[usage_record(
+            "claude-sonnet-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            1_000,
+        )])?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: CostUsd::from_nanos(3_000_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        drop(store);
+        let connection = open_raw_test_connection(database_path)?;
+        let (token_count, token_price): (i64, i64) = connection.query_row(
+            "SELECT estimated_token_count, estimated_token_price_nanos
+             FROM canonical_cost_usage
+             WHERE cost_source = 'estimated'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((token_count, token_price), (1_000, 3_000));
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_cost_takes_precedence_over_computed_cost_for_the_same_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                1_000,
+            )],
+            cost_usage: vec![cost_record_for_repo(
+                kvasir_repo("/not/persisted"),
+                "claude-sonnet-4-20250514",
+                1_781_956_800_000,
+                1_781_956_700_000,
+                "0.2",
+            )],
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.2"),
+                source: CostSource::Native,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn late_native_cost_replaces_covered_estimated_cost() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                1_000,
+            ),
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Output,
+                1_781_960_400_000,
+                1_781_956_700_000,
+                200,
+            ),
+        ]))?;
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: vec![cost_record_for_repo(
+                kvasir_repo("/not/persisted"),
+                "claude-sonnet-4-20250514",
+                1_781_960_400_000,
+                1_781_956_700_000,
+                "0.2",
+            )],
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.2"),
+                source: CostSource::Native,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn late_native_cost_replaces_estimates_across_days_and_preserves_later_estimates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Input,
+                1_782_039_600_000,
+                1_782_039_000_000,
+                1_000,
+            ),
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Output,
+                1_782_043_200_000,
+                1_782_039_000_000,
+                200,
+            ),
+            usage_record(
+                "claude-sonnet-4-20250514",
+                TokenMeasure::Cache,
+                1_782_046_800_000,
+                1_782_039_000_000,
+                50,
+            ),
+        ]))?;
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: vec![cost_record_for_repo(
+                kvasir_repo("/not/persisted"),
+                "claude-sonnet-4-20250514",
+                1_782_043_200_000,
+                1_782_039_000_000,
+                "0.2",
+            )],
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_782_039_000_000),
+                TimestampMillis::new_for_test(1_782_050_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-21")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: CostUsd::from_nanos(200_015_000).unwrap(),
+                source: CostSource::Mixed,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_cost_does_not_suppress_later_uncovered_estimates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![
+                usage_record(
+                    "claude-sonnet-4-20250514",
+                    TokenMeasure::Input,
+                    1_781_956_800_000,
+                    1_781_956_700_000,
+                    1_000,
+                ),
+                usage_record(
+                    "claude-sonnet-4-20250514",
+                    TokenMeasure::Output,
+                    1_781_960_400_000,
+                    1_781_956_700_000,
+                    200,
+                ),
+            ],
+            cost_usage: vec![cost_record_for_repo(
+                kvasir_repo("/not/persisted"),
+                "claude-sonnet-4-20250514",
+                1_781_956_800_000,
+                1_781_956_700_000,
+                "0.2",
+            )],
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.203"),
+                source: CostSource::Mixed,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn computes_estimated_cost_from_user_supplied_price_table()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let price_table = PriceTable::from_prices(vec![ModelTokenPrices::new(
+            ModelName::new("local-test-model"),
+            CostUsd::from_nanos(10).unwrap(),
+            CostUsd::from_nanos(20).unwrap(),
+            CostUsd::from_nanos(5).unwrap(),
+        )]);
+        let mut store = UsageStore::open_with_price_table(
+            temp.path().join("usage.sqlite3"),
+            &test_store_key(),
+            price_table,
+        )?;
+
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record(
+                "local-test-model",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                100,
+            ),
+            usage_record(
+                "local-test-model",
+                TokenMeasure::Output,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                10,
+            ),
+            usage_record(
+                "local-test-model",
+                TokenMeasure::Cache,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                4,
+            ),
+        ]))?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("local-test-model"),
+                cost_usd: CostUsd::from_nanos(1_220).unwrap(),
+                source: CostSource::Estimated,
+            }]
         );
 
         Ok(())
@@ -1189,7 +1824,7 @@ mod tests {
         connection.execute_batch(
             "CREATE TABLE keep_me (value TEXT NOT NULL);
             INSERT INTO keep_me (value) VALUES ('still here');
-            PRAGMA user_version = 3;",
+            PRAGMA user_version = 4;",
         )?;
         drop(connection);
 
@@ -1198,7 +1833,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(StoreError::IncompatibleSchema {
-                found: 3,
+                found: 4,
                 supported: CURRENT_SCHEMA_VERSION,
             })
         ));

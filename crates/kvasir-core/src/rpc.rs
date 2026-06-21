@@ -148,6 +148,15 @@ pub struct CostRollup {
     pub repo: RepoBucket,
     pub model: ModelName,
     pub cost_usd: CostUsd,
+    pub source: CostSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSource {
+    Native,
+    Estimated,
+    Mixed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +228,7 @@ mod tests {
                 repo: RepoBucket::no_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 cost_usd: CostUsd::from_decimal_str("0.1").unwrap(),
+                source: CostSource::Native,
             }],
         };
 
@@ -231,7 +241,8 @@ mod tests {
                         "day": "2026-06-20",
                         "repo": { "kind": "no_repo" },
                         "model": "claude-opus-4-20250514",
-                        "cost_usd": { "nanos": 100000000u64 }
+                        "cost_usd": { "nanos": 100000000u64 },
+                        "source": "native"
                     }]
                 }
             })

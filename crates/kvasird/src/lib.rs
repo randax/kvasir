@@ -19,7 +19,8 @@ use kvasir_core::rpc::{
     RpcStreamEvent, TokenRollup,
 };
 use kvasir_core::{
-    StoreKey, UsageStore, parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics,
+    PriceTable, StoreKey, UsageStore, parse_otlp_json_usage_metrics,
+    parse_otlp_protobuf_usage_metrics,
 };
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -48,6 +49,24 @@ pub struct DaemonConfig {
     pub rpc_socket_path: PathBuf,
     pub database_path: PathBuf,
     pub bearer_token: BearerToken,
+    pub price_table: PriceTable,
+}
+
+impl DaemonConfig {
+    pub fn new(
+        otlp_bind: SocketAddr,
+        rpc_socket_path: PathBuf,
+        database_path: PathBuf,
+        bearer_token: BearerToken,
+    ) -> Self {
+        Self {
+            otlp_bind,
+            rpc_socket_path,
+            database_path,
+            bearer_token,
+            price_table: PriceTable::bundled_defaults(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -265,7 +284,11 @@ pub async fn start_with_store_key_source(
 ) -> anyhow::Result<RunningDaemon> {
     let _startup_lock = StoreStartupLock::acquire(&config.database_path).await?;
     let store_key = store_key_source.resolve()?;
-    let store = UsageStore::open(&config.database_path, &store_key)?;
+    let store = UsageStore::open_with_price_table(
+        &config.database_path,
+        &store_key,
+        config.price_table.clone(),
+    )?;
     let (usage_updates, _usage_update_receiver) = broadcast::channel(32);
     let (shutdown, _shutdown_receiver) = broadcast::channel(1);
     let state = DaemonState {
