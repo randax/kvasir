@@ -1,0 +1,118 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "claude-code" } },
+          { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+          { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "token.usage",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "asInt": "1000",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781960400000000000",
+                    "asInt": "1100",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "asInt": "500",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "output" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "asInt": "100",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "cache" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781962100000000000",
+                    "timeUnixNano": "1781962200000000000",
+                    "asInt": "300",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781962100000000000",
+                    "timeUnixNano": "1781962200000000000",
+                    "asInt": "120",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "output" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781962100000000000",
+                    "timeUnixNano": "1781962200000000000",
+                    "asInt": "30",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "cache" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1782043100000000000",
+                    "timeUnixNano": "1782043200000000000",
+                    "asInt": "2000",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1782043100000000000",
+                    "timeUnixNano": "1782043200000000000",
+                    "asInt": "800",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "output" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1782043100000000000",
+                    "timeUnixNano": "1782043200000000000",
+                    "asInt": "50",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                      { "key": "token.type", "value": { "stringValue": "cache" } }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
