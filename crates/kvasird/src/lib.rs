@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::net::SocketAddr;
-use std::os::raw::{c_int, c_uint};
+use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -21,7 +21,9 @@ use kvasir_core::rpc::{
 use kvasir_core::{
     StoreKey, UsageStore, parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
@@ -35,11 +37,9 @@ const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
-const PRIVATE_SOCKET_UMASK: c_uint = 0o177;
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
-    fn umask(mask: c_uint) -> c_uint;
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +275,13 @@ pub async fn start_with_store_key_source(
         shutdown: shutdown.clone(),
     };
 
+    remove_stale_socket(&config.rpc_socket_path)?;
+    let unix_listener = bind_private_unix_listener(&config.rpc_socket_path)?;
+    std::fs::set_permissions(
+        &config.rpc_socket_path,
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+
     let tcp_listener = TcpListener::bind(config.otlp_bind).await?;
     let otlp_addr = tcp_listener.local_addr()?;
     let app = Router::new()
@@ -284,13 +291,6 @@ pub async fn start_with_store_key_source(
     let http_task = tokio::spawn(async move {
         let _ = axum::serve(tcp_listener, app).await;
     });
-
-    remove_stale_socket(&config.rpc_socket_path)?;
-    let unix_listener = bind_private_unix_listener(&config.rpc_socket_path)?;
-    std::fs::set_permissions(
-        &config.rpc_socket_path,
-        std::fs::Permissions::from_mode(0o600),
-    )?;
     let rpc_state = state.clone();
     let rpc_shutdown = shutdown.clone();
     let rpc_task = tokio::spawn(async move {
@@ -305,26 +305,28 @@ pub async fn start_with_store_key_source(
     })
 }
 
-struct UmaskGuard {
-    previous: c_uint,
-}
-
-impl UmaskGuard {
-    fn set(mask: c_uint) -> Self {
-        let previous = unsafe { umask(mask) };
-        Self { previous }
-    }
-}
-
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { umask(self.previous) };
-    }
-}
-
 fn bind_private_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
-    let _umask = UmaskGuard::set(PRIVATE_SOCKET_UMASK);
+    require_private_socket_parent(path)?;
     UnixListener::bind(path)
+}
+
+fn require_private_socket_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(parent)?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    if mode & 0o1000 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("rpc socket parent {} is not private", parent.display()),
+        ));
+    }
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 struct StoreStartupLock {
@@ -406,8 +408,9 @@ pub async fn query_token_rollup(
     request_bytes.push(b'\n');
     stream.write_all(&request_bytes).await?;
 
+    let mut reader = BufReader::new(stream);
     let response = read_bounded_line(
-        &mut stream,
+        &mut reader,
         MAX_RPC_RESPONSE_BYTES,
         DaemonError::RpcResponseTooLarge,
     )
@@ -429,8 +432,9 @@ pub async fn query_cost_rollup(
     request_bytes.push(b'\n');
     stream.write_all(&request_bytes).await?;
 
+    let mut reader = BufReader::new(stream);
     let response = read_bounded_line(
-        &mut stream,
+        &mut reader,
         MAX_RPC_RESPONSE_BYTES,
         DaemonError::RpcResponseTooLarge,
     )
@@ -533,7 +537,8 @@ async fn serve_rpc(listener: UnixListener, state: DaemonState, shutdown: broadca
 }
 
 async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow::Result<()> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let request = read_bounded_line(
         &mut reader,
         MAX_RPC_REQUEST_BYTES,
@@ -604,7 +609,20 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             error: RpcError::InvalidRequest,
         },
     };
+    write_rpc_response(&mut writer, response).await?;
+    Ok(())
+}
+
+async fn write_rpc_response<W>(writer: &mut W, response: RpcResponse) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut response_bytes = serde_json::to_vec(&response)?;
+    if response_bytes.len() + 1 > MAX_RPC_RESPONSE_BYTES {
+        response_bytes = serde_json::to_vec(&RpcResponse::Error {
+            error: RpcError::ResponseTooLarge,
+        })?;
+    }
     response_bytes.push(b'\n');
     writer.write_all(&response_bytes).await?;
     Ok(())
@@ -687,26 +705,29 @@ async fn read_bounded_line<R>(
     limit_error: DaemonError,
 ) -> Result<String, DaemonError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncBufRead + Unpin,
 {
     let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
     loop {
-        let bytes_read = reader.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            break;
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return String::from_utf8(request).map_err(DaemonError::InvalidRpcUtf8);
         }
-        for byte in &buffer[..bytes_read] {
-            request.push(*byte);
-            if request.len() > byte_limit {
-                return Err(limit_error);
-            }
-            if *byte == b'\n' {
-                return String::from_utf8(request).map_err(DaemonError::InvalidRpcUtf8);
-            }
+
+        let bytes_to_consume = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len());
+        if request.len() + bytes_to_consume > byte_limit {
+            return Err(limit_error);
+        }
+        request.extend_from_slice(&available[..bytes_to_consume]);
+        reader.consume(bytes_to_consume);
+        if request.last() == Some(&b'\n') {
+            return String::from_utf8(request).map_err(DaemonError::InvalidRpcUtf8);
         }
     }
-    String::from_utf8(request).map_err(DaemonError::InvalidRpcUtf8)
 }
 
 fn remove_stale_socket(path: &PathBuf) -> anyhow::Result<()> {

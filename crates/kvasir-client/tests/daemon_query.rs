@@ -4,9 +4,10 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
-    KvasirClient, KvasirCostRollup, KvasirCostUsd, KvasirModelName, KvasirRepoBucket,
-    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
-    KvasirSocketPath, KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate,
+    KvasirClient, KvasirClientError, KvasirCostRollup, KvasirCostUsd, KvasirModelName,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirSocketPath, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirTokenRollupUpdate,
 };
 use kvasir_core::rpc::BearerToken;
 use kvasird::{DaemonConfig, StoreKeySource, start_with_store_key_source};
@@ -318,22 +319,57 @@ async fn client_connect_retries_until_daemon_socket_is_available() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(many_model_token_usage_fixture(700))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: None,
+    };
+    let error = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.token_rollups(query)
+    })
+    .await?
+    .expect_err("oversized daemon response should surface as a typed client error");
+
+    assert!(matches!(error, KvasirClientError::RpcResponseTooLarge));
+
+    Ok(())
+}
+
 fn kvasir_repo() -> KvasirRepoBucket {
     KvasirRepoBucket {
         kind: KvasirRepoBucketKind::Repo,
-        name: Some(KvasirRepoName {
-            value: "kvasir".to_owned(),
-        }),
-        path: Some(KvasirRepoPath {
-            value: "/Users/oyr/projects/kvasir".to_owned(),
-        }),
+        name: Some(KvasirRepoName::try_from("kvasir".to_owned()).unwrap()),
+        path: Some(KvasirRepoPath::try_from("/Users/oyr/projects/kvasir".to_owned()).unwrap()),
     }
 }
 
 fn socket_path(path: std::path::PathBuf) -> KvasirSocketPath {
-    KvasirSocketPath {
-        value: path.to_string_lossy().into_owned(),
-    }
+    KvasirSocketPath::try_from(path.to_string_lossy().into_owned()).unwrap()
 }
 
 fn timestamp(year: i32, month: u32, day: u32) -> KvasirTimestampMillis {
@@ -346,9 +382,7 @@ fn timestamp(year: i32, month: u32, day: u32) -> KvasirTimestampMillis {
 }
 
 fn model(value: &str) -> KvasirModelName {
-    KvasirModelName {
-        value: value.to_owned(),
-    }
+    KvasirModelName::try_from(value.to_owned()).unwrap()
 }
 
 fn native_cost_usage_fixture() -> &'static str {
@@ -506,4 +540,44 @@ fn other_repo_token_usage_fixture() -> &'static str {
             }]
         }]
     }"#
+}
+
+fn many_model_token_usage_fixture(model_count: usize) -> String {
+    let data_points = (0..model_count)
+        .map(|index| {
+            format!(
+                r#"{{
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "asInt": "1",
+                    "attributes": [
+                        {{ "key": "model", "value": {{ "stringValue": "claude-generated-model-{index:04}" }} }},
+                        {{ "key": "token.type", "value": {{ "stringValue": "input" }} }}
+                    ]
+                }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        r#"{{
+            "resourceMetrics": [{{
+                "resource": {{
+                    "attributes": [
+                        {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                        {{ "key": "repo.path", "value": {{ "stringValue": "/Users/oyr/projects/kvasir" }} }}
+                    ]
+                }},
+                "scopeMetrics": [{{
+                    "metrics": [{{
+                        "name": "token.usage",
+                        "sum": {{
+                            "dataPoints": [{data_points}]
+                        }}
+                    }}]
+                }}]
+            }}]
+        }}"#
+    )
 }

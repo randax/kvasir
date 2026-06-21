@@ -178,6 +178,7 @@ pub enum RpcStreamEvent {
 pub enum RpcError {
     InvalidRequest,
     Internal,
+    ResponseTooLarge,
 }
 
 #[cfg(test)]
