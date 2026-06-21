@@ -2,13 +2,17 @@ use chrono::Datelike;
 use kvasir_core::rpc::{
     CostRollup as CoreCostRollup, CostRollupQuery, RollupQuery, RpcError, TimestampMillis,
     TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
+    Trace as CoreTrace, TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery,
+    TraceSpan as CoreTraceSpan, TraceSpanKind as CoreTraceSpanKind,
 };
 use kvasir_core::{RepoBucket, RepoIdentity};
 
 use crate::error::KvasirClientError;
 use crate::types::{
     KvasirCostRollup, KvasirCostUsd, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
-    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTokenRollup, KvasirToolCallRollup,
+    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceQuery,
+    KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -53,6 +57,15 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
             core_query = core_query.with_repo(repo.try_into()?);
         }
         Ok(core_query)
+    }
+}
+
+impl From<KvasirTraceQuery> for TraceQuery {
+    fn from(query: KvasirTraceQuery) -> Self {
+        Self {
+            session_id: query.session_id.into_core(),
+            prompt_id: query.prompt_id.into_core(),
+        }
     }
 }
 
@@ -114,6 +127,67 @@ impl TryFrom<CoreToolCallRollup> for KvasirToolCallRollup {
             tool_name: crate::types::KvasirToolName::from_core(rollup.tool_name),
             call_count: rollup.call_count,
         })
+    }
+}
+
+impl TryFrom<CoreTrace> for KvasirTrace {
+    type Error = KvasirClientError;
+
+    fn try_from(trace: CoreTrace) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: crate::types::KvasirSessionId::from_core(trace.session_id),
+            prompt_id: crate::types::KvasirPromptId::from_core(trace.prompt_id),
+            trace_id: crate::types::KvasirTraceId::from_core(trace.trace_id),
+            spans: trace
+                .spans
+                .into_iter()
+                .map(KvasirTraceSpan::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            durations: trace.durations.into(),
+        })
+    }
+}
+
+impl TryFrom<CoreTraceSpan> for KvasirTraceSpan {
+    type Error = KvasirClientError;
+
+    fn try_from(span: CoreTraceSpan) -> Result<Self, Self::Error> {
+        Ok(Self {
+            span_id: crate::types::KvasirSpanId::from_core(span.span_id),
+            parent_span_id: span
+                .parent_span_id
+                .map(crate::types::KvasirSpanId::from_core),
+            kind: span.kind.into(),
+            name: crate::types::KvasirSpanName::from_core(span.name),
+            started_at: KvasirTimestampMillis {
+                value: span.started_at.value(),
+            },
+            ended_at: KvasirTimestampMillis {
+                value: span.ended_at.value(),
+            },
+            duration_ms: span.duration_ms,
+            tool_name: span.tool_name.map(crate::types::KvasirToolName::from_core),
+        })
+    }
+}
+
+impl From<CoreTraceDurationMeasures> for KvasirTraceDurationMeasures {
+    fn from(durations: CoreTraceDurationMeasures) -> Self {
+        Self {
+            ttft_ms: durations.ttft_ms,
+            request_ms: durations.request_ms,
+            tool_ms: durations.tool_ms,
+        }
+    }
+}
+
+impl From<CoreTraceSpanKind> for KvasirTraceSpanKind {
+    fn from(kind: CoreTraceSpanKind) -> Self {
+        match kind {
+            CoreTraceSpanKind::Interaction => Self::Interaction,
+            CoreTraceSpanKind::LlmRequest => Self::LlmRequest,
+            CoreTraceSpanKind::ToolCall => Self::ToolCall,
+        }
     }
 }
 

@@ -19,6 +19,8 @@ uniffi.workspace = true
 anyhow.workspace = true
 http.workspace = true
 kvasird = { path = "../kvasird" }
+opentelemetry-proto.workspace = true
+prost.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

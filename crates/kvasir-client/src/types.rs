@@ -13,6 +13,21 @@ pub struct KvasirHarnessName(String);
 pub struct KvasirToolName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirSessionId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirPromptId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirTraceId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirSpanId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirSpanName(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirRepoName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +37,11 @@ uniffi::custom_type!(KvasirSocketPath, String);
 uniffi::custom_type!(KvasirModelName, String);
 uniffi::custom_type!(KvasirHarnessName, String);
 uniffi::custom_type!(KvasirToolName, String);
+uniffi::custom_type!(KvasirSessionId, String);
+uniffi::custom_type!(KvasirPromptId, String);
+uniffi::custom_type!(KvasirTraceId, String);
+uniffi::custom_type!(KvasirSpanId, String);
+uniffi::custom_type!(KvasirSpanName, String);
 uniffi::custom_type!(KvasirRepoName, String);
 uniffi::custom_type!(KvasirRepoPath, String);
 
@@ -55,6 +75,12 @@ pub struct KvasirRollupQuery {
     pub start: KvasirTimestampMillis,
     pub end: KvasirTimestampMillis,
     pub repo: Option<KvasirRepoBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirTraceQuery {
+    pub session_id: KvasirSessionId,
+    pub prompt_id: KvasirPromptId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -94,6 +120,41 @@ pub struct KvasirToolCallRollup {
     pub call_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirTrace {
+    pub session_id: KvasirSessionId,
+    pub prompt_id: KvasirPromptId,
+    pub trace_id: KvasirTraceId,
+    pub spans: Vec<KvasirTraceSpan>,
+    pub durations: KvasirTraceDurationMeasures,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirTraceSpan {
+    pub span_id: KvasirSpanId,
+    pub parent_span_id: Option<KvasirSpanId>,
+    pub kind: KvasirTraceSpanKind,
+    pub name: KvasirSpanName,
+    pub started_at: KvasirTimestampMillis,
+    pub ended_at: KvasirTimestampMillis,
+    pub duration_ms: u64,
+    pub tool_name: Option<KvasirToolName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirTraceDurationMeasures {
+    pub ttft_ms: Option<u64>,
+    pub request_ms: Option<u64>,
+    pub tool_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirTraceSpanKind {
+    Interaction,
+    LlmRequest,
+    ToolCall,
+}
+
 impl KvasirSocketPath {
     pub(crate) fn into_string(self) -> String {
         self.0
@@ -114,6 +175,44 @@ impl KvasirHarnessName {
 
 impl KvasirToolName {
     pub(crate) fn from_core(value: kvasir_core::rpc::ToolName) -> Self {
+        Self(value.as_str().to_owned())
+    }
+}
+
+impl KvasirSessionId {
+    pub(crate) fn from_core(value: kvasir_core::rpc::SessionId) -> Self {
+        Self(value.as_str().to_owned())
+    }
+
+    pub(crate) fn into_core(self) -> kvasir_core::rpc::SessionId {
+        kvasir_core::rpc::SessionId::new(self.0)
+    }
+}
+
+impl KvasirPromptId {
+    pub(crate) fn from_core(value: kvasir_core::rpc::PromptId) -> Self {
+        Self(value.as_str().to_owned())
+    }
+
+    pub(crate) fn into_core(self) -> kvasir_core::rpc::PromptId {
+        kvasir_core::rpc::PromptId::new(self.0)
+    }
+}
+
+impl KvasirTraceId {
+    pub(crate) fn from_core(value: kvasir_core::rpc::TraceId) -> Self {
+        Self(value.as_str().to_owned())
+    }
+}
+
+impl KvasirSpanId {
+    pub(crate) fn from_core(value: kvasir_core::rpc::SpanId) -> Self {
+        Self(value.as_str().to_owned())
+    }
+}
+
+impl KvasirSpanName {
+    pub(crate) fn from_core(value: kvasir_core::rpc::SpanName) -> Self {
         Self(value.as_str().to_owned())
     }
 }
@@ -158,6 +257,36 @@ impl From<KvasirHarnessName> for String {
 
 impl From<KvasirToolName> for String {
     fn from(value: KvasirToolName) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirSessionId> for String {
+    fn from(value: KvasirSessionId) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirPromptId> for String {
+    fn from(value: KvasirPromptId) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirTraceId> for String {
+    fn from(value: KvasirTraceId) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirSpanId> for String {
+    fn from(value: KvasirSpanId) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirSpanName> for String {
+    fn from(value: KvasirSpanName) -> Self {
         value.0
     }
 }
@@ -207,6 +336,46 @@ impl TryFrom<String> for KvasirToolName {
         } else {
             Err(KvasirClientError::InvalidQuery)
         }
+    }
+}
+
+impl TryFrom<String> for KvasirSessionId {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirPromptId {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirTraceId {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirSpanId {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirSpanName {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
     }
 }
 

@@ -8,7 +8,7 @@ use kvasir_core::rpc::{RpcRequest, RpcResponse, RpcStreamEvent};
 
 use crate::error::KvasirClientError;
 
-const MAX_RPC_RESPONSE_BYTES: u64 = 16 * 1024;
+const MAX_RPC_RESPONSE_BYTES: u64 = 1024 * 1024;
 const CONNECT_RETRY_ATTEMPTS: usize = 80;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 

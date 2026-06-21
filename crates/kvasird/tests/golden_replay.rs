@@ -950,12 +950,15 @@ async fn metrics_ingest_rejects_mixed_batches_with_empty_token_usage_metrics() -
 
 #[tokio::test]
 async fn rpc_client_rejects_oversized_responses() -> anyhow::Result<()> {
+    const OVERSIZED_RPC_RESPONSE_BYTES: usize = 1024 * 1024 + 1;
+
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("oversized-response.sock");
     let listener = tokio::net::UnixListener::bind(&rpc_socket_path)?;
     let server = tokio::spawn(async move {
         let (mut stream, _addr) = listener.accept().await?;
-        tokio::io::AsyncWriteExt::write_all(&mut stream, &vec![b'a'; 17 * 1024]).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &vec![b'a'; OVERSIZED_RPC_RESPONSE_BYTES])
+            .await?;
         tokio::io::AsyncWriteExt::write_all(&mut stream, b"\n").await?;
         anyhow::Ok(())
     });
@@ -1035,7 +1038,7 @@ async fn daemon_returns_bounded_error_for_oversized_rpc_query_response() -> anyh
         .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
         .header(AUTHORIZATION, "Bearer test-token")
         .header(CONTENT_TYPE, "application/json")
-        .body(many_model_token_usage_fixture(700))
+        .body(many_model_token_usage_fixture(7_000))
         .send()
         .await?
         .error_for_status()?;

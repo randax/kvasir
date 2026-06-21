@@ -1,5 +1,6 @@
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{
     LogRecord, ResourceLogs as OtlpResourceLogs, ScopeLogs,
@@ -7,13 +8,20 @@ use opentelemetry_proto::tonic::logs::v1::{
 use opentelemetry_proto::tonic::metrics::v1::{
     Metric, ResourceMetrics, ScopeMetrics, metric, number_data_point,
 };
+use opentelemetry_proto::tonic::trace::v1::{
+    ResourceSpans as OtlpResourceSpans, ScopeSpans, Span as OtlpSpan,
+};
 use prost::Message;
 use serde_json::Value;
 
-use crate::rpc::{HarnessName, ModelName, TimestampMillis, ToolName};
+use crate::rpc::{
+    HarnessName, ModelName, PromptId, SessionId, SpanId, SpanName, TimestampMillis, ToolName,
+    TraceId, TraceSpanKind,
+};
 use crate::usage::{
     CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageRecord, ToolCallEventKey, ToolCallRecord, UsageRecords,
+    TokenMeasure, TokenUsageRecord, ToolCallEventKey, ToolCallRecord, TraceSpanRecord,
+    UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +72,26 @@ pub enum OtlpError {
     InvalidToolName,
     #[error("otlp payload contains no tool call logs")]
     NoToolCallLogs,
+    #[error("otlp payload is missing resource spans")]
+    MissingResourceSpans,
+    #[error("otlp payload is missing scope spans")]
+    MissingScopeSpans,
+    #[error("otlp payload is missing spans")]
+    MissingSpans,
+    #[error("otlp trace span is missing session id")]
+    MissingSessionId,
+    #[error("otlp trace span is missing prompt id")]
+    MissingPromptId,
+    #[error("otlp trace span is missing trace id")]
+    MissingTraceId,
+    #[error("otlp trace span has invalid trace id")]
+    InvalidTraceId,
+    #[error("otlp trace span is missing span id")]
+    MissingSpanId,
+    #[error("otlp trace span has invalid span id")]
+    InvalidSpanId,
+    #[error("otlp trace span is missing or has invalid kind")]
+    InvalidTraceSpanKind,
 }
 
 pub fn parse_otlp_protobuf_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
@@ -176,6 +204,59 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
     Ok(records)
 }
 
+pub fn parse_otlp_protobuf_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
+    let request = ExportTraceServiceRequest::decode(bytes)?;
+    if request.resource_spans.is_empty() {
+        return Err(OtlpError::MissingResourceSpans);
+    }
+    let mut records = UsageRecords::default();
+    for resource_spans in request.resource_spans {
+        records.extend(records_from_resource_spans(resource_spans)?);
+    }
+    if records.trace_spans.is_empty() {
+        return Err(OtlpError::MissingSpans);
+    }
+    Ok(records)
+}
+
+pub fn parse_otlp_json_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
+    let payload: Value = serde_json::from_slice(bytes)?;
+    let mut records = UsageRecords::default();
+    let resource_spans = payload
+        .get("resourceSpans")
+        .and_then(Value::as_array)
+        .ok_or(OtlpError::MissingResourceSpans)?;
+    for resource_spans in resource_spans {
+        let resource_attributes = resource_spans
+            .get("resource")
+            .and_then(|resource| resource.get("attributes"))
+            .and_then(Value::as_array);
+        let session_id = json_session_id(resource_attributes);
+        let prompt_id = json_prompt_id(resource_attributes);
+        let scope_spans = resource_spans
+            .get("scopeSpans")
+            .and_then(Value::as_array)
+            .ok_or(OtlpError::MissingScopeSpans)?;
+        for scope_spans in scope_spans {
+            let spans = scope_spans
+                .get("spans")
+                .and_then(Value::as_array)
+                .ok_or(OtlpError::MissingSpans)?;
+            for span in spans {
+                records.trace_spans.push(json_trace_span_record(
+                    span,
+                    session_id.clone(),
+                    prompt_id.clone(),
+                )?);
+            }
+        }
+    }
+    if records.trace_spans.is_empty() {
+        return Err(OtlpError::MissingSpans);
+    }
+    Ok(records)
+}
+
 fn records_from_resource_metrics(
     resource_metrics: ResourceMetrics,
 ) -> Result<UsageRecords, OtlpError> {
@@ -254,6 +335,43 @@ fn records_from_scope_logs_for_logs(
         if let Some(record) = proto_tool_call_record(log_record, repo.clone())? {
             records.tool_calls.push(record);
         }
+    }
+    Ok(records)
+}
+
+fn records_from_resource_spans(
+    resource_spans: OtlpResourceSpans,
+) -> Result<UsageRecords, OtlpError> {
+    let resource_attributes = resource_spans
+        .resource
+        .as_ref()
+        .map(|resource| resource.attributes.as_slice())
+        .unwrap_or(&[]);
+    let session_id = proto_session_id(resource_attributes);
+    let prompt_id = proto_prompt_id(resource_attributes);
+    let mut records = UsageRecords::default();
+    for scope_spans in resource_spans.scope_spans {
+        records.extend(records_from_scope_spans_for_traces(
+            scope_spans,
+            session_id.clone(),
+            prompt_id.clone(),
+        )?);
+    }
+    Ok(records)
+}
+
+fn records_from_scope_spans_for_traces(
+    scope_spans: ScopeSpans,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<UsageRecords, OtlpError> {
+    let mut records = UsageRecords::default();
+    for span in scope_spans.spans {
+        records.trace_spans.push(proto_trace_span_record(
+            span,
+            resource_session_id.clone(),
+            resource_prompt_id.clone(),
+        )?);
     }
     Ok(records)
 }
@@ -463,6 +581,237 @@ fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError
         .or_else(|| json_attribute(attributes, "tool_name"))
         .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
+}
+
+fn proto_trace_span_record(
+    span: OtlpSpan,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<TraceSpanRecord, OtlpError> {
+    let session_id = resource_session_id
+        .or_else(|| proto_session_id(&span.attributes))
+        .ok_or(OtlpError::MissingSessionId)?;
+    let prompt_id = resource_prompt_id
+        .or_else(|| proto_prompt_id(&span.attributes))
+        .ok_or(OtlpError::MissingPromptId)?;
+    let kind = proto_trace_span_kind(&span.attributes).ok_or(OtlpError::InvalidTraceSpanKind)?;
+    let trace_id = canonical_proto_trace_id(span.trace_id)?;
+    let span_id = canonical_proto_span_id(span.span_id)?;
+    let parent_span_id = canonical_proto_parent_span_id(span.parent_span_id)?.map(SpanId::new);
+    let started_at = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let ended_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let tool_name = if kind == TraceSpanKind::ToolCall {
+        Some(proto_tool_name(&span.attributes)?)
+    } else {
+        None
+    };
+    Ok(TraceSpanRecord {
+        session_id,
+        prompt_id,
+        trace_id: TraceId::new(trace_id),
+        span_id: SpanId::new(span_id),
+        parent_span_id,
+        kind,
+        name: SpanName::new(span.name),
+        started_at,
+        ended_at,
+        duration_ms: duration_ms(started_at, ended_at),
+        tool_name,
+    })
+}
+
+fn json_trace_span_record(
+    span: &Value,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<TraceSpanRecord, OtlpError> {
+    let attributes = span.get("attributes").and_then(Value::as_array);
+    let session_id = resource_session_id
+        .or_else(|| json_session_id(attributes))
+        .ok_or(OtlpError::MissingSessionId)?;
+    let prompt_id = resource_prompt_id
+        .or_else(|| json_prompt_id(attributes))
+        .ok_or(OtlpError::MissingPromptId)?;
+    let kind = json_trace_span_kind(attributes).ok_or(OtlpError::InvalidTraceSpanKind)?;
+    let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
+    let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
+    let parent_span_id = span
+        .get("parentSpanId")
+        .and_then(Value::as_str)
+        .map(canonical_json_parent_span_id)
+        .transpose()?
+        .flatten()
+        .map(SpanId::new);
+    let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
+    let started_at =
+        json_timestamp(span, "startTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
+    let ended_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
+    let tool_name = if kind == TraceSpanKind::ToolCall {
+        Some(json_tool_name(attributes)?)
+    } else {
+        None
+    };
+    Ok(TraceSpanRecord {
+        session_id,
+        prompt_id,
+        trace_id: TraceId::new(trace_id),
+        span_id: SpanId::new(span_id),
+        parent_span_id,
+        kind,
+        name: SpanName::new(name),
+        started_at,
+        ended_at,
+        duration_ms: duration_ms(started_at, ended_at),
+        tool_name,
+    })
+}
+
+fn duration_ms(started_at: TimestampMillis, ended_at: TimestampMillis) -> u64 {
+    u64::try_from(ended_at.value().saturating_sub(started_at.value())).unwrap_or(0)
+}
+
+fn proto_session_id(attributes: &[KeyValue]) -> Option<SessionId> {
+    first_proto_attribute(attributes, &["session.id", "session_id", "conversation.id"])
+        .and_then(|value| meaningful_attribute(Some(value)))
+        .map(SessionId::new)
+}
+
+fn proto_prompt_id(attributes: &[KeyValue]) -> Option<PromptId> {
+    first_proto_attribute(attributes, &["prompt.id", "prompt_id"])
+        .and_then(|value| meaningful_attribute(Some(value)))
+        .map(PromptId::new)
+}
+
+fn json_session_id(attributes: Option<&Vec<Value>>) -> Option<SessionId> {
+    first_json_attribute(attributes, &["session.id", "session_id", "conversation.id"])
+        .and_then(|value| meaningful_attribute(Some(value)))
+        .map(SessionId::new)
+}
+
+fn json_prompt_id(attributes: Option<&Vec<Value>>) -> Option<PromptId> {
+    first_json_attribute(attributes, &["prompt.id", "prompt_id"])
+        .and_then(|value| meaningful_attribute(Some(value)))
+        .map(PromptId::new)
+}
+
+fn proto_trace_span_kind(attributes: &[KeyValue]) -> Option<TraceSpanKind> {
+    first_proto_attribute(
+        attributes,
+        &["claude.span.kind", "span.kind", "kvasir.span.kind"],
+    )
+    .as_deref()
+    .and_then(TraceSpanKind::from_attribute)
+}
+
+fn json_trace_span_kind(attributes: Option<&Vec<Value>>) -> Option<TraceSpanKind> {
+    first_json_attribute(
+        attributes,
+        &["claude.span.kind", "span.kind", "kvasir.span.kind"],
+    )
+    .as_deref()
+    .and_then(TraceSpanKind::from_attribute)
+}
+
+fn first_proto_attribute(attributes: &[KeyValue], keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| proto_attribute(attributes, key))
+}
+
+fn first_json_attribute(attributes: Option<&Vec<Value>>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| json_attribute(attributes, key))
+}
+
+fn canonical_proto_trace_id(bytes: Vec<u8>) -> Result<String, OtlpError> {
+    if bytes.is_empty() {
+        return Err(OtlpError::MissingTraceId);
+    }
+    fixed_width_proto_hex_id(bytes, 16).ok_or(OtlpError::InvalidTraceId)
+}
+
+fn canonical_proto_span_id(bytes: Vec<u8>) -> Result<String, OtlpError> {
+    if bytes.is_empty() {
+        return Err(OtlpError::MissingSpanId);
+    }
+    fixed_width_proto_hex_id(bytes, 8).ok_or(OtlpError::InvalidSpanId)
+}
+
+fn canonical_proto_parent_span_id(bytes: Vec<u8>) -> Result<Option<String>, OtlpError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    fixed_width_proto_hex_id(bytes, 8)
+        .map(Some)
+        .ok_or(OtlpError::InvalidSpanId)
+}
+
+fn fixed_width_proto_hex_id(bytes: Vec<u8>, expected_len: usize) -> Option<String> {
+    if bytes.len() != expected_len || bytes.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(nibble_to_hex(byte >> 4));
+        encoded.push(nibble_to_hex(byte & 0x0f));
+    }
+    Some(encoded)
+}
+
+fn canonical_json_trace_id(value: Option<&str>) -> Result<String, OtlpError> {
+    fixed_width_json_hex_id(
+        value,
+        32,
+        OtlpError::MissingTraceId,
+        OtlpError::InvalidTraceId,
+    )
+}
+
+fn canonical_json_span_id(value: Option<&str>) -> Result<String, OtlpError> {
+    fixed_width_json_hex_id(
+        value,
+        16,
+        OtlpError::MissingSpanId,
+        OtlpError::InvalidSpanId,
+    )
+}
+
+fn canonical_json_parent_span_id(value: &str) -> Result<Option<String>, OtlpError> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    fixed_width_json_hex_id(
+        Some(value),
+        16,
+        OtlpError::MissingSpanId,
+        OtlpError::InvalidSpanId,
+    )
+    .map(Some)
+}
+
+fn fixed_width_json_hex_id(
+    value: Option<&str>,
+    expected_len: usize,
+    missing: OtlpError,
+    invalid: OtlpError,
+) -> Result<String, OtlpError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(missing);
+    };
+    if value.len() != expected_len
+        || !value.chars().all(|character| character.is_ascii_hexdigit())
+        || value.bytes().all(|byte| byte == b'0')
+    {
+        return Err(invalid);
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + value - 10),
+        _ => unreachable!("nibble is four bits"),
+    }
 }
 
 fn tool_call_event_key(
@@ -692,6 +1041,90 @@ mod tests {
             parse_token_usage_protobuf(&payload),
             Err(OtlpError::MissingModel)
         ));
+    }
+
+    #[test]
+    fn json_traces_reject_invalid_trace_and_span_ids() {
+        assert!(matches!(
+            parse_otlp_json_traces(
+                trace_json_payload("aaaa", "1111111111111111", "interaction").as_bytes()
+            ),
+            Err(OtlpError::InvalidTraceId)
+        ));
+        assert!(matches!(
+            parse_otlp_json_traces(
+                trace_json_payload(
+                    "00000000000000000000000000000000",
+                    "1111111111111111",
+                    "interaction"
+                )
+                .as_bytes()
+            ),
+            Err(OtlpError::InvalidTraceId)
+        ));
+        assert!(matches!(
+            parse_otlp_json_traces(
+                trace_json_payload(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "0000000000000000",
+                    "interaction"
+                )
+                .as_bytes()
+            ),
+            Err(OtlpError::InvalidSpanId)
+        ));
+    }
+
+    #[test]
+    fn protobuf_trace_id_helpers_reject_invalid_otlp_widths_and_zeroes() {
+        assert!(matches!(
+            canonical_proto_trace_id(vec![1; 15]),
+            Err(OtlpError::InvalidTraceId)
+        ));
+        assert!(matches!(
+            canonical_proto_trace_id(vec![0; 16]),
+            Err(OtlpError::InvalidTraceId)
+        ));
+        assert!(matches!(
+            canonical_proto_span_id(vec![1; 7]),
+            Err(OtlpError::InvalidSpanId)
+        ));
+        assert!(matches!(
+            canonical_proto_span_id(vec![0; 8]),
+            Err(OtlpError::InvalidSpanId)
+        ));
+    }
+
+    #[test]
+    fn json_traces_accept_span_level_session_prompt_and_canonicalize_ids() {
+        let payload = r#"{
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "spanId": "1111111111111111",
+                        "name": "claude.interaction",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802750000000",
+                        "attributes": [
+                            { "key": "conversation.id", "value": { "stringValue": " session-12 " } },
+                            { "key": "prompt_id", "value": { "stringValue": " prompt-7 " } },
+                            { "key": "claude.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes()).expect("valid trace payload");
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].session_id.as_str(), "session-12");
+        assert_eq!(records.trace_spans[0].prompt_id.as_str(), "prompt-7");
+        assert_eq!(
+            records.trace_spans[0].trace_id.as_str(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
@@ -1622,5 +2055,32 @@ mod tests {
                 value: Some(any_value::Value::StringValue(value.to_owned())),
             }),
         }
+    }
+
+    fn trace_json_payload(trace_id: &str, span_id: &str, kind: &str) -> String {
+        format!(
+            r#"{{
+                "resourceSpans": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "session.id", "value": {{ "stringValue": "session-12" }} }},
+                            {{ "key": "prompt.id", "value": {{ "stringValue": "prompt-7" }} }}
+                        ]
+                    }},
+                    "scopeSpans": [{{
+                        "spans": [{{
+                            "traceId": "{trace_id}",
+                            "spanId": "{span_id}",
+                            "name": "claude.interaction",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956802750000000",
+                            "attributes": [
+                                {{ "key": "claude.span.kind", "value": {{ "stringValue": "{kind}" }} }}
+                            ]
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
     }
 }

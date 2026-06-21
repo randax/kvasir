@@ -64,6 +64,71 @@ impl ToolName {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptId(String);
+
+impl PromptId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceId(String);
+
+impl TraceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpanId(String);
+
+impl SpanId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpanName(String);
+
+impl SpanName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 fn is_known_claude_tool_name(value: &str) -> bool {
     matches!(
         value,
@@ -188,6 +253,12 @@ pub struct ToolCallRollupQuery {
     pub repo: Option<RepoBucket>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceQuery {
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
+}
+
 impl ToolCallRollupQuery {
     pub fn new(start: TimestampMillis, end: TimestampMillis) -> Self {
         Self {
@@ -250,6 +321,70 @@ pub struct ToolCallRollup {
     pub call_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trace {
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
+    pub trace_id: TraceId,
+    pub spans: Vec<TraceSpan>,
+    pub durations: TraceDurationMeasures,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSpan {
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub kind: TraceSpanKind,
+    pub name: SpanName,
+    pub started_at: TimestampMillis,
+    pub ended_at: TimestampMillis,
+    pub duration_ms: u64,
+    pub tool_name: Option<ToolName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceDurationMeasures {
+    pub ttft_ms: Option<u64>,
+    pub request_ms: Option<u64>,
+    pub tool_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanKind {
+    Interaction,
+    LlmRequest,
+    ToolCall,
+}
+
+impl TraceSpanKind {
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "interaction" => Some(Self::Interaction),
+            "llm_request" | "llm-request" => Some(Self::LlmRequest),
+            "tool" | "tool_call" | "tool-call" => Some(Self::ToolCall),
+            _ => None,
+        }
+    }
+
+    pub fn storage_name(self) -> &'static str {
+        match self {
+            Self::Interaction => "interaction",
+            Self::LlmRequest => "llm_request",
+            Self::ToolCall => "tool_call",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "interaction" => Some(Self::Interaction),
+            "llm_request" => Some(Self::LlmRequest),
+            "tool_call" => Some(Self::ToolCall),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostSource {
@@ -264,6 +399,7 @@ pub enum RpcRequest {
     TokenRollup { query: RollupQuery },
     CostRollup { query: CostRollupQuery },
     ToolCallRollup { query: ToolCallRollupQuery },
+    Trace { query: TraceQuery },
     SubscribeTokenRollup { query: RollupQuery },
 }
 
@@ -273,6 +409,7 @@ pub enum RpcResponse {
     TokenRollup { rollups: Vec<TokenRollup> },
     CostRollup { rollups: Vec<CostRollup> },
     ToolCallRollup { rollups: Vec<ToolCallRollup> },
+    Trace { traces: Vec<Trace> },
     Error { error: RpcError },
 }
 

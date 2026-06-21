@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::rpc::{HarnessName, ModelName, TimestampMillis, ToolName};
+use crate::rpc::{
+    HarnessName, ModelName, PromptId, SessionId, SpanId, SpanName, TimestampMillis, ToolName,
+    TraceId, TraceSpanKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoName(String);
@@ -165,6 +168,21 @@ impl ToolCallEventKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSpanRecord {
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub kind: TraceSpanKind,
+    pub name: SpanName,
+    pub started_at: TimestampMillis,
+    pub ended_at: TimestampMillis,
+    pub duration_ms: u64,
+    pub tool_name: Option<ToolName>,
+}
+
 const COST_NANOS_PER_USD: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +315,7 @@ pub struct UsageRecords {
     pub token_usage: Vec<TokenUsageRecord>,
     pub cost_usage: Vec<CostUsageRecord>,
     pub tool_calls: Vec<ToolCallRecord>,
+    pub trace_spans: Vec<TraceSpanRecord>,
 }
 
 impl UsageRecords {
@@ -305,17 +324,22 @@ impl UsageRecords {
             token_usage,
             cost_usage: Vec::new(),
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.token_usage.is_empty() && self.cost_usage.is_empty() && self.tool_calls.is_empty()
+        self.token_usage.is_empty()
+            && self.cost_usage.is_empty()
+            && self.tool_calls.is_empty()
+            && self.trace_spans.is_empty()
     }
 
     pub fn extend(&mut self, other: Self) {
         self.token_usage.extend(other.token_usage);
         self.cost_usage.extend(other.cost_usage);
         self.tool_calls.extend(other.tool_calls);
+        self.trace_spans.extend(other.trace_spans);
     }
 }
 

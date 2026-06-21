@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -5,13 +6,20 @@ use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
     KvasirClient, KvasirClientError, KvasirCostRollup, KvasirCostUsd, KvasirHarnessName,
-    KvasirModelName, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
-    KvasirRollupDay, KvasirRollupQuery, KvasirSocketPath, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
+    KvasirModelName, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
+    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath,
+    KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures,
+    KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::BearerToken;
 use kvasird::{DaemonConfig, StoreKeySource, start_with_store_key_source};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use prost::Message;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -93,6 +101,276 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
             },
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_queries_claude_trace_by_session_and_prompt() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+        })
+    })
+    .await??;
+
+    assert_eq!(traces.len(), 1);
+    let trace = &traces[0];
+    assert_eq!(trace.session_id, session("session-12"));
+    assert_eq!(trace.prompt_id, prompt("prompt-7"));
+    assert_eq!(trace.trace_id, trace_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert_eq!(
+        trace.durations,
+        KvasirTraceDurationMeasures {
+            ttft_ms: Some(250),
+            request_ms: Some(3_000),
+            tool_ms: Some(750),
+        }
+    );
+    assert_eq!(
+        trace.spans,
+        vec![
+            KvasirTraceSpan {
+                span_id: span("1111111111111111"),
+                parent_span_id: None,
+                kind: KvasirTraceSpanKind::Interaction,
+                name: span_name("claude.interaction"),
+                started_at: KvasirTimestampMillis {
+                    value: 1_781_956_800_000
+                },
+                ended_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_750
+                },
+                duration_ms: 2_750,
+                tool_name: None,
+            },
+            KvasirTraceSpan {
+                span_id: span("2222222222222222"),
+                parent_span_id: Some(span("1111111111111111")),
+                kind: KvasirTraceSpanKind::LlmRequest,
+                name: span_name("claude.llm_request"),
+                started_at: KvasirTimestampMillis {
+                    value: 1_781_956_800_250
+                },
+                ended_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_250
+                },
+                duration_ms: 2_000,
+                tool_name: None,
+            },
+            KvasirTraceSpan {
+                span_id: span("3333333333333333"),
+                parent_span_id: Some(span("1111111111111111")),
+                kind: KvasirTraceSpanKind::ToolCall,
+                name: span_name("claude.tool"),
+                started_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_250
+                },
+                ended_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_750
+                },
+                duration_ms: 500,
+                tool_name: Some(tool("Read")),
+            },
+            KvasirTraceSpan {
+                span_id: span("4444444444444444"),
+                parent_span_id: Some(span("1111111111111111")),
+                kind: KvasirTraceSpanKind::LlmRequest,
+                name: span_name("claude.llm_request"),
+                started_at: KvasirTimestampMillis {
+                    value: 1_781_956_803_000
+                },
+                ended_at: KvasirTimestampMillis {
+                    value: 1_781_956_804_000
+                },
+                duration_ms: 1_000,
+                tool_name: None,
+            },
+            KvasirTraceSpan {
+                span_id: span("5555555555555555"),
+                parent_span_id: Some(span("1111111111111111")),
+                kind: KvasirTraceSpanKind::ToolCall,
+                name: span_name("claude.tool"),
+                started_at: KvasirTimestampMillis {
+                    value: 1_781_956_804_000
+                },
+                ended_at: KvasirTimestampMillis {
+                    value: 1_781_956_804_250
+                },
+                duration_ms: 250,
+                tool_name: Some(tool("Bash")),
+            },
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_retrieves_trace_response_above_previous_rpc_response_cap() -> anyhow::Result<()> {
+    const TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP: usize = 400;
+
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(large_claude_trace_fixture(
+            TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP,
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            session_id: session("session-large"),
+            prompt_id: prompt("prompt-large"),
+        })
+    })
+    .await??;
+
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP);
+    assert_eq!(
+        traces[0].durations.request_ms,
+        Some(TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP as u64)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_keeps_distinct_trace_ids_for_the_same_session_prompt() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(two_trace_ids_for_same_prompt_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+        })
+    })
+    .await??;
+
+    assert_eq!(traces.len(), 2);
+    assert_eq!(
+        traces
+            .iter()
+            .map(|trace| String::from(trace.trace_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        ]
+    );
+    assert_eq!(traces[0].durations.request_ms, Some(2_000));
+    assert_eq!(traces[1].durations.request_ms, Some(1_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_queries_protobuf_claude_trace_by_session_and_prompt() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(claude_trace_protobuf_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+        })
+    })
+    .await??;
+
+    assert_eq!(traces.len(), 1);
+    assert_eq!(
+        traces[0].trace_id,
+        trace_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert_eq!(traces[0].spans[0].span_id, span("1111111111111111"));
+    assert_eq!(traces[0].durations.request_ms, Some(2_000));
 
     Ok(())
 }
@@ -411,7 +689,7 @@ async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyho
         .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
         .header(AUTHORIZATION, "Bearer test-token")
         .header(CONTENT_TYPE, "application/json")
-        .body(many_model_token_usage_fixture(700))
+        .body(many_model_token_usage_fixture(7_000))
         .send()
         .await?
         .error_for_status()?;
@@ -464,6 +742,250 @@ fn harness(value: &str) -> KvasirHarnessName {
 
 fn tool(value: &str) -> KvasirToolName {
     KvasirToolName::try_from(value.to_owned()).unwrap()
+}
+
+fn session(value: &str) -> KvasirSessionId {
+    KvasirSessionId::try_from(value.to_owned()).unwrap()
+}
+
+fn prompt(value: &str) -> KvasirPromptId {
+    KvasirPromptId::try_from(value.to_owned()).unwrap()
+}
+
+fn trace_id(value: &str) -> KvasirTraceId {
+    KvasirTraceId::try_from(value.to_owned()).unwrap()
+}
+
+fn span(value: &str) -> KvasirSpanId {
+    KvasirSpanId::try_from(value.to_owned()).unwrap()
+}
+
+fn span_name(value: &str) -> KvasirSpanName {
+    KvasirSpanName::try_from(value.to_owned()).unwrap()
+}
+
+fn claude_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "session-12" } },
+                    { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "claude.interaction",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802750000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "claude.llm_request",
+                        "startTimeUnixNano": "1781956800250000000",
+                        "endTimeUnixNano": "1781956802250000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "llm_request" } }
+                        ]
+                    },
+                    {
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "claude.tool",
+                        "startTimeUnixNano": "1781956802250000000",
+                        "endTimeUnixNano": "1781956802750000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "tool" } },
+                            { "key": "tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    },
+                    {
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "4444444444444444",
+                        "parentSpanId": "1111111111111111",
+                        "name": "claude.llm_request",
+                        "startTimeUnixNano": "1781956803000000000",
+                        "endTimeUnixNano": "1781956804000000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "llm_request" } }
+                        ]
+                    },
+                    {
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "5555555555555555",
+                        "parentSpanId": "1111111111111111",
+                        "name": "claude.tool",
+                        "startTimeUnixNano": "1781956804000000000",
+                        "endTimeUnixNano": "1781956804250000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "tool" } },
+                            { "key": "tool.name", "value": { "stringValue": "Bash" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn two_trace_ids_for_same_prompt_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "session.id", "value": { "stringValue": "session-12" } },
+                    { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "claude.llm_request",
+                        "startTimeUnixNano": "1781956800250000000",
+                        "endTimeUnixNano": "1781956802250000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "llm_request" } }
+                        ]
+                    },
+                    {
+                        "traceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "spanId": "2222222222222222",
+                        "name": "claude.llm_request",
+                        "startTimeUnixNano": "1781956803250000000",
+                        "endTimeUnixNano": "1781956804250000000",
+                        "attributes": [
+                            { "key": "claude.span.kind", "value": { "stringValue": "llm_request" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn large_claude_trace_fixture(span_count: usize) -> String {
+    let mut spans = String::new();
+    for index in 0..span_count {
+        if index > 0 {
+            spans.push(',');
+        }
+        let span_id = format!("{:016x}", index + 1);
+        let start_ns = 1_781_956_800_000_000_000_u64 + (index as u64 * 1_000_000);
+        let end_ns = start_ns + 1_000_000;
+        write!(
+            spans,
+            r#"{{
+                "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "spanId": "{span_id}",
+                "name": "claude.llm_request",
+                "startTimeUnixNano": "{start_ns}",
+                "endTimeUnixNano": "{end_ns}",
+                "attributes": [
+                    {{ "key": "claude.span.kind", "value": {{ "stringValue": "llm_request" }} }}
+                ]
+            }}"#
+        )
+        .expect("writing to a String cannot fail");
+    }
+
+    format!(
+        r#"{{
+        "resourceSpans": [{{
+            "resource": {{
+                "attributes": [
+                    {{ "key": "session.id", "value": {{ "stringValue": "session-large" }} }},
+                    {{ "key": "prompt.id", "value": {{ "stringValue": "prompt-large" }} }}
+                ]
+            }},
+            "scopeSpans": [{{
+                "spans": [{spans}]
+            }}]
+        }}]
+    }}"#
+    )
+}
+
+fn claude_trace_protobuf_fixture() -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("session.id", "session-12"),
+                    string_attribute("prompt.id", "prompt-7"),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    trace_id: hex_bytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    span_id: hex_bytes("1111111111111111"),
+                    trace_state: String::new(),
+                    parent_span_id: Vec::new(),
+                    flags: 0,
+                    name: "claude.llm_request".to_owned(),
+                    kind: 0,
+                    start_time_unix_nano: 1_781_956_800_250_000_000,
+                    end_time_unix_nano: 1_781_956_802_250_000_000,
+                    attributes: vec![string_attribute("claude.span.kind", "llm_request")],
+                    dropped_attributes_count: 0,
+                    events: Vec::new(),
+                    dropped_events_count: 0,
+                    links: Vec::new(),
+                    dropped_links_count: 0,
+                    status: None,
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn string_attribute(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_owned(),
+        key_strindex: 0,
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_owned())),
+        }),
+    }
+}
+
+fn hex_bytes(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_nibble(chunk[0]);
+            let low = hex_nibble(chunk[1]);
+            (high << 4) | low
+        })
+        .collect()
+}
+
+fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => panic!("test fixture contains non-hex digit"),
+    }
 }
 
 fn claude_tool_result_logs_fixture() -> &'static str {

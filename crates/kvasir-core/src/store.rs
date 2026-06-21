@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{Connection, params};
@@ -7,14 +7,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::pricing::PriceTable;
 use crate::rpc::{
     CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName, RollupDay, RollupQuery,
-    TimestampMillis, TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName,
+    SpanId, SpanName, TimestampMillis, TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName,
+    Trace, TraceDurationMeasures, TraceId, TraceQuery, TraceSpan, TraceSpanKind,
 };
 use crate::usage::{
     CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure,
     TokenUsageRecord, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -149,6 +150,7 @@ impl UsageStore {
         )?;
         Self::ingest_cost_usage_in_transaction(&transaction, &records.cost_usage)?;
         Self::ingest_tool_calls_in_transaction(&transaction, &records.tool_calls)?;
+        Self::ingest_trace_spans_in_transaction(&transaction, &records.trace_spans)?;
         transaction.commit()?;
         Ok(())
     }
@@ -429,6 +431,67 @@ impl UsageStore {
             .map_err(StoreError::from)
     }
 
+    pub fn traces(&self, query: TraceQuery) -> Result<Vec<Trace>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                trace_id,
+                span_id,
+                parent_span_id,
+                kind,
+                name,
+                started_at_ms,
+                ended_at_ms,
+                duration_ms,
+                tool_name
+             FROM canonical_trace_spans
+             WHERE session_id = ?1 AND prompt_id = ?2
+             ORDER BY trace_id, started_at_ms, span_id",
+        )?;
+        let rows = statement
+            .query_map(
+                params![query.session_id.as_str(), query.prompt_id.as_str()],
+                |row| {
+                    let kind: String = row.get(3)?;
+                    let parent_span_id: Option<String> = row.get(2)?;
+                    let tool_name: Option<String> = row.get(8)?;
+                    Ok(StoredTraceSpan {
+                        trace_id: row.get(0)?,
+                        span: TraceSpan {
+                            span_id: SpanId::new(row.get::<_, String>(1)?),
+                            parent_span_id: parent_span_id.map(SpanId::new),
+                            kind: trace_span_kind_from_storage(&kind)?,
+                            name: SpanName::new(row.get::<_, String>(4)?),
+                            started_at: TimestampMillis::from_millis(row.get(5)?),
+                            ended_at: TimestampMillis::from_millis(row.get(6)?),
+                            duration_ms: unsigned_token_column(row, 7)?,
+                            tool_name: tool_name.map(ToolName::new),
+                        },
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut spans_by_trace_id: BTreeMap<String, Vec<TraceSpan>> = BTreeMap::new();
+        for row in rows {
+            spans_by_trace_id
+                .entry(row.trace_id)
+                .or_default()
+                .push(row.span);
+        }
+        Ok(spans_by_trace_id
+            .into_iter()
+            .map(|(trace_id, spans)| {
+                let durations = trace_duration_measures(&spans);
+                Trace {
+                    session_id: query.session_id.clone(),
+                    prompt_id: query.prompt_id.clone(),
+                    trace_id: TraceId::new(trace_id),
+                    spans,
+                    durations,
+                }
+            })
+            .collect())
+    }
+
     fn migrate(&mut self) -> Result<(), StoreError> {
         let schema_version = self
             .connection
@@ -444,6 +507,7 @@ impl UsageStore {
         let transaction = self.connection.transaction()?;
         match schema_version {
             CURRENT_SCHEMA_VERSION => {}
+            4 => migrate_v4_to_v5(&transaction)?,
             3 => migrate_v3_to_v4(&transaction)?,
             2 => migrate_v2_to_v4(&transaction)?,
             _ if schema_version < 2 => drop_incompatible_usage_tables(&transaction)?,
@@ -546,7 +610,28 @@ impl UsageStore {
                 tool_name TEXT NOT NULL,
                 call_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(day, repo_bucket, repo_name, repo_path, harness, tool_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS canonical_trace_spans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                span_id TEXT NOT NULL,
+                parent_span_id TEXT,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                tool_name TEXT,
+                UNIQUE(session_id, prompt_id, trace_id, span_id)
             );",
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_trace_spans_session_prompt
+             ON canonical_trace_spans (session_id, prompt_id, started_at_ms, span_id)",
+            [],
         )?;
         transaction.execute(
             "CREATE INDEX IF NOT EXISTS canonical_cost_usage_native_lookup
@@ -716,6 +801,43 @@ impl UsageStore {
                     stored_repo.path,
                     record.harness.as_str(),
                     record.tool_name.as_str(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ingest_trace_spans_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        records: &[crate::usage::TraceSpanRecord],
+    ) -> Result<(), StoreError> {
+        for record in records {
+            transaction.execute(
+                "INSERT OR REPLACE INTO canonical_trace_spans (
+                    session_id,
+                    prompt_id,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    kind,
+                    name,
+                    started_at_ms,
+                    ended_at_ms,
+                    duration_ms,
+                    tool_name
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    record.session_id.as_str(),
+                    record.prompt_id.as_str(),
+                    record.trace_id.as_str(),
+                    record.span_id.as_str(),
+                    record.parent_span_id.as_ref().map(SpanId::as_str),
+                    record.kind.storage_name(),
+                    record.name.as_str(),
+                    record.started_at.value(),
+                    record.ended_at.value(),
+                    i64::try_from(record.duration_ms).unwrap_or(i64::MAX),
+                    record.tool_name.as_ref().map(ToolName::as_str),
                 ],
             )?;
         }
@@ -1000,11 +1122,36 @@ fn drop_incompatible_usage_tables(
         "DROP TABLE IF EXISTS canonical_token_usage;
         DROP TABLE IF EXISTS canonical_cost_usage;
         DROP TABLE IF EXISTS canonical_tool_calls;
+        DROP TABLE IF EXISTS canonical_trace_spans;
         DROP TABLE IF EXISTS cumulative_counter_snapshots;
         DROP TABLE IF EXISTS cost_counter_snapshots;
         DROP TABLE IF EXISTS token_rollups;
         DROP TABLE IF EXISTS cost_rollups;
         DROP TABLE IF EXISTS tool_call_rollups;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS canonical_trace_spans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            prompt_id TEXT NOT NULL,
+            trace_id TEXT NOT NULL,
+            span_id TEXT NOT NULL,
+            parent_span_id TEXT,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            started_at_ms INTEGER NOT NULL,
+            ended_at_ms INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            tool_name TEXT,
+            UNIQUE(session_id, prompt_id, trace_id, span_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS canonical_trace_spans_session_prompt
+        ON canonical_trace_spans (session_id, prompt_id, started_at_ms, span_id);",
     )?;
     Ok(())
 }
@@ -1020,6 +1167,44 @@ fn migrate_v2_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
         UPDATE cost_rollups SET native_cost_usd_nanos = cost_usd_nanos;",
     )?;
     Ok(())
+}
+
+fn trace_span_kind_from_storage(value: &str) -> rusqlite::Result<TraceSpanKind> {
+    TraceSpanKind::from_storage(value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "invalid trace span kind {value}"
+            )),
+        )
+    })
+}
+
+fn trace_duration_measures(spans: &[TraceSpan]) -> TraceDurationMeasures {
+    let first_interaction = spans
+        .iter()
+        .filter(|span| span.kind == TraceSpanKind::Interaction)
+        .min_by_key(|span| span.started_at);
+    let first_request = spans
+        .iter()
+        .filter(|span| span.kind == TraceSpanKind::LlmRequest)
+        .min_by_key(|span| span.started_at);
+    TraceDurationMeasures {
+        ttft_ms: first_interaction
+            .zip(first_request)
+            .and_then(|(interaction, request)| {
+                u64::try_from(request.started_at.value() - interaction.started_at.value()).ok()
+            }),
+        request_ms: trace_duration_sum(spans, TraceSpanKind::LlmRequest),
+        tool_ms: trace_duration_sum(spans, TraceSpanKind::ToolCall),
+    }
+}
+
+fn trace_duration_sum(spans: &[TraceSpan], kind: TraceSpanKind) -> Option<u64> {
+    let mut matching_spans = spans.iter().filter(|span| span.kind == kind).peekable();
+    matching_spans.peek()?;
+    matching_spans.try_fold(0_u64, |total, span| total.checked_add(span.duration_ms))
 }
 
 fn migrate_v3_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
@@ -1157,6 +1342,11 @@ struct EstimatedCostRollup {
     repo_path: String,
     model: String,
     cost_usd_nanos: i64,
+}
+
+struct StoredTraceSpan {
+    trace_id: String,
+    span: TraceSpan,
 }
 
 impl NativeCostCoverage {
@@ -1694,6 +1884,7 @@ mod tests {
                 ),
             ],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
 
         let query = CostRollupQuery::new(
@@ -1780,6 +1971,7 @@ mod tests {
                 "Read",
                 1_781_956_800_000,
             )],
+            trace_spans: Vec::new(),
         })?;
         store
             .connection
@@ -1823,6 +2015,7 @@ mod tests {
                 tool_call_record_for_repo(repo.clone(), "claude_code", "Read", 1_781_956_800_000),
                 tool_call_record_for_repo(repo.clone(), "claude_code", "Write", 1_781_960_400_000),
             ],
+            trace_spans: Vec::new(),
         })?;
 
         assert_eq!(
@@ -1960,6 +2153,7 @@ mod tests {
                 "0.2",
             )],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2011,6 +2205,7 @@ mod tests {
                 "0.2",
             )],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2069,6 +2264,7 @@ mod tests {
                 "0.2",
             )],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2119,6 +2315,7 @@ mod tests {
                 "0.2",
             )],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2154,6 +2351,7 @@ mod tests {
                 "0.2",
             )],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords {
             token_usage: vec![usage_record(
@@ -2171,6 +2369,7 @@ mod tests {
                 "0.2",
             )],
             tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2622,6 +2821,123 @@ mod tests {
     }
 
     #[test]
+    fn opening_v4_schema_adds_trace_span_table() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let mut store = open_test_store(&database_path)?;
+        store.ingest_token_usage(&[usage_record(
+            "claude-opus-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            100,
+        )])?;
+        drop(store);
+
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "DROP TABLE canonical_trace_spans;
+            PRAGMA user_version = 4;",
+        )?;
+        drop(connection);
+
+        let mut store = open_test_store(&database_path)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        let trace_query = TraceQuery {
+            session_id: crate::rpc::SessionId::new("session-12"),
+            prompt_id: crate::rpc::PromptId::new("prompt-7"),
+        };
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: vec![crate::usage::TraceSpanRecord {
+                session_id: trace_query.session_id.clone(),
+                prompt_id: trace_query.prompt_id.clone(),
+                trace_id: TraceId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                span_id: SpanId::new("1111111111111111"),
+                parent_span_id: None,
+                kind: TraceSpanKind::Interaction,
+                name: SpanName::new("claude.interaction"),
+                started_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                ended_at: TimestampMillis::new_for_test(1_781_956_801_000),
+                duration_ms: 1_000,
+                tool_name: None,
+            }],
+        })?;
+        assert_eq!(store.traces(trace_query)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn trace_query_reports_kind_conversion_failure_on_selected_kind_column()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store = open_test_store(&database_path)?;
+        store.connection.execute(
+            "INSERT INTO canonical_trace_spans (
+                session_id,
+                prompt_id,
+                trace_id,
+                span_id,
+                kind,
+                name,
+                started_at_ms,
+                ended_at_ms,
+                duration_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "session-12",
+                "prompt-7",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                "not-a-kind",
+                "claude.unknown",
+                1_781_956_800_000_i64,
+                1_781_956_801_000_i64,
+                1_000_i64,
+            ],
+        )?;
+
+        let error = store
+            .traces(TraceQuery {
+                session_id: crate::rpc::SessionId::new("session-12"),
+                prompt_id: crate::rpc::PromptId::new("prompt-7"),
+            })
+            .expect_err("invalid stored trace kind should fail conversion");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    _
+                ))
+            ),
+            "{error:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn opening_newer_schema_is_rejected_without_dropping_tables()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -2630,7 +2946,7 @@ mod tests {
         connection.execute_batch(
             "CREATE TABLE keep_me (value TEXT NOT NULL);
             INSERT INTO keep_me (value) VALUES ('still here');
-            PRAGMA user_version = 5;",
+            PRAGMA user_version = 6;",
         )?;
         drop(connection);
 
@@ -2639,7 +2955,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(StoreError::IncompatibleSchema {
-                found: 5,
+                found: 6,
                 supported: CURRENT_SCHEMA_VERSION,
             })
         ));
