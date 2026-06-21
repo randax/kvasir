@@ -135,7 +135,7 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
 pub fn parse_otlp_protobuf_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
     let request = ExportLogsServiceRequest::decode(bytes)?;
     if request.resource_logs.is_empty() {
-        return Err(OtlpError::MissingResourceLogs);
+        return Ok(UsageRecords::default());
     }
     let mut records = UsageRecords::default();
     for resource_logs in request.resource_logs {
@@ -166,9 +166,6 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
                 .get("logRecords")
                 .and_then(Value::as_array)
                 .ok_or(OtlpError::MissingLogRecords)?;
-            if log_records.is_empty() {
-                return Err(OtlpError::MissingLogRecords);
-            }
             for log_record in log_records {
                 if let Some(record) = json_tool_call_record(log_record, repo.clone())? {
                     records.tool_calls.push(record);
@@ -241,9 +238,6 @@ fn records_from_resource_logs(resource_logs: OtlpResourceLogs) -> Result<UsageRe
         .map(|resource| repo_from_proto_attributes(&resource.attributes))
         .unwrap_or_else(RepoBucket::no_repo);
 
-    if resource_logs.scope_logs.is_empty() {
-        return Err(OtlpError::MissingScopeLogs);
-    }
     let mut records = UsageRecords::default();
     for scope_logs in resource_logs.scope_logs {
         records.extend(records_from_scope_logs_for_logs(scope_logs, repo.clone())?);
@@ -255,9 +249,6 @@ fn records_from_scope_logs_for_logs(
     scope_logs: ScopeLogs,
     repo: RepoBucket,
 ) -> Result<UsageRecords, OtlpError> {
-    if scope_logs.log_records.is_empty() {
-        return Err(OtlpError::MissingLogRecords);
-    }
     let mut records = UsageRecords::default();
     for log_record in scope_logs.log_records {
         if let Some(record) = proto_tool_call_record(log_record, repo.clone())? {
@@ -443,17 +434,13 @@ fn json_tool_call_record(
         return Ok(None);
     }
     let tool_name = json_tool_name(attributes)?;
-    let occurred_at = json_timestamp(log_record, "timeUnixNano")
-        .or_else(|| json_timestamp(log_record, "observedTimeUnixNano"))
-        .ok_or(OtlpError::MissingTimestamp)?;
+    let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
     let harness = HarnessName::new("claude_code");
     let event_key = tool_call_event_key(
         &repo,
         harness.as_str(),
         tool_name.as_str(),
-        json_number(log_record, "timeUnixNano")
-            .or_else(|| json_number(log_record, "observedTimeUnixNano"))
-            .ok_or(OtlpError::MissingTimestamp)?,
+        occurred_at_nanos,
     );
     Ok(Some(ToolCallRecord::new(
         event_key,
@@ -598,6 +585,16 @@ fn json_number(value: &Value, key: &str) -> Option<u64> {
 
 fn json_timestamp(value: &Value, key: &str) -> Option<TimestampMillis> {
     json_number(value, key).and_then(TimestampMillis::try_from_unix_nanos)
+}
+
+fn json_log_timestamp(value: &Value) -> Result<(u64, TimestampMillis), OtlpError> {
+    ["timeUnixNano", "observedTimeUnixNano"]
+        .into_iter()
+        .find_map(|key| {
+            let raw_value = json_number(value, key)?;
+            TimestampMillis::try_from_unix_nanos(raw_value).map(|timestamp| (raw_value, timestamp))
+        })
+        .ok_or(OtlpError::MissingTimestamp)
 }
 
 fn json_counter_start(value: &Value, key: &str) -> Option<TimestampMillis> {
@@ -949,6 +946,128 @@ mod tests {
             records.tool_calls[0].tool_name,
             ToolName::new("mcp__linear__issue_view")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_tool_result_event_key_reuses_the_selected_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "observedTimeUnixNano": "1781956900000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(records.tool_calls[0].occurred_at.value(), 1_781_956_800_000);
+        assert!(
+            records.tool_calls[0]
+                .event_key
+                .as_str()
+                .contains("occurred_at_nanos=1781956800000000000\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_accept_empty_batches_as_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": []
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_skip_empty_scope_collections() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": []
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_skip_empty_log_record_collections() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": []
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_usage_logs_accept_empty_batches_as_noop() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = ExportLogsServiceRequest {
+            resource_logs: Vec::new(),
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_usage_logs_skip_empty_scope_and_log_record_collections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportLogsServiceRequest {
+            resource_logs: vec![
+                OtlpResourceLogs {
+                    resource: None,
+                    scope_logs: Vec::new(),
+                    schema_url: String::new(),
+                },
+                OtlpResourceLogs {
+                    resource: None,
+                    scope_logs: vec![ScopeLogs {
+                        scope: None,
+                        log_records: Vec::new(),
+                        schema_url: String::new(),
+                    }],
+                    schema_url: String::new(),
+                },
+            ],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert!(records.is_empty());
 
         Ok(())
     }
