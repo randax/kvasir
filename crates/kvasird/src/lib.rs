@@ -1,7 +1,12 @@
+use std::fs::File;
 use std::net::SocketAddr;
+use std::os::raw::c_int;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::PathBuf;
+use std::os::unix::io::AsRawFd;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::to_bytes;
@@ -13,15 +18,26 @@ use kvasir_core::rpc::{
     BearerToken, CostRollup, CostRollupQuery, RollupQuery, RpcError, RpcRequest, RpcResponse,
     TokenRollup,
 };
-use kvasir_core::{UsageStore, parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics};
+use kvasir_core::{
+    StoreKey, UsageStore, parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024;
+const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+const LOCK_UN: c_int = 8;
+
+unsafe extern "C" {
+    fn flock(fd: c_int, operation: c_int) -> c_int;
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -29,6 +45,179 @@ pub struct DaemonConfig {
     pub rpc_socket_path: PathBuf,
     pub database_path: PathBuf,
     pub bearer_token: BearerToken,
+}
+
+#[derive(Clone)]
+pub enum StoreKeySource {
+    Keychain(KeychainStoreKeySource),
+    Static(StoreKey),
+}
+
+impl std::fmt::Debug for StoreKeySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keychain(source) => formatter.debug_tuple("Keychain").field(source).finish(),
+            Self::Static(_key) => formatter.write_str("Static(StoreKey(<redacted>))"),
+        }
+    }
+}
+
+impl StoreKeySource {
+    pub fn keychain_for_database(database_path: &Path) -> Self {
+        Self::Keychain(KeychainStoreKeySource::for_database(database_path))
+    }
+
+    pub fn static_key_for_test(bytes: [u8; 32]) -> Self {
+        Self::Static(StoreKey::from_bytes(bytes))
+    }
+
+    fn resolve(&self) -> anyhow::Result<StoreKey> {
+        match self {
+            Self::Keychain(source) => source.resolve(),
+            Self::Static(key) => Ok(key.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KeychainStoreKeySource {
+    service: &'static str,
+    user: String,
+}
+
+impl KeychainStoreKeySource {
+    fn for_database(database_path: &Path) -> Self {
+        Self {
+            service: "dev.kvasir.store",
+            user: keychain_user_for_database(database_path),
+        }
+    }
+
+    fn resolve(&self) -> anyhow::Result<StoreKey> {
+        let entry = keyring::Entry::new(self.service, &self.user)?;
+        resolve_store_key(&KeyringStoreKeyCredential { entry })
+    }
+}
+
+trait StoreKeyCredential {
+    fn get_password(&self) -> Result<String, StoreKeyCredentialReadError>;
+    fn set_password(&self, password: &str) -> anyhow::Result<()>;
+}
+
+enum StoreKeyCredentialReadError {
+    NoEntry,
+    Read(anyhow::Error),
+}
+
+struct KeyringStoreKeyCredential {
+    entry: keyring::Entry,
+}
+
+impl StoreKeyCredential for KeyringStoreKeyCredential {
+    fn get_password(&self) -> Result<String, StoreKeyCredentialReadError> {
+        self.entry.get_password().map_err(|err| match err {
+            keyring::Error::NoEntry => StoreKeyCredentialReadError::NoEntry,
+            other => StoreKeyCredentialReadError::Read(other.into()),
+        })
+    }
+
+    fn set_password(&self, password: &str) -> anyhow::Result<()> {
+        self.entry.set_password(password)?;
+        Ok(())
+    }
+}
+
+fn resolve_store_key(credential: &impl StoreKeyCredential) -> anyhow::Result<StoreKey> {
+    match credential.get_password() {
+        Ok(encoded_key) => {
+            let encoded_key = Zeroizing::new(encoded_key);
+            Ok(StoreKey::from_hex(&encoded_key)?)
+        }
+        Err(StoreKeyCredentialReadError::NoEntry) => {
+            let key = StoreKey::generate()?;
+            let encoded_key = key.to_hex_secret();
+            credential.set_password(&encoded_key)?;
+            Ok(key)
+        }
+        Err(StoreKeyCredentialReadError::Read(err)) => Err(err),
+    }
+}
+
+fn keychain_user_for_database(database_path: &Path) -> String {
+    let stable_path = canonical_database_path(database_path);
+    format!("usage.sqlite3:{}", keychain_path_component(&stable_path))
+}
+
+fn keychain_path_component(stable_path: &Path) -> String {
+    if let Some(path) = stable_path.to_str() {
+        return format!("utf8:{path}");
+    }
+
+    format!("hex:{}", hex_encode(stable_path.as_os_str().as_bytes()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(hex_nibble(byte >> 4));
+        encoded.push(hex_nibble(byte & 0x0f));
+    }
+    encoded
+}
+
+fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'a' + (nibble - 10)),
+        _ => unreachable!("nibble is masked to four bits"),
+    }
+}
+
+fn canonical_database_path(database_path: &Path) -> PathBuf {
+    if let Ok(path) = database_path.canonicalize() {
+        return path;
+    }
+
+    let absolute_path = absolute_lexical_path(database_path);
+    let Some(parent) = absolute_path.parent() else {
+        return absolute_path;
+    };
+    let Some(file_name) = absolute_path.file_name() else {
+        return absolute_path;
+    };
+    parent
+        .canonicalize()
+        .map(|parent| parent.join(file_name))
+        .unwrap_or(absolute_path)
+}
+
+fn absolute_lexical_path(path: &Path) -> PathBuf {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    lexical_normalize_path(&absolute_path)
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.as_os_str() != "/" && !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    normalized
 }
 
 pub struct RunningDaemon {
@@ -59,7 +248,17 @@ struct DaemonState {
 }
 
 pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
-    let store = UsageStore::open(&config.database_path)?;
+    let store_key_source = StoreKeySource::keychain_for_database(&config.database_path);
+    start_with_store_key_source(config, store_key_source).await
+}
+
+pub async fn start_with_store_key_source(
+    config: DaemonConfig,
+    store_key_source: StoreKeySource,
+) -> anyhow::Result<RunningDaemon> {
+    let _startup_lock = StoreStartupLock::acquire(&config.database_path).await?;
+    let store_key = store_key_source.resolve()?;
+    let store = UsageStore::open(&config.database_path, &store_key)?;
     let state = DaemonState {
         store: Arc::new(Mutex::new(store)),
         bearer_token: config.bearer_token,
@@ -91,6 +290,75 @@ pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
         rpc_socket_path: config.rpc_socket_path,
         tasks: vec![http_task, rpc_task],
     })
+}
+
+struct StoreStartupLock {
+    file: File,
+}
+
+impl StoreStartupLock {
+    async fn acquire(database_path: &Path) -> anyhow::Result<Self> {
+        let lock_path = store_startup_lock_path(database_path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        let started_at = Instant::now();
+        loop {
+            match try_lock_file(&file) {
+                Ok(true) => {
+                    return Ok(Self { file });
+                }
+                Ok(false) => {}
+                Err(err) => return Err(err.into()),
+            }
+            if started_at.elapsed() >= STORE_STARTUP_LOCK_TIMEOUT {
+                return Err(DaemonError::StoreStartupLockTimedOut {
+                    path: lock_path.clone(),
+                }
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl Drop for StoreStartupLock {
+    fn drop(&mut self) {
+        let _ = unlock_file(&self.file);
+    }
+}
+
+fn store_startup_lock_path(database_path: &Path) -> PathBuf {
+    let stable_path = canonical_database_path(database_path);
+    let mut lock_path = stable_path.as_os_str().to_os_string();
+    lock_path.push(".startup-lock");
+    PathBuf::from(lock_path)
+}
+
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+fn unlock_file(file: &File) -> std::io::Result<()> {
+    let result = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 pub async fn query_token_rollup(
@@ -339,4 +607,148 @@ enum DaemonError {
     RpcIo(#[from] std::io::Error),
     #[error("refusing to remove non-socket rpc path {path}")]
     RpcSocketPathIsNotSocket { path: PathBuf },
+    #[error("timed out waiting for store startup lock {path}")]
+    StoreStartupLockTimedOut { path: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn store_key_resolver_generates_once_and_reuses_stored_key() -> anyhow::Result<()> {
+        let credential = MemoryStoreKeyCredential::default();
+
+        let first_key = resolve_store_key(&credential)?;
+        let second_key = resolve_store_key(&credential)?;
+
+        assert_eq!(first_key, second_key);
+        assert_eq!(credential.set_count.get(), 1);
+        assert_eq!(credential.password.borrow().as_ref().unwrap().len(), 64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_users_are_scoped_to_database_paths() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+
+        assert_ne!(
+            keychain_user_for_database(&temp.path().join("first.sqlite3")),
+            keychain_user_for_database(&temp.path().join("second.sqlite3"))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_utf8_database_paths_have_distinct_keychain_users() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first_path = PathBuf::from(OsString::from_vec(b"invalid-\xff.sqlite3".to_vec()));
+        let second_path = PathBuf::from(OsString::from_vec(b"invalid-\xfe.sqlite3".to_vec()));
+
+        assert_eq!(first_path.to_string_lossy(), second_path.to_string_lossy());
+        assert_ne!(
+            keychain_user_for_database(&first_path),
+            keychain_user_for_database(&second_path)
+        );
+    }
+
+    #[test]
+    fn startup_lock_paths_use_the_same_canonical_database_identity() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let alias_path = temp.path().join(".").join("usage.sqlite3");
+
+        assert_eq!(
+            store_startup_lock_path(&database_path),
+            store_startup_lock_path(&alias_path)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn relative_database_path_spellings_share_keychain_and_lock_identity() {
+        let bare_path = Path::new("usage.sqlite3");
+        let dot_path = Path::new("./usage.sqlite3");
+
+        assert_eq!(
+            keychain_user_for_database(bare_path),
+            keychain_user_for_database(dot_path)
+        );
+        assert_eq!(
+            store_startup_lock_path(bare_path),
+            store_startup_lock_path(dot_path)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nonexistent_database_under_symlinked_parent_uses_real_parent_identity() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let real_parent = temp.path().join("real");
+        let symlink_parent = temp.path().join("link");
+        std::fs::create_dir(&real_parent)?;
+        std::os::unix::fs::symlink(&real_parent, &symlink_parent)?;
+        let real_path = real_parent.join("usage.sqlite3");
+        let symlink_path = symlink_parent.join("usage.sqlite3");
+
+        assert_eq!(
+            keychain_user_for_database(&real_path),
+            keychain_user_for_database(&symlink_path)
+        );
+        assert_eq!(
+            store_startup_lock_path(&real_path),
+            store_startup_lock_path(&symlink_path)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_lock_can_acquire_existing_unlocked_file() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        std::fs::write(store_startup_lock_path(&database_path), "stale")?;
+
+        let _lock = StoreStartupLock::acquire(&database_path).await?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn static_store_key_source_debug_output_is_redacted() {
+        let source = StoreKeySource::static_key_for_test([11; 32]);
+
+        assert_eq!(format!("{source:?}"), "Static(StoreKey(<redacted>))");
+    }
+
+    #[derive(Default)]
+    struct MemoryStoreKeyCredential {
+        password: RefCell<Option<String>>,
+        set_count: Cell<usize>,
+    }
+
+    impl StoreKeyCredential for MemoryStoreKeyCredential {
+        fn get_password(&self) -> Result<String, StoreKeyCredentialReadError> {
+            self.password
+                .borrow()
+                .clone()
+                .ok_or(StoreKeyCredentialReadError::NoEntry)
+        }
+
+        fn set_password(&self, password: &str) -> anyhow::Result<()> {
+            self.set_count.set(self.set_count.get() + 1);
+            self.password.replace(Some(password.to_owned()));
+            Ok(())
+        }
+    }
 }

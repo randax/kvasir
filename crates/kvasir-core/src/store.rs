@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, params};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::rpc::{CostRollup, CostRollupQuery, ModelName, RollupDay, RollupQuery, TokenRollup};
 use crate::usage::{
@@ -21,13 +22,77 @@ pub enum StoreError {
     IncompatibleSchema { found: i64, supported: i64 },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StoreKeyError {
+    #[error("store key must be 64 hex characters")]
+    InvalidHexLength,
+    #[error("store key contains non-hex character")]
+    InvalidHexCharacter,
+    #[error("store key generation failed")]
+    Random,
+}
+
 pub struct UsageStore {
     connection: Connection,
 }
 
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct StoreKey {
+    bytes: [u8; 32],
+}
+
+impl std::fmt::Debug for StoreKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreKey(<redacted>)")
+    }
+}
+
+impl StoreKey {
+    pub fn generate() -> Result<Self, StoreKeyError> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| StoreKeyError::Random)?;
+        Ok(Self { bytes })
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn from_hex(encoded: &str) -> Result<Self, StoreKeyError> {
+        if encoded.len() != 64 {
+            return Err(StoreKeyError::InvalidHexLength);
+        }
+
+        let mut bytes = [0_u8; 32];
+        for (index, chunk) in encoded.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = (hex_to_nibble(chunk[0])? << 4) | hex_to_nibble(chunk[1])?;
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn to_hex_secret(&self) -> Zeroizing<String> {
+        let mut encoded = String::with_capacity(self.bytes.len() * 2);
+        for byte in self.bytes {
+            encoded.push(nibble_to_hex(byte >> 4));
+            encoded.push(nibble_to_hex(byte & 0x0f));
+        }
+        Zeroizing::new(encoded)
+    }
+
+    fn sqlcipher_raw_key(&self) -> Zeroizing<String> {
+        self.to_hex_secret()
+    }
+
+    #[cfg(test)]
+    fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
 impl UsageStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub fn open(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
+        apply_database_key(&connection, key)?;
         let mut store = Self { connection };
         store.migrate()?;
         Ok(store)
@@ -508,6 +573,30 @@ impl UsageStore {
     }
 }
 
+fn apply_database_key(connection: &Connection, key: &StoreKey) -> Result<(), StoreError> {
+    let raw_key = key.sqlcipher_raw_key();
+    let sql = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", raw_key.as_str()));
+    connection.execute_batch(&sql)?;
+    Ok(())
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'a' + (nibble - 10)),
+        _ => unreachable!("nibble is masked to four bits"),
+    }
+}
+
+fn hex_to_nibble(character: u8) -> Result<u8, StoreKeyError> {
+    match character {
+        b'0'..=b'9' => Ok(character - b'0'),
+        b'a'..=b'f' => Ok(character - b'a' + 10),
+        b'A'..=b'F' => Ok(character - b'A' + 10),
+        _ => Err(StoreKeyError::InvalidHexCharacter),
+    }
+}
+
 struct StoredRepo<'a> {
     bucket: &'static str,
     name: &'a str,
@@ -587,10 +676,94 @@ mod tests {
     use crate::usage::{CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount};
 
     #[test]
+    fn reopens_encrypted_store_with_the_same_key() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store_key = StoreKey::from_bytes_for_test([7; 32]);
+        let expected = vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo("/not/persisted"),
+            model: ModelName::new("claude-opus-4-20250514"),
+            input_tokens: 100,
+            output_tokens: 0,
+            cache_tokens: 0,
+        }];
+
+        {
+            let mut store = UsageStore::open(&database_path, &store_key)?;
+            store.ingest_token_usage(&[usage_record(
+                "claude-opus-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                100,
+            )])?;
+            assert_eq!(store.persisted_daily_token_rollups()?, expected);
+        }
+
+        let reopened = UsageStore::open(database_path, &store_key)?;
+
+        assert_eq!(reopened.persisted_daily_token_rollups()?, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_store_cannot_be_read_without_the_key() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+
+        {
+            let mut store = open_test_store(&database_path)?;
+            store.ingest_token_usage(&[usage_record(
+                "claude-opus-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                100,
+            )])?;
+        }
+
+        let connection = Connection::open(database_path)?;
+        let result = connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        });
+
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_store_cannot_be_opened_with_a_different_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let wrong_key = StoreKey::from_bytes_for_test([8; 32]);
+
+        {
+            let mut store = open_test_store(&database_path)?;
+            store.ingest_token_usage(&[usage_record(
+                "claude-opus-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                100,
+            )])?;
+        }
+
+        let result = UsageStore::open(&database_path, &wrong_key);
+
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn persists_daily_rollups_from_cumulative_counter_deltas()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let mut store = UsageStore::open(temp.path().join("usage.sqlite3"))?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
 
         store.ingest_token_usage(&[
             usage_record(
@@ -652,7 +825,7 @@ mod tests {
     fn ignores_out_of_order_cumulative_counter_snapshots() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = tempdir()?;
-        let mut store = UsageStore::open(temp.path().join("usage.sqlite3"))?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
 
         store.ingest_token_usage(&[
             usage_record(
@@ -695,7 +868,7 @@ mod tests {
     #[test]
     fn token_rollups_are_grouped_and_filtered_by_repo() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let mut store = UsageStore::open(temp.path().join("usage.sqlite3"))?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
         let kvasir = kvasir_repo("/repos/kvasir");
         let other_kvasir = kvasir_repo("/other/kvasir");
         let name_only = RepoBucket::repo(
@@ -836,7 +1009,7 @@ mod tests {
     #[test]
     fn cost_rollups_are_grouped_and_filtered_by_repo() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let mut store = UsageStore::open(temp.path().join("usage.sqlite3"))?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
         let kvasir = kvasir_repo("/repos/kvasir");
         let other_kvasir = kvasir_repo("/other/kvasir");
 
@@ -947,7 +1120,7 @@ mod tests {
     fn opening_old_schema_recreates_repo_aware_tables() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let database_path = temp.path().join("usage.sqlite3");
-        let connection = Connection::open(&database_path)?;
+        let connection = open_raw_test_connection(&database_path)?;
         connection.execute_batch(
             "CREATE TABLE canonical_token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -980,7 +1153,7 @@ mod tests {
         )?;
         drop(connection);
 
-        let mut store = UsageStore::open(database_path)?;
+        let mut store = open_test_store(database_path)?;
         store.ingest_token_usage(&[usage_record(
             "claude-opus-4-20250514",
             TokenMeasure::Input,
@@ -1012,7 +1185,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let database_path = temp.path().join("usage.sqlite3");
-        let connection = Connection::open(&database_path)?;
+        let connection = open_raw_test_connection(&database_path)?;
         connection.execute_batch(
             "CREATE TABLE keep_me (value TEXT NOT NULL);
             INSERT INTO keep_me (value) VALUES ('still here');
@@ -1020,7 +1193,7 @@ mod tests {
         )?;
         drop(connection);
 
-        let result = UsageStore::open(&database_path);
+        let result = UsageStore::open(&database_path, &test_store_key());
 
         assert!(matches!(
             result,
@@ -1030,12 +1203,26 @@ mod tests {
             })
         ));
 
-        let connection = Connection::open(&database_path)?;
+        let connection = open_raw_test_connection(&database_path)?;
         let value: String =
             connection.query_row("SELECT value FROM keep_me", [], |row| row.get(0))?;
         assert_eq!(value, "still here");
 
         Ok(())
+    }
+
+    fn open_test_store(path: impl AsRef<Path>) -> Result<UsageStore, StoreError> {
+        UsageStore::open(path, &test_store_key())
+    }
+
+    fn open_raw_test_connection(path: impl AsRef<Path>) -> Result<Connection, StoreError> {
+        let connection = Connection::open(path)?;
+        apply_database_key(&connection, &test_store_key())?;
+        Ok(connection)
+    }
+
+    fn test_store_key() -> StoreKey {
+        StoreKey::from_bytes_for_test([7; 32])
     }
 
     fn usage_record(

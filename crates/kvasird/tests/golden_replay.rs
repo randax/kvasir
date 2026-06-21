@@ -10,7 +10,10 @@ use kvasir_core::rpc::{
     TokenRollup,
 };
 use kvasir_core::{CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath};
-use kvasird::{DaemonConfig, query_cost_rollup, query_token_rollup, start};
+use kvasird::{
+    DaemonConfig, RunningDaemon, StoreKeySource, query_cost_rollup, query_token_rollup,
+    start_with_store_key_source,
+};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -18,7 +21,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
     let bearer_token = BearerToken::new("test-token");
-    let daemon = start(DaemonConfig {
+    let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
@@ -102,11 +105,93 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
 }
 
 #[tokio::test]
+async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let bearer_token = BearerToken::new("test-token");
+
+    {
+        let daemon = start_with_store_key_source(
+            DaemonConfig {
+                otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                rpc_socket_path: rpc_socket_path.clone(),
+                database_path: database_path.clone(),
+                bearer_token: bearer_token.clone(),
+            },
+            StoreKeySource::static_key_for_test([11; 32]),
+        )
+        .await?;
+
+        reqwest::Client::new()
+            .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+            .header(AUTHORIZATION, "Bearer test-token")
+            .header(CONTENT_TYPE, "application/json")
+            .body(repo_and_no_repo_metrics_fixture())
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path,
+            bearer_token,
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    assert_eq!(
+        query_token_rollup(
+            rpc_socket_path,
+            RollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        vec![
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: RepoBucket::no_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 25,
+                output_tokens: 0,
+                cache_tokens: 0,
+            },
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_tokens: 0,
+            },
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: other_kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 40,
+                output_tokens: 0,
+                cache_tokens: 0,
+            },
+        ]
+    );
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn metrics_ingest_attributes_rollups_to_repo_and_no_repo_buckets() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
     let bearer_token = BearerToken::new("test-token");
-    let daemon = start(DaemonConfig {
+    let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
@@ -195,7 +280,7 @@ async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
     let bearer_token = BearerToken::new("test-token");
-    let daemon = start(DaemonConfig {
+    let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
@@ -280,7 +365,7 @@ async fn daemon_refuses_to_replace_non_socket_rpc_path() -> anyhow::Result<()> {
     let rpc_socket_path = temp.path().join("not-a-socket");
     std::fs::write(&rpc_socket_path, "do not remove")?;
 
-    let result = start(DaemonConfig {
+    let result = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
@@ -298,7 +383,7 @@ async fn daemon_refuses_to_replace_non_socket_rpc_path() -> anyhow::Result<()> {
 async fn daemon_creates_private_rpc_socket() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
-    let _daemon = start(DaemonConfig {
+    let _daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
@@ -315,7 +400,7 @@ async fn daemon_creates_private_rpc_socket() -> anyhow::Result<()> {
 #[tokio::test]
 async fn metrics_ingest_rejects_oversized_bodies() -> anyhow::Result<()> {
     let temp = tempdir()?;
-    let daemon = start(DaemonConfig {
+    let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: temp.path().join("kvasird.sock"),
         database_path: temp.path().join("usage.sqlite3"),
@@ -346,7 +431,7 @@ async fn metrics_ingest_rejects_oversized_bodies() -> anyhow::Result<()> {
 #[tokio::test]
 async fn metrics_ingest_rejects_payloads_without_token_usage_metrics() -> anyhow::Result<()> {
     let temp = tempdir()?;
-    let daemon = start(DaemonConfig {
+    let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: temp.path().join("kvasird.sock"),
         database_path: temp.path().join("usage.sqlite3"),
@@ -371,7 +456,7 @@ async fn metrics_ingest_rejects_payloads_without_token_usage_metrics() -> anyhow
 async fn metrics_ingest_rejects_mixed_batches_with_empty_token_usage_metrics() -> anyhow::Result<()>
 {
     let temp = tempdir()?;
-    let daemon = start(DaemonConfig {
+    let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         rpc_socket_path: temp.path().join("kvasird.sock"),
         database_path: temp.path().join("usage.sqlite3"),
@@ -448,6 +533,10 @@ async fn rpc_client_rejects_oversized_responses() -> anyhow::Result<()> {
 fn claude_token_usage_protobuf_fixture() -> anyhow::Result<Vec<u8>> {
     let encoded = include_str!("fixtures/claude_token_usage_otlp.pb.base64").trim();
     Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
+}
+
+async fn start_test_daemon(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
+    start_with_store_key_source(config, StoreKeySource::static_key_for_test([11; 32])).await
 }
 
 fn kvasir_repo() -> RepoBucket {
