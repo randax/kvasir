@@ -30,13 +30,24 @@ impl RepoPath {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoIdentity {
-    pub name: RepoName,
-    pub path: RepoPath,
+    pub name: Option<RepoName>,
+    pub path: Option<RepoPath>,
 }
 
 impl RepoIdentity {
     pub fn new(name: RepoName, path: RepoPath) -> Self {
-        Self { name, path }
+        Self {
+            name: Some(name),
+            path: Some(path),
+        }
+    }
+
+    pub fn from_parts(name: Option<RepoName>, path: Option<RepoPath>) -> Option<Self> {
+        if name.is_none() && path.is_none() {
+            None
+        } else {
+            Some(Self { name, path })
+        }
     }
 }
 

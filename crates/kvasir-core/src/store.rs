@@ -14,6 +14,8 @@ const NO_REPO_STORAGE_VALUE: &str = "";
 pub enum StoreError {
     #[error("sqlite failed")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("sqlite schema version {found} is newer than supported version {supported}")]
+    IncompatibleSchema { found: i64, supported: i64 },
 }
 
 pub struct UsageStore {
@@ -23,7 +25,7 @@ pub struct UsageStore {
 impl UsageStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
-        let store = Self { connection };
+        let mut store = Self { connection };
         store.migrate()?;
         Ok(store)
     }
@@ -169,19 +171,28 @@ impl UsageStore {
             .map_err(StoreError::from)
     }
 
-    fn migrate(&self) -> Result<(), StoreError> {
+    fn migrate(&mut self) -> Result<(), StoreError> {
         let schema_version = self
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if schema_version != CURRENT_SCHEMA_VERSION {
-            self.connection.execute_batch(
+
+        if schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::IncompatibleSchema {
+                found: schema_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        let transaction = self.connection.transaction()?;
+        if schema_version < CURRENT_SCHEMA_VERSION {
+            transaction.execute_batch(
                 "DROP TABLE IF EXISTS canonical_token_usage;
                 DROP TABLE IF EXISTS cumulative_counter_snapshots;
                 DROP TABLE IF EXISTS token_rollups;",
             )?;
         }
 
-        self.connection.execute_batch(
+        transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS canonical_token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_at_ms INTEGER NOT NULL,
@@ -216,10 +227,10 @@ impl UsageStore {
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_tokens INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
-            );
-
-            PRAGMA user_version = 1;",
+            );",
         )?;
+        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -302,8 +313,16 @@ impl<'a> StoredRepo<'a> {
             },
             RepoBucket::Repo(identity) => Self {
                 bucket: REPO_BUCKET,
-                name: identity.name.as_str(),
-                path: identity.path.as_str(),
+                name: identity
+                    .name
+                    .as_ref()
+                    .map(RepoName::as_str)
+                    .unwrap_or(NO_REPO_STORAGE_VALUE),
+                path: identity
+                    .path
+                    .as_ref()
+                    .map(RepoPath::as_str)
+                    .unwrap_or(NO_REPO_STORAGE_VALUE),
             },
         }
     }
@@ -311,12 +330,19 @@ impl<'a> StoredRepo<'a> {
 
 fn repo_bucket_from_storage(bucket: &str, name: String, path: String) -> RepoBucket {
     match bucket {
-        REPO_BUCKET => {
-            RepoBucket::repo(RepoIdentity::new(RepoName::new(name), RepoPath::new(path)))
-        }
+        REPO_BUCKET => RepoIdentity::from_parts(
+            non_empty_storage_value(name).map(RepoName::new),
+            non_empty_storage_value(path).map(RepoPath::new),
+        )
+        .map(RepoBucket::repo)
+        .unwrap_or_else(RepoBucket::no_repo),
         NO_REPO_BUCKET => RepoBucket::no_repo(),
         _ => RepoBucket::no_repo(),
     }
+}
+
+fn non_empty_storage_value(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn unsigned_token_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
@@ -450,6 +476,12 @@ mod tests {
         let mut store = UsageStore::open(temp.path().join("usage.sqlite3"))?;
         let kvasir = kvasir_repo("/repos/kvasir");
         let other_kvasir = kvasir_repo("/other/kvasir");
+        let name_only = RepoBucket::repo(
+            RepoIdentity::from_parts(Some(RepoName::new("name-only")), None).unwrap(),
+        );
+        let path_only = RepoBucket::repo(
+            RepoIdentity::from_parts(None, Some(RepoPath::new("/repos/path-only"))).unwrap(),
+        );
         let no_repo = RepoBucket::no_repo();
 
         store.ingest_token_usage(&[
@@ -468,6 +500,22 @@ mod tests {
                 1_781_956_800_000,
                 1_781_956_700_000,
                 400,
+            ),
+            usage_record_for_repo(
+                name_only.clone(),
+                "claude-opus-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                150,
+            ),
+            usage_record_for_repo(
+                path_only.clone(),
+                "claude-opus-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                175,
             ),
             usage_record_for_repo(
                 no_repo.clone(),
@@ -497,6 +545,14 @@ mod tests {
                 },
                 TokenRollup {
                     day: RollupDay::parse("2026-06-20")?,
+                    repo: path_only.clone(),
+                    model: ModelName::new("claude-opus-4-20250514"),
+                    input_tokens: 175,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
                     repo: other_kvasir.clone(),
                     model: ModelName::new("claude-opus-4-20250514"),
                     input_tokens: 400,
@@ -511,6 +567,14 @@ mod tests {
                     output_tokens: 0,
                     cache_tokens: 0,
                 },
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: name_only.clone(),
+                    model: ModelName::new("claude-opus-4-20250514"),
+                    input_tokens: 150,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
             ]
         );
 
@@ -521,6 +585,24 @@ mod tests {
                 repo: kvasir,
                 model: ModelName::new("claude-opus-4-20250514"),
                 input_tokens: 1000,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+
+        assert_eq!(
+            store.token_rollups(
+                RollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(name_only.clone())
+            )?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: name_only,
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 150,
                 output_tokens: 0,
                 cache_tokens: 0,
             }]
@@ -589,6 +671,37 @@ mod tests {
                 cache_tokens: 0,
             }]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_newer_schema_is_rejected_without_dropping_tables()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let connection = Connection::open(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE keep_me (value TEXT NOT NULL);
+            INSERT INTO keep_me (value) VALUES ('still here');
+            PRAGMA user_version = 2;",
+        )?;
+        drop(connection);
+
+        let result = UsageStore::open(&database_path);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::IncompatibleSchema {
+                found: 2,
+                supported: CURRENT_SCHEMA_VERSION,
+            })
+        ));
+
+        let connection = Connection::open(&database_path)?;
+        let value: String =
+            connection.query_row("SELECT value FROM keep_me", [], |row| row.get(0))?;
+        assert_eq!(value, "still here");
 
         Ok(())
     }
