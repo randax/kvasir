@@ -6,12 +6,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::pricing::PriceTable;
 use crate::rpc::{
-    CostRollup, CostRollupQuery, CostSource, ModelName, RollupDay, RollupQuery, TimestampMillis,
-    TokenRollup,
+    CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName, RollupDay, RollupQuery,
+    TimestampMillis, TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName,
 };
 use crate::usage::{
     CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure,
-    TokenUsageRecord, UsageRecords,
+    TokenUsageRecord, ToolCallRecord, UsageRecords,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 4;
@@ -21,6 +21,7 @@ const NO_REPO_STORAGE_VALUE: &str = "";
 const NATIVE_COST_SOURCE: i64 = 1;
 const ESTIMATED_COST_SOURCE: i64 = 2;
 const MIXED_COST_SOURCE: i64 = 3;
+const MILLIS_PER_DAY: i64 = 86_400_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -147,6 +148,7 @@ impl UsageStore {
             &token_deltas,
         )?;
         Self::ingest_cost_usage_in_transaction(&transaction, &records.cost_usage)?;
+        Self::ingest_tool_calls_in_transaction(&transaction, &records.tool_calls)?;
         transaction.commit()?;
         Ok(())
     }
@@ -298,6 +300,135 @@ impl UsageStore {
             .map_err(StoreError::from)
     }
 
+    pub fn tool_call_rollups(
+        &self,
+        query: ToolCallRollupQuery,
+    ) -> Result<Vec<ToolCallRollup>, StoreError> {
+        if is_day_aligned(query.start) && is_day_aligned(query.end) {
+            return self.persisted_tool_call_rollups(query);
+        }
+        self.canonical_tool_call_rollups(query)
+    }
+
+    fn persisted_tool_call_rollups(
+        &self,
+        query: ToolCallRollupQuery,
+    ) -> Result<Vec<ToolCallRollup>, StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let start_day = query.start.day().as_date().to_string();
+        let end_day = query.end.day().as_date().to_string();
+        let mut statement = self.connection.prepare(
+            "SELECT
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name,
+                call_count
+             FROM tool_call_rollups
+             WHERE day >= ?1 AND day < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+             ORDER BY day, repo_bucket, repo_name, repo_path, harness, tool_name",
+        )?;
+        let rows = statement.query_map(
+            params![
+                start_day,
+                end_day,
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+            ],
+            |row| {
+                let day: String = row.get(0)?;
+                let repo_bucket: String = row.get(1)?;
+                let repo_name: String = row.get(2)?;
+                let repo_path: String = row.get(3)?;
+                let harness: String = row.get(4)?;
+                let tool_name: String = row.get(5)?;
+                Ok(ToolCallRollup {
+                    day: RollupDay::parse(&day).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
+                    harness: HarnessName::new(harness),
+                    tool_name: ToolName::new(tool_name),
+                    call_count: unsigned_token_column(row, 6)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn canonical_tool_call_rollups(
+        &self,
+        query: ToolCallRollupQuery,
+    ) -> Result<Vec<ToolCallRollup>, StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name,
+                SUM(call_count) AS call_count
+             FROM canonical_tool_calls
+             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+             GROUP BY day, repo_bucket, repo_name, repo_path, harness, tool_name
+             ORDER BY day, repo_bucket, repo_name, repo_path, harness, tool_name",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+            ],
+            |row| {
+                let day: String = row.get(0)?;
+                let repo_bucket: String = row.get(1)?;
+                let repo_name: String = row.get(2)?;
+                let repo_path: String = row.get(3)?;
+                let harness: String = row.get(4)?;
+                let tool_name: String = row.get(5)?;
+                Ok(ToolCallRollup {
+                    day: RollupDay::parse(&day).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
+                    harness: HarnessName::new(harness),
+                    tool_name: ToolName::new(tool_name),
+                    call_count: unsigned_token_column(row, 6)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     fn migrate(&mut self) -> Result<(), StoreError> {
         let schema_version = self
             .connection
@@ -391,6 +522,30 @@ impl UsageStore {
                 native_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                 estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(day, repo_bucket, repo_name, repo_path, model)
+            );
+
+            CREATE TABLE IF NOT EXISTS canonical_tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                call_count INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_call_rollups (
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                call_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, repo_bucket, repo_name, repo_path, harness, tool_name)
             );",
         )?;
         transaction.execute(
@@ -516,6 +671,51 @@ impl UsageStore {
                     stored_repo.path,
                     record.model.as_str(),
                     delta,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ingest_tool_calls_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        records: &[ToolCallRecord],
+    ) -> Result<(), StoreError> {
+        for record in records {
+            let day = record.occurred_at.day().as_date().to_string();
+            let stored_repo = StoredRepo::from_bucket(&record.repo);
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO canonical_tool_calls (
+                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                params![
+                    record.event_key.as_str(),
+                    record.occurred_at.value(),
+                    day,
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    record.harness.as_str(),
+                    record.tool_name.as_str(),
+                ],
+            )?;
+            if inserted == 0 {
+                continue;
+            }
+
+            transaction.execute(
+                "INSERT INTO tool_call_rollups (
+                    day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                ON CONFLICT(day, repo_bucket, repo_name, repo_path, harness, tool_name) DO UPDATE SET
+                    call_count = call_count + excluded.call_count",
+                params![
+                    day,
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    record.harness.as_str(),
+                    record.tool_name.as_str(),
                 ],
             )?;
         }
@@ -799,10 +999,12 @@ fn drop_incompatible_usage_tables(
     transaction.execute_batch(
         "DROP TABLE IF EXISTS canonical_token_usage;
         DROP TABLE IF EXISTS canonical_cost_usage;
+        DROP TABLE IF EXISTS canonical_tool_calls;
         DROP TABLE IF EXISTS cumulative_counter_snapshots;
         DROP TABLE IF EXISTS cost_counter_snapshots;
         DROP TABLE IF EXISTS token_rollups;
-        DROP TABLE IF EXISTS cost_rollups;",
+        DROP TABLE IF EXISTS cost_rollups;
+        DROP TABLE IF EXISTS tool_call_rollups;",
     )?;
     Ok(())
 }
@@ -1101,6 +1303,10 @@ fn cost_source_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result
     }
 }
 
+fn is_day_aligned(timestamp: TimestampMillis) -> bool {
+    timestamp.value().rem_euclid(MILLIS_PER_DAY) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -1108,7 +1314,7 @@ mod tests {
     use super::*;
     use crate::pricing::ModelTokenPrices;
     use crate::rpc::TimestampMillis;
-    use crate::usage::{CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount};
+    use crate::usage::{CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount, ToolCallEventKey};
 
     #[test]
     fn reopens_encrypted_store_with_the_same_key() -> Result<(), Box<dyn std::error::Error>> {
@@ -1487,6 +1693,7 @@ mod tests {
                     "2.0",
                 ),
             ],
+            tool_calls: Vec::new(),
         })?;
 
         let query = CostRollupQuery::new(
@@ -1553,6 +1760,90 @@ mod tests {
                     source: CostSource::Native,
                 },
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_rollups_read_persisted_rollup_table() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: vec![tool_call_record_for_repo(
+                repo.clone(),
+                "claude_code",
+                "Read",
+                1_781_956_800_000,
+            )],
+        })?;
+        store
+            .connection
+            .execute("DELETE FROM canonical_tool_calls", [])?;
+
+        assert_eq!(
+            store.tool_call_rollups(ToolCallRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_913_600_000),
+                TimestampMillis::new_for_test(1_781_913_600_000),
+            ))?,
+            Vec::<ToolCallRollup>::new()
+        );
+        assert_eq!(
+            store.tool_call_rollups(ToolCallRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_913_600_000),
+                TimestampMillis::new_for_test(1_782_000_000_000),
+            ))?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("claude_code"),
+                tool_name: ToolName::new("Read"),
+                call_count: 1,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_rollups_preserve_sub_day_time_window_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: vec![
+                tool_call_record_for_repo(repo.clone(), "claude_code", "Read", 1_781_956_800_000),
+                tool_call_record_for_repo(repo.clone(), "claude_code", "Write", 1_781_960_400_000),
+            ],
+        })?;
+
+        assert_eq!(
+            store.tool_call_rollups(ToolCallRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_800_000),
+                TimestampMillis::new_for_test(1_781_956_800_000),
+            ))?,
+            Vec::<ToolCallRollup>::new()
+        );
+        assert_eq!(
+            store.tool_call_rollups(ToolCallRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_960_400_000),
+                TimestampMillis::new_for_test(1_781_964_000_000),
+            ))?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("claude_code"),
+                tool_name: ToolName::new("Write"),
+                call_count: 1,
+            }]
         );
 
         Ok(())
@@ -1668,6 +1959,7 @@ mod tests {
                 1_781_956_700_000,
                 "0.2",
             )],
+            tool_calls: Vec::new(),
         })?;
 
         assert_eq!(
@@ -1718,6 +2010,7 @@ mod tests {
                 1_781_956_700_000,
                 "0.2",
             )],
+            tool_calls: Vec::new(),
         })?;
 
         assert_eq!(
@@ -1775,6 +2068,7 @@ mod tests {
                 1_782_039_000_000,
                 "0.2",
             )],
+            tool_calls: Vec::new(),
         })?;
 
         assert_eq!(
@@ -1824,6 +2118,7 @@ mod tests {
                 1_781_956_700_000,
                 "0.2",
             )],
+            tool_calls: Vec::new(),
         })?;
 
         assert_eq!(
@@ -1858,6 +2153,7 @@ mod tests {
                 1_781_956_700_000,
                 "0.2",
             )],
+            tool_calls: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords {
             token_usage: vec![usage_record(
@@ -1874,6 +2170,7 @@ mod tests {
                 1_781_956_700_000,
                 "0.2",
             )],
+            tool_calls: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2417,6 +2714,21 @@ mod tests {
             repo,
             ModelName::new(model),
             cost_usd(cost),
+        )
+    }
+
+    fn tool_call_record_for_repo(
+        repo: RepoBucket,
+        harness: &str,
+        tool_name: &str,
+        occurred_at_ms: i64,
+    ) -> ToolCallRecord {
+        ToolCallRecord::new(
+            ToolCallEventKey::new(format!("test:{harness}:{tool_name}:{occurred_at_ms}")),
+            TimestampMillis::new_for_test(occurred_at_ms),
+            repo,
+            HarnessName::new(harness),
+            ToolName::new(tool_name),
         )
     }
 

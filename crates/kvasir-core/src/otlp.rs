@@ -1,15 +1,19 @@
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::logs::v1::{
+    LogRecord, ResourceLogs as OtlpResourceLogs, ScopeLogs,
+};
 use opentelemetry_proto::tonic::metrics::v1::{
     Metric, ResourceMetrics, ScopeMetrics, metric, number_data_point,
 };
 use prost::Message;
 use serde_json::Value;
 
-use crate::rpc::{ModelName, TimestampMillis};
+use crate::rpc::{HarnessName, ModelName, TimestampMillis, ToolName};
 use crate::usage::{
     CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageRecord, UsageRecords,
+    TokenMeasure, TokenUsageRecord, ToolCallEventKey, ToolCallRecord, UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +52,18 @@ pub enum OtlpError {
     InvalidMetricKind,
     #[error("otlp payload contains no token usage metrics")]
     NoTokenUsageMetrics,
+    #[error("otlp payload is missing resource logs")]
+    MissingResourceLogs,
+    #[error("otlp payload is missing scope logs")]
+    MissingScopeLogs,
+    #[error("otlp payload is missing log records")]
+    MissingLogRecords,
+    #[error("otlp log record is missing tool name")]
+    MissingToolName,
+    #[error("otlp log record has invalid tool name")]
+    InvalidToolName,
+    #[error("otlp payload contains no tool call logs")]
+    NoToolCallLogs,
 }
 
 pub fn parse_otlp_protobuf_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
@@ -116,6 +132,50 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
     Ok(records)
 }
 
+pub fn parse_otlp_protobuf_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
+    let request = ExportLogsServiceRequest::decode(bytes)?;
+    if request.resource_logs.is_empty() {
+        return Ok(UsageRecords::default());
+    }
+    let mut records = UsageRecords::default();
+    for resource_logs in request.resource_logs {
+        records.extend(records_from_resource_logs(resource_logs)?);
+    }
+    Ok(records)
+}
+
+pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
+    let payload: Value = serde_json::from_slice(bytes)?;
+    let mut records = UsageRecords::default();
+    let resource_logs = payload
+        .get("resourceLogs")
+        .and_then(Value::as_array)
+        .ok_or(OtlpError::MissingResourceLogs)?;
+    for resource_logs in resource_logs {
+        let resource_attributes = resource_logs
+            .get("resource")
+            .and_then(|resource| resource.get("attributes"))
+            .and_then(Value::as_array);
+        let repo = repo_from_json_attributes(resource_attributes);
+        let scope_logs = resource_logs
+            .get("scopeLogs")
+            .and_then(Value::as_array)
+            .ok_or(OtlpError::MissingScopeLogs)?;
+        for scope_logs in scope_logs {
+            let log_records = scope_logs
+                .get("logRecords")
+                .and_then(Value::as_array)
+                .ok_or(OtlpError::MissingLogRecords)?;
+            for log_record in log_records {
+                if let Some(record) = json_tool_call_record(log_record, repo.clone())? {
+                    records.tool_calls.push(record);
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
 fn records_from_resource_metrics(
     resource_metrics: ResourceMetrics,
 ) -> Result<UsageRecords, OtlpError> {
@@ -167,6 +227,33 @@ fn records_from_metric(metric: Metric, repo: RepoBucket) -> Result<UsageRecords,
             }
         }
         _ => {}
+    }
+    Ok(records)
+}
+
+fn records_from_resource_logs(resource_logs: OtlpResourceLogs) -> Result<UsageRecords, OtlpError> {
+    let repo = resource_logs
+        .resource
+        .as_ref()
+        .map(|resource| repo_from_proto_attributes(&resource.attributes))
+        .unwrap_or_else(RepoBucket::no_repo);
+
+    let mut records = UsageRecords::default();
+    for scope_logs in resource_logs.scope_logs {
+        records.extend(records_from_scope_logs_for_logs(scope_logs, repo.clone())?);
+    }
+    Ok(records)
+}
+
+fn records_from_scope_logs_for_logs(
+    scope_logs: ScopeLogs,
+    repo: RepoBucket,
+) -> Result<UsageRecords, OtlpError> {
+    let mut records = UsageRecords::default();
+    for log_record in scope_logs.log_records {
+        if let Some(record) = proto_tool_call_record(log_record, repo.clone())? {
+            records.tool_calls.push(record);
+        }
     }
     Ok(records)
 }
@@ -303,6 +390,141 @@ fn json_cost_record(data_point: &Value, repo: RepoBucket) -> Result<CostUsageRec
     ))
 }
 
+fn proto_tool_call_record(
+    log_record: LogRecord,
+    repo: RepoBucket,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    if !is_tool_result_event(Some(log_record.event_name.as_str()), || {
+        proto_attribute(&log_record.attributes, "event.name")
+    }) {
+        return Ok(None);
+    }
+    let tool_name = proto_tool_name(&log_record.attributes)?;
+    let occurred_at_nanos = if log_record.time_unix_nano == 0 {
+        log_record.observed_time_unix_nano
+    } else {
+        log_record.time_unix_nano
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let harness = HarnessName::new("claude_code");
+    let event_key = tool_call_event_key(
+        &repo,
+        harness.as_str(),
+        tool_name.as_str(),
+        occurred_at_nanos,
+    );
+    Ok(Some(ToolCallRecord::new(
+        event_key,
+        occurred_at,
+        repo,
+        harness,
+        tool_name,
+    )))
+}
+
+fn json_tool_call_record(
+    log_record: &Value,
+    repo: RepoBucket,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    let attributes = log_record.get("attributes").and_then(Value::as_array);
+    if !is_tool_result_event(log_record.get("eventName").and_then(Value::as_str), || {
+        json_attribute(attributes, "event.name")
+    }) {
+        return Ok(None);
+    }
+    let tool_name = json_tool_name(attributes)?;
+    let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
+    let harness = HarnessName::new("claude_code");
+    let event_key = tool_call_event_key(
+        &repo,
+        harness.as_str(),
+        tool_name.as_str(),
+        occurred_at_nanos,
+    );
+    Ok(Some(ToolCallRecord::new(
+        event_key,
+        occurred_at,
+        repo,
+        harness,
+        tool_name,
+    )))
+}
+
+fn proto_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
+    let value = proto_attribute(attributes, "tool.name")
+        .or_else(|| proto_attribute(attributes, "tool_name"))
+        .ok_or(OtlpError::MissingToolName)?;
+    ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
+}
+
+fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError> {
+    let value = json_attribute(attributes, "tool.name")
+        .or_else(|| json_attribute(attributes, "tool_name"))
+        .ok_or(OtlpError::MissingToolName)?;
+    ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
+}
+
+fn tool_call_event_key(
+    repo: &RepoBucket,
+    harness: &str,
+    tool_name: &str,
+    occurred_at_nanos: u64,
+) -> ToolCallEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-log-tool-result");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("harness=");
+    canonical.push_str(harness);
+    canonical.push('\n');
+    canonical.push_str("tool_name=");
+    canonical.push_str(tool_name);
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    ToolCallEventKey::new(canonical)
+}
+
+fn append_repo_key(output: &mut String, repo: &RepoBucket) {
+    match repo {
+        RepoBucket::NoRepo => output.push_str("repo_bucket=no_repo\nrepo_name=\nrepo_path=\n"),
+        RepoBucket::Repo(identity) => {
+            output.push_str("repo_bucket=repo\nrepo_name=");
+            output.push_str(
+                identity
+                    .name
+                    .as_ref()
+                    .map(RepoName::as_str)
+                    .unwrap_or_default(),
+            );
+            output.push_str("\nrepo_path=");
+            output.push_str(
+                identity
+                    .path
+                    .as_ref()
+                    .map(RepoPath::as_str)
+                    .unwrap_or_default(),
+            );
+            output.push('\n');
+        }
+    }
+}
+
+fn is_tool_result_event(
+    event_name: Option<&str>,
+    attribute_event_name: impl FnOnce() -> Option<String>,
+) -> bool {
+    matches_tool_result(event_name) || matches_tool_result(attribute_event_name().as_deref())
+}
+
+fn matches_tool_result(value: Option<&str>) -> bool {
+    value
+        .map(|value| value == "tool_result" || value.ends_with(".tool_result"))
+        .unwrap_or(false)
+}
+
 fn repo_from_proto_attributes(attributes: &[KeyValue]) -> RepoBucket {
     repo_from_optional_attributes(
         proto_attribute(attributes, "repo.name"),
@@ -363,6 +585,16 @@ fn json_number(value: &Value, key: &str) -> Option<u64> {
 
 fn json_timestamp(value: &Value, key: &str) -> Option<TimestampMillis> {
     json_number(value, key).and_then(TimestampMillis::try_from_unix_nanos)
+}
+
+fn json_log_timestamp(value: &Value) -> Result<(u64, TimestampMillis), OtlpError> {
+    ["timeUnixNano", "observedTimeUnixNano"]
+        .into_iter()
+        .find_map(|key| {
+            let raw_value = json_number(value, key)?;
+            TimestampMillis::try_from_unix_nanos(raw_value).map(|timestamp| (raw_value, timestamp))
+        })
+        .ok_or(OtlpError::MissingTimestamp)
 }
 
 fn json_counter_start(value: &Value, key: &str) -> Option<TimestampMillis> {
@@ -624,6 +856,277 @@ mod tests {
             parse_token_usage_json(payload),
             Err(OtlpError::MissingDataPoints)
         ));
+    }
+
+    #[test]
+    fn json_tool_result_requires_explicit_tool_name_attribute() {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "name", "value": { "stringValue": "Read" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_logs(payload),
+            Err(OtlpError::MissingToolName)
+        ));
+    }
+
+    #[test]
+    fn json_tool_result_rejects_content_like_tool_names() {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "Read /Users/oyr/secret.txt" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_logs(payload),
+            Err(OtlpError::InvalidToolName)
+        ));
+    }
+
+    #[test]
+    fn json_tool_result_rejects_unknown_tool_names() {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "InventedTool" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_logs(payload),
+            Err(OtlpError::InvalidToolName)
+        ));
+    }
+
+    #[test]
+    fn json_tool_result_accepts_mcp_tool_names() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "mcp__linear__issue_view" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(
+            records.tool_calls[0].tool_name,
+            ToolName::new("mcp__linear__issue_view")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_tool_result_event_key_reuses_the_selected_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "observedTimeUnixNano": "1781956900000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(records.tool_calls[0].occurred_at.value(), 1_781_956_800_000);
+        assert!(
+            records.tool_calls[0]
+                .event_key
+                .as_str()
+                .contains("occurred_at_nanos=1781956800000000000\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_accept_empty_batches_as_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": []
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_skip_empty_scope_collections() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": []
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_skip_empty_log_record_collections() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": []
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_usage_logs_accept_empty_batches_as_noop() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = ExportLogsServiceRequest {
+            resource_logs: Vec::new(),
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_usage_logs_skip_empty_scope_and_log_record_collections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportLogsServiceRequest {
+            resource_logs: vec![
+                OtlpResourceLogs {
+                    resource: None,
+                    scope_logs: Vec::new(),
+                    schema_url: String::new(),
+                },
+                OtlpResourceLogs {
+                    resource: None,
+                    scope_logs: vec![ScopeLogs {
+                        scope: None,
+                        log_records: Vec::new(),
+                        schema_url: String::new(),
+                    }],
+                    schema_url: String::new(),
+                },
+            ],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_usage_logs_normalize_claude_tool_results_with_repo_and_harness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_logs_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
+            ],
+            vec![
+                LogRecord {
+                    time_unix_nano: 1_781_956_800_000_000_000,
+                    observed_time_unix_nano: 0,
+                    severity_number: 0,
+                    severity_text: String::new(),
+                    body: None,
+                    attributes: vec![string_attribute("tool.name", "Read")],
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                    trace_id: Vec::new(),
+                    span_id: Vec::new(),
+                    event_name: "tool_result".to_owned(),
+                },
+                LogRecord {
+                    time_unix_nano: 1_781_956_900_000_000_000,
+                    observed_time_unix_nano: 0,
+                    severity_number: 0,
+                    severity_text: String::new(),
+                    body: None,
+                    attributes: vec![string_attribute("tool.name", "Ignored")],
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                    trace_id: Vec::new(),
+                    span_id: Vec::new(),
+                    event_name: "user_prompt".to_owned(),
+                },
+            ],
+        );
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(
+            records.tool_calls[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/Users/oyr/projects/kvasir"),
+            ))
+        );
+        assert_eq!(
+            records.tool_calls[0].harness,
+            HarnessName::new("claude_code")
+        );
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
+
+        Ok(())
     }
 
     #[test]
@@ -1065,6 +1568,28 @@ mod tests {
                             is_monotonic: true,
                         })),
                     }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn protobuf_logs_payload_with_resource_attributes(
+        resource_attributes: Vec<KeyValue>,
+        log_records: Vec<LogRecord>,
+    ) -> Vec<u8> {
+        ExportLogsServiceRequest {
+            resource_logs: vec![OtlpResourceLogs {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records,
                     schema_url: String::new(),
                 }],
                 schema_url: String::new(),

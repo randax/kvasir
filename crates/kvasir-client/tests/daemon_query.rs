@@ -4,10 +4,10 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
-    KvasirClient, KvasirClientError, KvasirCostRollup, KvasirCostUsd, KvasirModelName,
-    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
-    KvasirRollupQuery, KvasirSocketPath, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirTokenRollupUpdate,
+    KvasirClient, KvasirClientError, KvasirCostRollup, KvasirCostUsd, KvasirHarnessName,
+    KvasirModelName, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
+    KvasirRollupDay, KvasirRollupQuery, KvasirSocketPath, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::BearerToken;
@@ -298,6 +298,73 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn client_queries_tool_call_rollups_through_daemon_socket() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_tool_result_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: Some(kvasir_repo()),
+    };
+    let rollups = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.tool_call_rollups(query)
+    })
+    .await??;
+
+    assert_eq!(
+        rollups,
+        vec![
+            KvasirToolCallRollup {
+                day: KvasirRollupDay {
+                    year: 2026,
+                    month: 6,
+                    day: 20,
+                },
+                repo: kvasir_repo(),
+                harness: harness("claude_code"),
+                tool_name: tool("Bash"),
+                call_count: 1,
+            },
+            KvasirToolCallRollup {
+                day: KvasirRollupDay {
+                    year: 2026,
+                    month: 6,
+                    day: 20,
+                },
+                repo: kvasir_repo(),
+                harness: harness("claude_code"),
+                tool_name: tool("Read"),
+                call_count: 2,
+            },
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn client_connect_retries_until_daemon_socket_is_available() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
@@ -389,6 +456,71 @@ fn timestamp(year: i32, month: u32, day: u32) -> KvasirTimestampMillis {
 
 fn model(value: &str) -> KvasirModelName {
     KvasirModelName::try_from(value.to_owned()).unwrap()
+}
+
+fn harness(value: &str) -> KvasirHarnessName {
+    KvasirHarnessName::try_from(value.to_owned()).unwrap()
+}
+
+fn tool(value: &str) -> KvasirToolName {
+    KvasirToolName::try_from(value.to_owned()).unwrap()
+}
+
+fn claude_tool_result_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                    ]
+                },
+                "scopeLogs": [{
+                    "logRecords": [
+                        {
+                            "timeUnixNano": "1781956800000000000",
+                            "eventName": "tool_result",
+                            "attributes": [
+                                { "key": "tool.name", "value": { "stringValue": "Read" } }
+                            ]
+                        },
+                        {
+                            "timeUnixNano": "1781956900000000000",
+                            "eventName": "tool_result",
+                            "attributes": [
+                                { "key": "tool.name", "value": { "stringValue": "Read" } }
+                            ]
+                        },
+                        {
+                            "timeUnixNano": "1781957000000000000",
+                            "eventName": "tool_result",
+                            "attributes": [
+                                { "key": "tool.name", "value": { "stringValue": "Bash" } }
+                            ]
+                        }
+                    ]
+                }]
+            },
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/tmp/other-kvasir" } }
+                    ]
+                },
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "Edit" } }
+                        ]
+                    }]
+                }]
+            }
+        ]
+    }"#
 }
 
 fn native_cost_usage_fixture() -> &'static str {

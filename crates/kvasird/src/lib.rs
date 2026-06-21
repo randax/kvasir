@@ -16,11 +16,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use kvasir_core::rpc::{
     BearerToken, CostRollup, CostRollupQuery, RollupQuery, RpcError, RpcRequest, RpcResponse,
-    RpcStreamEvent, TokenRollup,
+    RpcStreamEvent, TokenRollup, ToolCallRollup, ToolCallRollupQuery,
 };
 use kvasir_core::{
-    PriceTable, StoreKey, UsageStore, parse_otlp_json_usage_metrics,
-    parse_otlp_protobuf_usage_metrics,
+    PriceTable, StoreKey, UsageStore, parse_otlp_json_usage_logs, parse_otlp_json_usage_metrics,
+    parse_otlp_protobuf_usage_logs, parse_otlp_protobuf_usage_metrics,
 };
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -309,6 +309,7 @@ pub async fn start_with_store_key_source(
     let otlp_addr = tcp_listener.local_addr()?;
     let app = Router::new()
         .route("/v1/metrics", post(ingest_metrics))
+        .route("/v1/logs", post(ingest_logs))
         .layer(DefaultBodyLimit::max(MAX_OTLP_REQUEST_BYTES))
         .with_state(state.clone());
     let http_task = tokio::spawn(async move {
@@ -469,9 +470,64 @@ pub async fn query_cost_rollup(
     }
 }
 
+pub async fn query_tool_call_rollup(
+    socket_path: impl Into<PathBuf>,
+    query: ToolCallRollupQuery,
+) -> anyhow::Result<Vec<ToolCallRollup>> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::ToolCallRollup { query };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::ToolCallRollup { rollups } => Ok(rollups),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
 async fn ingest_metrics(
     State(state): State<DaemonState>,
     request: Request,
+) -> Result<StatusCode, IngestError> {
+    ingest_otlp(
+        request,
+        state,
+        parse_otlp_json_usage_metrics,
+        parse_otlp_protobuf_usage_metrics,
+    )
+    .await
+}
+
+async fn ingest_logs(
+    State(state): State<DaemonState>,
+    request: Request,
+) -> Result<StatusCode, IngestError> {
+    ingest_otlp(
+        request,
+        state,
+        parse_otlp_json_usage_logs,
+        parse_otlp_protobuf_usage_logs,
+    )
+    .await
+}
+
+async fn ingest_otlp(
+    request: Request,
+    state: DaemonState,
+    parse_json: fn(&[u8]) -> Result<kvasir_core::usage::UsageRecords, kvasir_core::otlp::OtlpError>,
+    parse_protobuf: fn(
+        &[u8],
+    )
+        -> Result<kvasir_core::usage::UsageRecords, kvasir_core::otlp::OtlpError>,
 ) -> Result<StatusCode, IngestError> {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
@@ -486,9 +542,9 @@ async fn ingest_metrics(
         .await
         .map_err(|_| IngestError::PayloadTooLarge)?;
     let records = if content_type.starts_with("application/json") {
-        parse_otlp_json_usage_metrics(&body)
+        parse_json(&body)
     } else if content_type.starts_with("application/x-protobuf") {
-        parse_otlp_protobuf_usage_metrics(&body)
+        parse_protobuf(&body)
     } else {
         return Err(IngestError::UnsupportedContentType);
     }
@@ -580,6 +636,14 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
         Ok(RpcRequest::CostRollup { query }) => {
             match state.store.lock().await.cost_rollups(query) {
                 Ok(rollups) => RpcResponse::CostRollup { rollups },
+                Err(_err) => RpcResponse::Error {
+                    error: RpcError::Internal,
+                },
+            }
+        }
+        Ok(RpcRequest::ToolCallRollup { query }) => {
+            match state.store.lock().await.tool_call_rollups(query) {
+                Ok(rollups) => RpcResponse::ToolCallRollup { rollups },
                 Err(_err) => RpcResponse::Error {
                     error: RpcError::Internal,
                 },
