@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::net::SocketAddr;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_uint};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -16,27 +16,30 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use kvasir_core::rpc::{
     BearerToken, CostRollup, CostRollupQuery, RollupQuery, RpcError, RpcRequest, RpcResponse,
-    TokenRollup,
+    RpcStreamEvent, TokenRollup,
 };
 use kvasir_core::{
     StoreKey, UsageStore, parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024;
+const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
+const PRIVATE_SOCKET_UMASK: c_uint = 0o177;
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
+    fn umask(mask: c_uint) -> c_uint;
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +226,7 @@ fn lexical_normalize_path(path: &Path) -> PathBuf {
 pub struct RunningDaemon {
     otlp_addr: SocketAddr,
     rpc_socket_path: PathBuf,
+    shutdown: broadcast::Sender<()>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -234,6 +238,7 @@ impl RunningDaemon {
 
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
+        let _ = self.shutdown.send(());
         for task in &self.tasks {
             task.abort();
         }
@@ -245,6 +250,8 @@ impl Drop for RunningDaemon {
 struct DaemonState {
     store: Arc<Mutex<UsageStore>>,
     bearer_token: BearerToken,
+    usage_updates: broadcast::Sender<()>,
+    shutdown: broadcast::Sender<()>,
 }
 
 pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
@@ -259,9 +266,13 @@ pub async fn start_with_store_key_source(
     let _startup_lock = StoreStartupLock::acquire(&config.database_path).await?;
     let store_key = store_key_source.resolve()?;
     let store = UsageStore::open(&config.database_path, &store_key)?;
+    let (usage_updates, _usage_update_receiver) = broadcast::channel(32);
+    let (shutdown, _shutdown_receiver) = broadcast::channel(1);
     let state = DaemonState {
         store: Arc::new(Mutex::new(store)),
         bearer_token: config.bearer_token,
+        usage_updates,
+        shutdown: shutdown.clone(),
     };
 
     let tcp_listener = TcpListener::bind(config.otlp_bind).await?;
@@ -275,21 +286,45 @@ pub async fn start_with_store_key_source(
     });
 
     remove_stale_socket(&config.rpc_socket_path)?;
-    let unix_listener = UnixListener::bind(&config.rpc_socket_path)?;
+    let unix_listener = bind_private_unix_listener(&config.rpc_socket_path)?;
     std::fs::set_permissions(
         &config.rpc_socket_path,
         std::fs::Permissions::from_mode(0o600),
     )?;
     let rpc_state = state.clone();
+    let rpc_shutdown = shutdown.clone();
     let rpc_task = tokio::spawn(async move {
-        serve_rpc(unix_listener, rpc_state).await;
+        serve_rpc(unix_listener, rpc_state, rpc_shutdown).await;
     });
 
     Ok(RunningDaemon {
         otlp_addr,
         rpc_socket_path: config.rpc_socket_path,
+        shutdown,
         tasks: vec![http_task, rpc_task],
     })
+}
+
+struct UmaskGuard {
+    previous: c_uint,
+}
+
+impl UmaskGuard {
+    fn set(mask: c_uint) -> Self {
+        let previous = unsafe { umask(mask) };
+        Self { previous }
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { umask(self.previous) };
+    }
+}
+
+fn bind_private_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
+    let _umask = UmaskGuard::set(PRIVATE_SOCKET_UMASK);
+    UnixListener::bind(path)
 }
 
 struct StoreStartupLock {
@@ -372,7 +407,7 @@ pub async fn query_token_rollup(
     stream.write_all(&request_bytes).await?;
 
     let response = read_bounded_line(
-        stream,
+        &mut stream,
         MAX_RPC_RESPONSE_BYTES,
         DaemonError::RpcResponseTooLarge,
     )
@@ -395,7 +430,7 @@ pub async fn query_cost_rollup(
     stream.write_all(&request_bytes).await?;
 
     let response = read_bounded_line(
-        stream,
+        &mut stream,
         MAX_RPC_RESPONSE_BYTES,
         DaemonError::RpcResponseTooLarge,
     )
@@ -432,12 +467,15 @@ async fn ingest_metrics(
     }
     .map_err(|_| IngestError::InvalidPayload)?;
 
-    state
-        .store
-        .lock()
-        .await
-        .ingest_usage(&records)
-        .map_err(|_| IngestError::StoreWriteFailed)?;
+    {
+        state
+            .store
+            .lock()
+            .await
+            .ingest_usage(&records)
+            .map_err(|_| IngestError::StoreWriteFailed)?;
+    }
+    let _ = state.usage_updates.send(());
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -470,14 +508,21 @@ fn reject_oversized_content_length(headers: &HeaderMap) -> Result<(), IngestErro
     }
 }
 
-async fn serve_rpc(listener: UnixListener, state: DaemonState) {
+async fn serve_rpc(listener: UnixListener, state: DaemonState, shutdown: broadcast::Sender<()>) {
+    let mut shutdown_receiver = shutdown.subscribe();
     loop {
-        let (stream, _addr) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(err) => {
-                eprintln!("kvasird rpc accept failed: {err}");
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                continue;
+        let (stream, _addr) = tokio::select! {
+            biased;
+            _ = shutdown_receiver.recv() => return,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        eprintln!("kvasird rpc accept failed: {err}");
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        continue;
+                    }
+                }
             }
         };
         let connection_state = state.clone();
@@ -488,9 +533,9 @@ async fn serve_rpc(listener: UnixListener, state: DaemonState) {
 }
 
 async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow::Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = stream.into_split();
     let request = read_bounded_line(
-        reader,
+        &mut reader,
         MAX_RPC_REQUEST_BYTES,
         DaemonError::RpcRequestTooLarge,
     )
@@ -512,6 +557,49 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                 },
             }
         }
+        Ok(RpcRequest::SubscribeTokenRollup { query }) => {
+            let mut updates = state.usage_updates.subscribe();
+            let mut shutdown = state.shutdown.subscribe();
+            let mut disconnect_probe = [0_u8; 1];
+            let mut last_event = None;
+            match write_token_rollup_event(&mut writer, &state, query.clone(), &mut shutdown)
+                .await?
+            {
+                StreamWriteOutcome::Written(event) => last_event = Some(event),
+                StreamWriteOutcome::Unchanged => {}
+                StreamWriteOutcome::Shutdown => return Ok(()),
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => return Ok(()),
+                    disconnected = reader.read(&mut disconnect_probe) => {
+                        match disconnected {
+                            Ok(0) | Err(_) => return Ok(()),
+                            Ok(_) => return Ok(()),
+                        }
+                    }
+                    update = updates.recv() => {
+                        match update {
+                            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                match write_token_rollup_event_if_changed(
+                                    &mut writer,
+                                    &state,
+                                    query.clone(),
+                                    &mut shutdown,
+                                    last_event.as_ref(),
+                                ).await {
+                                    Ok(StreamWriteOutcome::Written(event)) => last_event = Some(event),
+                                    Ok(StreamWriteOutcome::Unchanged) => {}
+                                    Ok(StreamWriteOutcome::Shutdown) | Err(_) => return Ok(()),
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                    }
+                }
+            }
+        }
         Err(_err) => RpcResponse::Error {
             error: RpcError::InvalidRequest,
         },
@@ -522,8 +610,79 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
     Ok(())
 }
 
+enum StreamWriteOutcome {
+    Written(RpcStreamEvent),
+    Unchanged,
+    Shutdown,
+}
+
+async fn write_token_rollup_event<W>(
+    writer: &mut W,
+    state: &DaemonState,
+    query: RollupQuery,
+    shutdown: &mut broadcast::Receiver<()>,
+) -> anyhow::Result<StreamWriteOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_token_rollup_event_if_changed(writer, state, query, shutdown, None).await
+}
+
+async fn write_token_rollup_event_if_changed<W>(
+    writer: &mut W,
+    state: &DaemonState,
+    query: RollupQuery,
+    shutdown: &mut broadcast::Receiver<()>,
+    last_event: Option<&RpcStreamEvent>,
+) -> anyhow::Result<StreamWriteOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    let event = match state.store.lock().await.token_rollups(query) {
+        Ok(rollups) => RpcStreamEvent::TokenRollup { rollups },
+        Err(_err) => RpcStreamEvent::Error {
+            error: RpcError::Internal,
+        },
+    };
+    if last_event == Some(&event) {
+        return Ok(StreamWriteOutcome::Unchanged);
+    }
+    let mut event_bytes = serde_json::to_vec(&event)?;
+    if event_bytes.len() >= MAX_RPC_RESPONSE_BYTES {
+        let bounded_error = RpcStreamEvent::Error {
+            error: RpcError::Internal,
+        };
+        if last_event == Some(&bounded_error) {
+            return Ok(StreamWriteOutcome::Unchanged);
+        }
+        event_bytes = serde_json::to_vec(&bounded_error)?;
+        return write_rpc_stream_event(writer, shutdown, bounded_error, event_bytes).await;
+    }
+    write_rpc_stream_event(writer, shutdown, event, event_bytes).await
+}
+
+async fn write_rpc_stream_event<W>(
+    writer: &mut W,
+    shutdown: &mut broadcast::Receiver<()>,
+    event: RpcStreamEvent,
+    mut event_bytes: Vec<u8>,
+) -> anyhow::Result<StreamWriteOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    event_bytes.push(b'\n');
+    tokio::select! {
+        biased;
+        _ = shutdown.recv() => return Ok(StreamWriteOutcome::Shutdown),
+        result = tokio::time::timeout(RPC_WRITE_TIMEOUT, writer.write_all(&event_bytes)) => {
+            result??;
+        }
+    }
+    Ok(StreamWriteOutcome::Written(event))
+}
+
 async fn read_bounded_line<R>(
-    mut reader: R,
+    reader: &mut R,
     byte_limit: usize,
     limit_error: DaemonError,
 ) -> Result<String, DaemonError>
