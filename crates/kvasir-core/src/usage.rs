@@ -198,6 +198,18 @@ impl CostUsd {
         self.nanos
     }
 
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.nanos
+            .checked_add(other.nanos)
+            .and_then(Self::from_nanos)
+    }
+
+    pub fn checked_mul(self, multiplier: u64) -> Option<Self> {
+        self.nanos
+            .checked_mul(multiplier)
+            .and_then(Self::from_nanos)
+    }
+
     pub fn storage_value(self) -> i64 {
         i64::try_from(self.nanos).expect("cost is validated before storage")
     }

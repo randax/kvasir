@@ -7,10 +7,12 @@ use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
-    BearerToken, CostRollup, CostRollupQuery, ModelName, RollupDay, RollupQuery, RpcRequest,
-    RpcStreamEvent, TimestampMillis, TokenRollup,
+    BearerToken, CostRollup, CostRollupQuery, CostSource, ModelName, RollupDay, RollupQuery,
+    RpcRequest, RpcStreamEvent, TimestampMillis, TokenRollup,
 };
-use kvasir_core::{CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath};
+use kvasir_core::{
+    CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity, RepoName, RepoPath,
+};
 use kvasird::{
     DaemonConfig, RunningDaemon, StoreKeySource, query_cost_rollup, query_token_rollup,
     start_with_store_key_source,
@@ -28,6 +30,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -92,6 +95,42 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
         ]
     );
 
+    let cost_rollups = query_cost_rollup(
+        rpc_socket_path.clone(),
+        CostRollupQuery::new(
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        ),
+    )
+    .await?;
+
+    assert_eq!(
+        cost_rollups,
+        vec![
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: CostUsd::from_nanos(57_937_500).unwrap(),
+                source: CostSource::Estimated,
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: CostUsd::from_nanos(2_709_000).unwrap(),
+                source: CostSource::Estimated,
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-21")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: CostUsd::from_nanos(19_822_500).unwrap(),
+                source: CostSource::Estimated,
+            },
+        ]
+    );
+
     let later_rollups = query_token_rollup(
         rpc_socket_path,
         RollupQuery::new(
@@ -120,6 +159,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
                 rpc_socket_path: rpc_socket_path.clone(),
                 database_path: database_path.clone(),
                 bearer_token: bearer_token.clone(),
+                price_table: PriceTable::bundled_defaults(),
             },
             StoreKeySource::static_key_for_test([11; 32]),
         )
@@ -141,6 +181,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
             rpc_socket_path: rpc_socket_path.clone(),
             database_path,
             bearer_token,
+            price_table: PriceTable::bundled_defaults(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -198,6 +239,7 @@ async fn metrics_ingest_attributes_rollups_to_repo_and_no_repo_buckets() -> anyh
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -287,6 +329,7 @@ async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -312,24 +355,28 @@ async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
                 repo: kvasir_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 cost_usd: cost_usd("1.25"),
+                source: CostSource::Native,
             },
             CostRollup {
                 day: RollupDay::parse("2026-06-20")?,
                 repo: kvasir_repo(),
                 model: ModelName::new("claude-sonnet-4-20250514"),
                 cost_usd: cost_usd("0.2"),
+                source: CostSource::Native,
             },
             CostRollup {
                 day: RollupDay::parse("2026-06-20")?,
                 repo: other_kvasir_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 cost_usd: cost_usd("0.375"),
+                source: CostSource::Native,
             },
             CostRollup {
                 day: RollupDay::parse("2026-06-21")?,
                 repo: kvasir_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 cost_usd: cost_usd("0.5"),
+                source: CostSource::Native,
             },
         ]
     );
@@ -342,18 +389,21 @@ async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
                 repo: kvasir_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 cost_usd: cost_usd("1.25"),
+                source: CostSource::Native,
             },
             CostRollup {
                 day: RollupDay::parse("2026-06-20")?,
                 repo: kvasir_repo(),
                 model: ModelName::new("claude-sonnet-4-20250514"),
                 cost_usd: cost_usd("0.2"),
+                source: CostSource::Native,
             },
             CostRollup {
                 day: RollupDay::parse("2026-06-21")?,
                 repo: kvasir_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 cost_usd: cost_usd("0.5"),
+                source: CostSource::Native,
             },
         ]
     );
@@ -372,6 +422,7 @@ async fn daemon_refuses_to_replace_non_socket_rpc_path() -> anyhow::Result<()> {
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await;
 
@@ -390,11 +441,158 @@ async fn daemon_creates_private_rpc_socket() -> anyhow::Result<()> {
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
     let mode = std::fs::metadata(rpc_socket_path)?.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_returns_mixed_cost_rollups_with_time_boundaries() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(mixed_cost_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert_eq!(
+        query_cost_rollup(
+            rpc_socket_path.clone(),
+            CostRollupQuery::new(
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap()
+                ),
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 13, 0, 0).unwrap()
+                ),
+            )
+        )
+        .await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("claude-sonnet-4-20250514"),
+            cost_usd: cost_usd("0.2"),
+            source: CostSource::Native,
+        }]
+    );
+
+    assert_eq!(
+        query_cost_rollup(
+            rpc_socket_path.clone(),
+            CostRollupQuery::new(
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 13, 0, 0).unwrap()
+                ),
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 14, 0, 0).unwrap()
+                ),
+            )
+        )
+        .await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("claude-sonnet-4-20250514"),
+            cost_usd: CostUsd::from_nanos(3_000_000).unwrap(),
+            source: CostSource::Estimated,
+        }]
+    );
+
+    assert_eq!(
+        query_cost_rollup(
+            rpc_socket_path,
+            CostRollupQuery::new(
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap()
+                ),
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 14, 0, 0).unwrap()
+                ),
+            )
+        )
+        .await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("claude-sonnet-4-20250514"),
+            cost_usd: cost_usd("0.203"),
+            source: CostSource::Mixed,
+        }]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_uses_configured_price_table_for_estimated_cost() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let price_table = PriceTable::from_prices(vec![ModelTokenPrices::new(
+        ModelName::new("local-test-model"),
+        CostUsd::from_nanos(10).unwrap(),
+        CostUsd::from_nanos(20).unwrap(),
+        CostUsd::from_nanos(5).unwrap(),
+    )]);
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+        price_table,
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(custom_price_token_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert_eq!(
+        query_cost_rollup(
+            rpc_socket_path,
+            CostRollupQuery::new(
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap()
+                ),
+                TimestampMillis::from_datetime(
+                    Utc.with_ymd_and_hms(2026, 6, 20, 13, 0, 0).unwrap()
+                ),
+            )
+        )
+        .await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("local-test-model"),
+            cost_usd: CostUsd::from_nanos(1_000).unwrap(),
+            source: CostSource::Estimated,
+        }]
+    );
 
     Ok(())
 }
@@ -407,6 +605,7 @@ async fn metrics_ingest_rejects_oversized_bodies() -> anyhow::Result<()> {
         rpc_socket_path: temp.path().join("kvasird.sock"),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -438,6 +637,7 @@ async fn metrics_ingest_rejects_payloads_without_token_usage_metrics() -> anyhow
         rpc_socket_path: temp.path().join("kvasird.sock"),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -463,6 +663,7 @@ async fn metrics_ingest_rejects_mixed_batches_with_empty_token_usage_metrics() -
         rpc_socket_path: temp.path().join("kvasird.sock"),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -542,6 +743,7 @@ async fn rpc_subscription_closes_when_extra_input_arrives_after_subscribe_reques
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -583,6 +785,7 @@ async fn daemon_returns_bounded_error_for_oversized_rpc_query_response() -> anyh
         rpc_socket_path: rpc_socket_path.clone(),
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
     })
     .await?;
 
@@ -818,4 +1021,88 @@ fn many_model_token_usage_fixture(model_count: usize) -> String {
             }}]
         }}"#
     )
+}
+
+fn mixed_cost_usage_fixture() -> &'static str {
+    r#"{
+        "resourceMetrics": [{
+            "resource": {
+                "attributes": [
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                ]
+            },
+            "scopeMetrics": [{
+                "metrics": [
+                    {
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956800000000000",
+                                    "asInt": "1000",
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                                        { "key": "token.type", "value": { "stringValue": "input" } }
+                                    ]
+                                },
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781960400000000000",
+                                    "asInt": "200",
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } },
+                                        { "key": "token.type", "value": { "stringValue": "output" } }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asDouble": 0.2,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } }
+                                ]
+                            }]
+                        }
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn custom_price_token_usage_fixture() -> &'static str {
+    r#"{
+        "resourceMetrics": [{
+            "resource": {
+                "attributes": [
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                ]
+            },
+            "scopeMetrics": [{
+                "metrics": [{
+                    "name": "token.usage",
+                    "sum": {
+                        "dataPoints": [{
+                            "startTimeUnixNano": "1781956700000000000",
+                            "timeUnixNano": "1781956800000000000",
+                            "asInt": "100",
+                            "attributes": [
+                                { "key": "model", "value": { "stringValue": "local-test-model" } },
+                                { "key": "token.type", "value": { "stringValue": "input" } }
+                            ]
+                        }]
+                    }
+                }]
+            }]
+        }]
+    }"#
 }
