@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use base64::Engine;
 use chrono::{TimeZone, Utc};
+use http::StatusCode;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
     BearerToken, ModelName, RollupDay, RollupQuery, TimestampMillis, TokenRollup,
@@ -129,6 +130,139 @@ async fn daemon_creates_private_rpc_socket() -> anyhow::Result<()> {
 
     let mode = std::fs::metadata(rpc_socket_path)?.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_rejects_oversized_bodies() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let daemon = start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+    })
+    .await?;
+
+    let mut stream = tokio::net::TcpStream::connect(daemon.otlp_addr()).await?;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        b"POST /v1/metrics HTTP/1.1\r\n\
+          Host: localhost\r\n\
+          Authorization: Bearer test-token\r\n\
+          Content-Type: application/json\r\n\
+          Content-Length: 9437184\r\n\
+          \r\n",
+    )
+    .await?;
+    let mut response = vec![0_u8; 256];
+    let bytes_read = tokio::io::AsyncReadExt::read(&mut stream, &mut response).await?;
+    let response = String::from_utf8(response[..bytes_read].to_vec())?;
+
+    assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_rejects_payloads_without_token_usage_metrics() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let daemon = start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+    })
+    .await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"resourceMetrics":[]}"#)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_rejects_mixed_batches_with_empty_token_usage_metrics() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let daemon = start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+    })
+    .await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{
+                "resourceMetrics": [{
+                    "scopeMetrics": [{
+                        "metrics": [
+                            {
+                                "name": "token.usage",
+                                "sum": {
+                                    "dataPoints": [{
+                                        "timeUnixNano": "1781956800000000000",
+                                        "asInt": "100",
+                                        "attributes": [
+                                            { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                            { "key": "token.type", "value": { "stringValue": "input" } }
+                                        ]
+                                    }]
+                                }
+                            },
+                            {
+                                "name": "token.usage",
+                                "sum": { "dataPoints": [] }
+                            }
+                        ]
+                    }]
+                }]
+            }"#,
+        )
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rpc_client_rejects_oversized_responses() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("oversized-response.sock");
+    let listener = tokio::net::UnixListener::bind(&rpc_socket_path)?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _addr) = listener.accept().await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &vec![b'a'; 17 * 1024]).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"\n").await?;
+        anyhow::Ok(())
+    });
+
+    let result = query_token_rollup(
+        rpc_socket_path,
+        RollupQuery::new(
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        ),
+    )
+    .await;
+
+    assert!(result.is_err());
+    server.await??;
 
     Ok(())
 }

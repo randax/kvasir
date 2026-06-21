@@ -4,18 +4,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
+use axum::body::to_bytes;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use kvasir_core::rpc::{BearerToken, RollupQuery, RpcError, RpcRequest, RpcResponse, TokenRollup};
 use kvasir_core::{UsageStore, parse_otlp_json_metrics, parse_otlp_protobuf_metrics};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -63,6 +66,7 @@ pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
     let otlp_addr = tcp_listener.local_addr()?;
     let app = Router::new()
         .route("/v1/metrics", post(ingest_metrics))
+        .layer(DefaultBodyLimit::max(MAX_OTLP_REQUEST_BYTES))
         .with_state(state.clone());
     let http_task = tokio::spawn(async move {
         let _ = axum::serve(tcp_listener, app).await;
@@ -96,59 +100,54 @@ pub async fn query_token_rollup(
     request_bytes.push(b'\n');
     stream.write_all(&request_bytes).await?;
 
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response).await?;
+    let response = read_bounded_line(
+        stream,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
     match serde_json::from_str::<RpcResponse>(&response)? {
         RpcResponse::TokenRollup { rollups } => Ok(rollups),
-        RpcResponse::Error { error } => anyhow::bail!("rpc failed: {error:?}"),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
     }
 }
 
 async fn ingest_metrics(
     State(state): State<DaemonState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<StatusCode, (StatusCode, String)> {
+    request: Request,
+) -> Result<StatusCode, IngestError> {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     authorize(&state, &headers)?;
+    reject_oversized_content_length(&headers)?;
 
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
+    let body = to_bytes(body, MAX_OTLP_REQUEST_BYTES)
+        .await
+        .map_err(|_| IngestError::PayloadTooLarge)?;
     let records = if content_type.starts_with("application/json") {
         parse_otlp_json_metrics(&body)
     } else if content_type.starts_with("application/x-protobuf") {
         parse_otlp_protobuf_metrics(&body)
     } else {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported metrics content type".to_owned(),
-        ));
+        return Err(IngestError::UnsupportedContentType);
     }
-    .map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "invalid otlp metrics payload".to_owned(),
-        )
-    })?;
+    .map_err(|_| IngestError::InvalidPayload)?;
 
     state
         .store
         .lock()
         .await
         .ingest_token_usage(&records)
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store write failed".to_owned(),
-            )
-        })?;
+        .map_err(|_| IngestError::StoreWriteFailed)?;
 
     Ok(StatusCode::ACCEPTED)
 }
 
-fn authorize(state: &DaemonState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+fn authorize(state: &DaemonState, headers: &HeaderMap) -> Result<(), IngestError> {
     let authorized = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -157,14 +156,34 @@ fn authorize(state: &DaemonState, headers: &HeaderMap) -> Result<(), (StatusCode
     if authorized {
         Ok(())
     } else {
-        Err((StatusCode::UNAUTHORIZED, "missing bearer token".to_owned()))
+        Err(IngestError::Unauthorized)
+    }
+}
+
+fn reject_oversized_content_length(headers: &HeaderMap) -> Result<(), IngestError> {
+    let Some(content_length) = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return Ok(());
+    };
+    if content_length > MAX_OTLP_REQUEST_BYTES {
+        Err(IngestError::PayloadTooLarge)
+    } else {
+        Ok(())
     }
 }
 
 async fn serve_rpc(listener: UnixListener, state: DaemonState) {
     loop {
-        let Ok((stream, _addr)) = listener.accept().await else {
-            break;
+        let (stream, _addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(err) => {
+                eprintln!("kvasird rpc accept failed: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
         };
         let connection_state = state.clone();
         tokio::spawn(async move {
@@ -175,7 +194,12 @@ async fn serve_rpc(listener: UnixListener, state: DaemonState) {
 
 async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let request = read_bounded_line(reader).await?;
+    let request = read_bounded_line(
+        reader,
+        MAX_RPC_REQUEST_BYTES,
+        DaemonError::RpcRequestTooLarge,
+    )
+    .await?;
     let response = match serde_json::from_str::<RpcRequest>(&request) {
         Ok(RpcRequest::TokenRollup { query }) => {
             match state.store.lock().await.token_rollups(query) {
@@ -195,7 +219,14 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
     Ok(())
 }
 
-async fn read_bounded_line(mut reader: tokio::net::unix::OwnedReadHalf) -> anyhow::Result<String> {
+async fn read_bounded_line<R>(
+    mut reader: R,
+    byte_limit: usize,
+    limit_error: DaemonError,
+) -> Result<String, DaemonError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
@@ -205,15 +236,15 @@ async fn read_bounded_line(mut reader: tokio::net::unix::OwnedReadHalf) -> anyho
         }
         for byte in &buffer[..bytes_read] {
             request.push(*byte);
-            if request.len() > MAX_RPC_REQUEST_BYTES {
-                anyhow::bail!("rpc request exceeds byte limit");
+            if request.len() > byte_limit {
+                return Err(limit_error);
             }
             if *byte == b'\n' {
-                return String::from_utf8(request).map_err(Into::into);
+                return String::from_utf8(request).map_err(DaemonError::InvalidRpcUtf8);
             }
         }
     }
-    String::from_utf8(request).map_err(Into::into)
+    String::from_utf8(request).map_err(DaemonError::InvalidRpcUtf8)
 }
 
 fn remove_stale_socket(path: &PathBuf) -> anyhow::Result<()> {
@@ -226,6 +257,49 @@ fn remove_stale_socket(path: &PathBuf) -> anyhow::Result<()> {
         std::fs::remove_file(path)?;
         Ok(())
     } else {
-        anyhow::bail!("refusing to remove non-socket file at {}", path.display())
+        Err(DaemonError::RpcSocketPathIsNotSocket { path: path.clone() }.into())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum IngestError {
+    #[error("unauthorized metrics ingest")]
+    Unauthorized,
+    #[error("unsupported metrics content type")]
+    UnsupportedContentType,
+    #[error("invalid metrics payload")]
+    InvalidPayload,
+    #[error("metrics payload is too large")]
+    PayloadTooLarge,
+    #[error("metrics store write failed")]
+    StoreWriteFailed,
+}
+
+impl IntoResponse for IngestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::InvalidPayload => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::StoreWriteFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+        .into_response()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DaemonError {
+    #[error("rpc request exceeds byte limit")]
+    RpcRequestTooLarge,
+    #[error("rpc response exceeds byte limit")]
+    RpcResponseTooLarge,
+    #[error("rpc returned typed error {0:?}")]
+    RpcReturnedError(RpcError),
+    #[error("rpc payload is not valid utf-8")]
+    InvalidRpcUtf8(#[from] std::string::FromUtf8Error),
+    #[error("rpc io failed")]
+    RpcIo(#[from] std::io::Error),
+    #[error("refusing to remove non-socket rpc path {path}")]
+    RpcSocketPathIsNotSocket { path: PathBuf },
 }
