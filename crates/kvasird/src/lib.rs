@@ -9,8 +9,11 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use kvasir_core::rpc::{BearerToken, RollupQuery, RpcError, RpcRequest, RpcResponse, TokenRollup};
-use kvasir_core::{UsageStore, parse_otlp_json_metrics, parse_otlp_protobuf_metrics};
+use kvasir_core::rpc::{
+    BearerToken, CostRollup, CostRollupQuery, RollupQuery, RpcError, RpcRequest, RpcResponse,
+    TokenRollup,
+};
+use kvasir_core::{UsageStore, parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Mutex;
@@ -109,6 +112,30 @@ pub async fn query_token_rollup(
     match serde_json::from_str::<RpcResponse>(&response)? {
         RpcResponse::TokenRollup { rollups } => Ok(rollups),
         RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
+pub async fn query_cost_rollup(
+    socket_path: impl Into<PathBuf>,
+    query: CostRollupQuery,
+) -> anyhow::Result<Vec<CostRollup>> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::CostRollup { query };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let response = read_bounded_line(
+        stream,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::CostRollup { rollups } => Ok(rollups),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
     }
 }
 
@@ -129,9 +156,9 @@ async fn ingest_metrics(
         .await
         .map_err(|_| IngestError::PayloadTooLarge)?;
     let records = if content_type.starts_with("application/json") {
-        parse_otlp_json_metrics(&body)
+        parse_otlp_json_usage_metrics(&body)
     } else if content_type.starts_with("application/x-protobuf") {
-        parse_otlp_protobuf_metrics(&body)
+        parse_otlp_protobuf_usage_metrics(&body)
     } else {
         return Err(IngestError::UnsupportedContentType);
     }
@@ -141,7 +168,7 @@ async fn ingest_metrics(
         .store
         .lock()
         .await
-        .ingest_token_usage(&records)
+        .ingest_usage(&records)
         .map_err(|_| IngestError::StoreWriteFailed)?;
 
     Ok(StatusCode::ACCEPTED)
@@ -204,6 +231,14 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
         Ok(RpcRequest::TokenRollup { query }) => {
             match state.store.lock().await.token_rollups(query) {
                 Ok(rollups) => RpcResponse::TokenRollup { rollups },
+                Err(_err) => RpcResponse::Error {
+                    error: RpcError::Internal,
+                },
+            }
+        }
+        Ok(RpcRequest::CostRollup { query }) => {
+            match state.store.lock().await.cost_rollups(query) {
+                Ok(rollups) => RpcResponse::CostRollup { rollups },
                 Err(_err) => RpcResponse::Error {
                     error: RpcError::Internal,
                 },
@@ -296,6 +331,8 @@ enum DaemonError {
     RpcResponseTooLarge,
     #[error("rpc returned typed error {0:?}")]
     RpcReturnedError(RpcError),
+    #[error("rpc returned the wrong response type")]
+    RpcReturnedWrongResponse,
     #[error("rpc payload is not valid utf-8")]
     InvalidRpcUtf8(#[from] std::string::FromUtf8Error),
     #[error("rpc io failed")]

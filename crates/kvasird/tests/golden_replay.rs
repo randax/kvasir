@@ -6,10 +6,11 @@ use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
-    BearerToken, ModelName, RollupDay, RollupQuery, TimestampMillis, TokenRollup,
+    BearerToken, CostRollup, CostRollupQuery, ModelName, RollupDay, RollupQuery, TimestampMillis,
+    TokenRollup,
 };
-use kvasir_core::{RepoBucket, RepoIdentity, RepoName, RepoPath};
-use kvasird::{DaemonConfig, query_token_rollup, start};
+use kvasir_core::{CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath};
+use kvasird::{DaemonConfig, query_cost_rollup, query_token_rollup, start};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -184,6 +185,90 @@ async fn metrics_ingest_attributes_rollups_to_repo_and_no_repo_buckets() -> anyh
             output_tokens: 0,
             cache_tokens: 0,
         }]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(native_cost_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = CostRollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+
+    assert_eq!(
+        query_cost_rollup(rpc_socket_path.clone(), query.clone()).await?,
+        vec![
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: cost_usd("1.25"),
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.2"),
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: other_kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: cost_usd("0.375"),
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-21")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: cost_usd("0.5"),
+            },
+        ]
+    );
+
+    assert_eq!(
+        query_cost_rollup(rpc_socket_path, query.with_repo(kvasir_repo())).await?,
+        vec![
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: cost_usd("1.25"),
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-sonnet-4-20250514"),
+                cost_usd: cost_usd("0.2"),
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-21")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: cost_usd("0.5"),
+            },
+        ]
     );
 
     Ok(())
@@ -379,6 +464,10 @@ fn other_kvasir_repo() -> RepoBucket {
     ))
 }
 
+fn cost_usd(value: &str) -> CostUsd {
+    CostUsd::from_decimal_str(value).expect("test cost must be valid")
+}
+
 fn repo_and_no_repo_metrics_fixture() -> &'static str {
     r#"{
         "resourceMetrics": [
@@ -442,6 +531,75 @@ fn repo_and_no_repo_metrics_fixture() -> &'static str {
                                 "attributes": [
                                     { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
                                     { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }
+        ]
+    }"#
+}
+
+fn native_cost_usage_fixture() -> &'static str {
+    r#"{
+        "resourceMetrics": [
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asDouble": 1.25,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                ]
+                            },
+                            {
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1782043200000000000",
+                                "asDouble": 1.75,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                ]
+                            },
+                            {
+                                "startTimeUnixNano": "1781962100000000000",
+                                "timeUnixNano": "1781962200000000000",
+                                "asDouble": 0.2,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-sonnet-4-20250514" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            },
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/tmp/other-kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asDouble": 0.375,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
                                 ]
                             }]
                         }
