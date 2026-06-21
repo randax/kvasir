@@ -7,6 +7,12 @@ pub struct KvasirSocketPath(String);
 pub struct KvasirModelName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirHarnessName(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirToolName(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirRepoName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +20,8 @@ pub struct KvasirRepoPath(String);
 
 uniffi::custom_type!(KvasirSocketPath, String);
 uniffi::custom_type!(KvasirModelName, String);
+uniffi::custom_type!(KvasirHarnessName, String);
+uniffi::custom_type!(KvasirToolName, String);
 uniffi::custom_type!(KvasirRepoName, String);
 uniffi::custom_type!(KvasirRepoPath, String);
 
@@ -77,6 +85,15 @@ pub struct KvasirCostRollup {
     pub cost_usd: KvasirCostUsd,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirToolCallRollup {
+    pub day: KvasirRollupDay,
+    pub repo: KvasirRepoBucket,
+    pub harness: KvasirHarnessName,
+    pub tool_name: KvasirToolName,
+    pub call_count: u64,
+}
+
 impl KvasirSocketPath {
     pub(crate) fn into_string(self) -> String {
         self.0
@@ -85,6 +102,18 @@ impl KvasirSocketPath {
 
 impl KvasirModelName {
     pub(crate) fn from_core(value: kvasir_core::rpc::ModelName) -> Self {
+        Self(value.as_str().to_owned())
+    }
+}
+
+impl KvasirHarnessName {
+    pub(crate) fn from_core(value: kvasir_core::rpc::HarnessName) -> Self {
+        Self(value.as_str().to_owned())
+    }
+}
+
+impl KvasirToolName {
+    pub(crate) fn from_core(value: kvasir_core::rpc::ToolName) -> Self {
         Self(value.as_str().to_owned())
     }
 }
@@ -121,6 +150,18 @@ impl From<KvasirModelName> for String {
     }
 }
 
+impl From<KvasirHarnessName> for String {
+    fn from(value: KvasirHarnessName) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirToolName> for String {
+    fn from(value: KvasirToolName) -> Self {
+        value.0
+    }
+}
+
 impl From<KvasirRepoName> for String {
     fn from(value: KvasirRepoName) -> Self {
         value.0
@@ -146,6 +187,26 @@ impl TryFrom<String> for KvasirModelName {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirHarnessName {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirToolName {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if kvasir_core::rpc::ToolName::try_new(&value).is_some() {
+            Ok(Self(value))
+        } else {
+            Err(KvasirClientError::InvalidQuery)
+        }
     }
 }
 

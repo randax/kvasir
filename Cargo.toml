@@ -20,7 +20,7 @@ chrono = { version = "0.4.42", features = ["serde"] }
 getrandom = "0.3.4"
 http = "1.4.0"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "metrics", "with-serde"] }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "logs", "metrics", "with-serde"] }
 prost = "0.14.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher"] }

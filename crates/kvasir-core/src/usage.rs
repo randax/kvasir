@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::rpc::{ModelName, TimestampMillis};
+use crate::rpc::{HarnessName, ModelName, TimestampMillis, ToolName};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoName(String);
@@ -123,6 +123,46 @@ pub struct TokenUsageRecord {
     pub model: ModelName,
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub event_key: ToolCallEventKey,
+    pub occurred_at: TimestampMillis,
+    pub repo: RepoBucket,
+    pub harness: HarnessName,
+    pub tool_name: ToolName,
+}
+
+impl ToolCallRecord {
+    pub fn new(
+        event_key: ToolCallEventKey,
+        occurred_at: TimestampMillis,
+        repo: RepoBucket,
+        harness: HarnessName,
+        tool_name: ToolName,
+    ) -> Self {
+        Self {
+            event_key,
+            occurred_at,
+            repo,
+            harness,
+            tool_name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallEventKey(String);
+
+impl ToolCallEventKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 const COST_NANOS_PER_USD: u64 = 1_000_000_000;
@@ -256,6 +296,7 @@ impl CostUsageRecord {
 pub struct UsageRecords {
     pub token_usage: Vec<TokenUsageRecord>,
     pub cost_usage: Vec<CostUsageRecord>,
+    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 impl UsageRecords {
@@ -263,16 +304,18 @@ impl UsageRecords {
         Self {
             token_usage,
             cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.token_usage.is_empty() && self.cost_usage.is_empty()
+        self.token_usage.is_empty() && self.cost_usage.is_empty() && self.tool_calls.is_empty()
     }
 
     pub fn extend(&mut self, other: Self) {
         self.token_usage.extend(other.token_usage);
         self.cost_usage.extend(other.cost_usage);
+        self.tool_calls.extend(other.tool_calls);
     }
 }
 

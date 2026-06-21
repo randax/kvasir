@@ -1,14 +1,14 @@
 use chrono::Datelike;
 use kvasir_core::rpc::{
     CostRollup as CoreCostRollup, CostRollupQuery, RollupQuery, RpcError, TimestampMillis,
-    TokenRollup as CoreTokenRollup,
+    TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
 };
 use kvasir_core::{RepoBucket, RepoIdentity};
 
 use crate::error::KvasirClientError;
 use crate::types::{
     KvasirCostRollup, KvasirCostUsd, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
-    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTokenRollup,
+    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTokenRollup, KvasirToolCallRollup,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -27,6 +27,21 @@ impl TryFrom<KvasirRollupQuery> for RollupQuery {
 }
 
 impl TryFrom<KvasirRollupQuery> for CostRollupQuery {
+    type Error = KvasirClientError;
+
+    fn try_from(query: KvasirRollupQuery) -> Result<Self, Self::Error> {
+        let mut core_query = Self::new(
+            TimestampMillis::from_millis(query.start.value),
+            TimestampMillis::from_millis(query.end.value),
+        );
+        if let Some(repo) = query.repo {
+            core_query = core_query.with_repo(repo.try_into()?);
+        }
+        Ok(core_query)
+    }
+}
+
+impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
     type Error = KvasirClientError;
 
     fn try_from(query: KvasirRollupQuery) -> Result<Self, Self::Error> {
@@ -84,6 +99,20 @@ impl TryFrom<CoreCostRollup> for KvasirCostRollup {
             cost_usd: KvasirCostUsd {
                 nanos: rollup.cost_usd.as_nanos(),
             },
+        })
+    }
+}
+
+impl TryFrom<CoreToolCallRollup> for KvasirToolCallRollup {
+    type Error = KvasirClientError;
+
+    fn try_from(rollup: CoreToolCallRollup) -> Result<Self, Self::Error> {
+        Ok(Self {
+            day: rollup_day_from_core(rollup.day)?,
+            repo: rollup.repo.into(),
+            harness: crate::types::KvasirHarnessName::from_core(rollup.harness),
+            tool_name: crate::types::KvasirToolName::from_core(rollup.tool_name),
+            call_count: rollup.call_count,
         })
     }
 }

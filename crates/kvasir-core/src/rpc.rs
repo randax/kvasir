@@ -29,6 +29,72 @@ impl ModelName {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessName(String);
+
+impl HarnessName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolName(String);
+
+impl ToolName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self::try_new(value).expect("tool name must be a valid tool identifier")
+    }
+
+    pub fn try_new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        if is_known_claude_tool_name(&value) || is_valid_mcp_tool_name(&value) {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn is_known_claude_tool_name(value: &str) -> bool {
+    matches!(
+        value,
+        "Bash"
+            | "BashOutput"
+            | "Edit"
+            | "ExitPlanMode"
+            | "Glob"
+            | "Grep"
+            | "KillBash"
+            | "LS"
+            | "MultiEdit"
+            | "NotebookEdit"
+            | "NotebookRead"
+            | "Read"
+            | "Task"
+            | "TodoWrite"
+            | "WebFetch"
+            | "WebSearch"
+            | "Write"
+    )
+}
+
+fn is_valid_mcp_tool_name(value: &str) -> bool {
+    value.starts_with("mcp__")
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TimestampMillis(i64);
 
@@ -115,6 +181,30 @@ pub struct CostRollupQuery {
     pub repo: Option<RepoBucket>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRollupQuery {
+    pub start: TimestampMillis,
+    pub end: TimestampMillis,
+    pub repo: Option<RepoBucket>,
+}
+
+impl ToolCallRollupQuery {
+    pub fn new(start: TimestampMillis, end: TimestampMillis) -> Self {
+        Self {
+            start,
+            end,
+            repo: None,
+        }
+    }
+
+    pub fn with_repo(self, repo: RepoBucket) -> Self {
+        Self {
+            repo: Some(repo),
+            ..self
+        }
+    }
+}
+
 impl CostRollupQuery {
     pub fn new(start: TimestampMillis, end: TimestampMillis) -> Self {
         Self {
@@ -151,6 +241,15 @@ pub struct CostRollup {
     pub source: CostSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRollup {
+    pub day: RollupDay,
+    pub repo: RepoBucket,
+    pub harness: HarnessName,
+    pub tool_name: ToolName,
+    pub call_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostSource {
@@ -164,6 +263,7 @@ pub enum CostSource {
 pub enum RpcRequest {
     TokenRollup { query: RollupQuery },
     CostRollup { query: CostRollupQuery },
+    ToolCallRollup { query: ToolCallRollupQuery },
     SubscribeTokenRollup { query: RollupQuery },
 }
 
@@ -172,6 +272,7 @@ pub enum RpcRequest {
 pub enum RpcResponse {
     TokenRollup { rollups: Vec<TokenRollup> },
     CostRollup { rollups: Vec<CostRollup> },
+    ToolCallRollup { rollups: Vec<ToolCallRollup> },
     Error { error: RpcError },
 }
 
