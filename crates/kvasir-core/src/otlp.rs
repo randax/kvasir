@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::rpc::{ModelName, TimestampMillis};
 use crate::usage::{
-    RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageRecord,
+    CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
+    TokenMeasure, TokenUsageRecord, UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -25,10 +26,16 @@ pub enum OtlpError {
     InvalidMeasure,
     #[error("otlp token datapoint is missing token count")]
     MissingTokenCount,
+    #[error("otlp cost datapoint is missing cost")]
+    MissingCost,
+    #[error("otlp cost datapoint has invalid cost")]
+    InvalidCost,
     #[error("otlp token datapoint has non-integral token count")]
     NonIntegralTokenCount,
     #[error("otlp token datapoint is missing timestamp")]
     MissingTimestamp,
+    #[error("otlp cumulative datapoint is missing counter start timestamp")]
+    MissingCounterStart,
     #[error("otlp payload is missing resource metrics")]
     MissingResourceMetrics,
     #[error("otlp payload is missing scope metrics")]
@@ -43,12 +50,12 @@ pub enum OtlpError {
     NoTokenUsageMetrics,
 }
 
-pub fn parse_otlp_protobuf_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+pub fn parse_otlp_protobuf_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
     let request = ExportMetricsServiceRequest::decode(bytes)?;
     if request.resource_metrics.is_empty() {
         return Err(OtlpError::MissingResourceMetrics);
     }
-    let mut records = Vec::new();
+    let mut records = UsageRecords::default();
     for resource_metrics in request.resource_metrics {
         records.extend(records_from_resource_metrics(resource_metrics)?);
     }
@@ -58,9 +65,9 @@ pub fn parse_otlp_protobuf_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>
     Ok(records)
 }
 
-pub fn parse_otlp_json_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
     let payload: Value = serde_json::from_slice(bytes)?;
-    let mut records = Vec::new();
+    let mut records = UsageRecords::default();
     let resource_metrics = payload
         .get("resourceMetrics")
         .and_then(Value::as_array)
@@ -81,37 +88,24 @@ pub fn parse_otlp_json_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, Ot
                 .and_then(Value::as_array)
                 .ok_or(OtlpError::MissingMetrics)?;
             for metric in metrics {
-                if metric.get("name").and_then(Value::as_str) != Some("token.usage") {
-                    continue;
-                }
-                let data_points = metric
-                    .get("sum")
-                    .and_then(|sum| sum.get("dataPoints"))
-                    .and_then(Value::as_array)
-                    .filter(|data_points| !data_points.is_empty())
-                    .ok_or(OtlpError::MissingDataPoints)?;
-                for data_point in data_points {
-                    let attributes = data_point.get("attributes").and_then(Value::as_array);
-                    let model =
-                        json_attribute(attributes, "model").ok_or(OtlpError::MissingModel)?;
-                    let measure = json_attribute(attributes, "token.type")
-                        .or_else(|| json_attribute(attributes, "type"))
-                        .and_then(|value| TokenMeasure::from_attribute(&value))
-                        .ok_or(OtlpError::InvalidMeasure)?;
-                    let token_count = json_token_count(data_point)?;
-                    let occurred_at = json_timestamp(data_point, "timeUnixNano")
-                        .or_else(|| json_timestamp(data_point, "startTimeUnixNano"))
-                        .ok_or(OtlpError::MissingTimestamp)?;
-                    let counter_start =
-                        json_timestamp(data_point, "startTimeUnixNano").unwrap_or(occurred_at);
-                    records.push(TokenUsageRecord::new(
-                        occurred_at,
-                        counter_start,
-                        repo.clone(),
-                        ModelName::new(model),
-                        measure,
-                        token_count,
-                    ));
+                match metric.get("name").and_then(Value::as_str) {
+                    Some("token.usage") => {
+                        let data_points = json_data_points(metric)?;
+                        for data_point in data_points {
+                            records
+                                .token_usage
+                                .push(json_token_record(data_point, repo.clone())?);
+                        }
+                    }
+                    Some("cost.usage") => {
+                        let data_points = json_data_points(metric)?;
+                        for data_point in data_points {
+                            records
+                                .cost_usage
+                                .push(json_cost_record(data_point, repo.clone())?);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -124,7 +118,7 @@ pub fn parse_otlp_json_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, Ot
 
 fn records_from_resource_metrics(
     resource_metrics: ResourceMetrics,
-) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+) -> Result<UsageRecords, OtlpError> {
     let repo = resource_metrics
         .resource
         .as_ref()
@@ -134,7 +128,7 @@ fn records_from_resource_metrics(
     if resource_metrics.scope_metrics.is_empty() {
         return Err(OtlpError::MissingScopeMetrics);
     }
-    let mut records = Vec::new();
+    let mut records = UsageRecords::default();
     for scope_metrics in resource_metrics.scope_metrics {
         records.extend(records_from_scope_metrics(scope_metrics, repo.clone())?);
     }
@@ -144,25 +138,42 @@ fn records_from_resource_metrics(
 fn records_from_scope_metrics(
     scope_metrics: ScopeMetrics,
     repo: RepoBucket,
-) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+) -> Result<UsageRecords, OtlpError> {
     if scope_metrics.metrics.is_empty() {
         return Err(OtlpError::MissingMetrics);
     }
-    let mut records = Vec::new();
+    let mut records = UsageRecords::default();
     for metric in scope_metrics.metrics {
         records.extend(records_from_metric(metric, repo.clone())?);
     }
     Ok(records)
 }
 
-fn records_from_metric(
-    metric: Metric,
-    repo: RepoBucket,
-) -> Result<Vec<TokenUsageRecord>, OtlpError> {
-    if metric.name != "token.usage" {
-        return Ok(Vec::new());
+fn records_from_metric(metric: Metric, repo: RepoBucket) -> Result<UsageRecords, OtlpError> {
+    let mut records = UsageRecords::default();
+    match metric.name.as_str() {
+        "token.usage" => {
+            for data_point in proto_data_points(metric)? {
+                records
+                    .token_usage
+                    .push(record_from_proto_data_point(data_point, repo.clone())?);
+            }
+        }
+        "cost.usage" => {
+            for data_point in proto_data_points(metric)? {
+                records
+                    .cost_usage
+                    .push(cost_record_from_proto_data_point(data_point, repo.clone())?);
+            }
+        }
+        _ => {}
     }
+    Ok(records)
+}
 
+fn proto_data_points(
+    metric: Metric,
+) -> Result<Vec<opentelemetry_proto::tonic::metrics::v1::NumberDataPoint>, OtlpError> {
     let sum = match metric.data {
         Some(metric::Data::Sum(sum)) => sum,
         Some(_) | None => return Err(OtlpError::InvalidMetricKind),
@@ -170,11 +181,7 @@ fn records_from_metric(
     if sum.data_points.is_empty() {
         return Err(OtlpError::MissingDataPoints);
     }
-
-    sum.data_points
-        .into_iter()
-        .map(|data_point| record_from_proto_data_point(data_point, repo.clone()))
-        .collect()
+    Ok(sum.data_points)
 }
 
 fn record_from_proto_data_point(
@@ -212,6 +219,87 @@ fn record_from_proto_data_point(
         ModelName::new(model),
         measure,
         token_count,
+    ))
+}
+
+fn cost_record_from_proto_data_point(
+    data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
+    repo: RepoBucket,
+) -> Result<CostUsageRecord, OtlpError> {
+    let model = proto_attribute(&data_point.attributes, "model").ok_or(OtlpError::MissingModel)?;
+    let cost_usd = match data_point.value.ok_or(OtlpError::MissingCost)? {
+        number_data_point::Value::AsInt(value) => {
+            CostUsd::from_whole_usd(u64::try_from(value).map_err(|_| OtlpError::InvalidCost)?)
+                .ok_or(OtlpError::InvalidCost)?
+        }
+        number_data_point::Value::AsDouble(value) => {
+            CostUsd::from_f64(value).ok_or(OtlpError::InvalidCost)?
+        }
+    };
+    let occurred_at = if data_point.time_unix_nano == 0 {
+        TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
+    } else {
+        TimestampMillis::try_from_unix_nanos(data_point.time_unix_nano)
+    }
+    .ok_or(OtlpError::MissingTimestamp)?;
+    let counter_start = TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
+        .filter(|timestamp| data_point.start_time_unix_nano != 0 && timestamp.value() != 0)
+        .ok_or(OtlpError::MissingCounterStart)?;
+    Ok(CostUsageRecord::new(
+        occurred_at,
+        counter_start,
+        repo,
+        ModelName::new(model),
+        cost_usd,
+    ))
+}
+
+fn json_data_points(metric: &Value) -> Result<&Vec<Value>, OtlpError> {
+    metric
+        .get("sum")
+        .and_then(|sum| sum.get("dataPoints"))
+        .and_then(Value::as_array)
+        .filter(|data_points| !data_points.is_empty())
+        .ok_or(OtlpError::MissingDataPoints)
+}
+
+fn json_token_record(data_point: &Value, repo: RepoBucket) -> Result<TokenUsageRecord, OtlpError> {
+    let attributes = data_point.get("attributes").and_then(Value::as_array);
+    let model = json_attribute(attributes, "model").ok_or(OtlpError::MissingModel)?;
+    let measure = json_attribute(attributes, "token.type")
+        .or_else(|| json_attribute(attributes, "type"))
+        .and_then(|value| TokenMeasure::from_attribute(&value))
+        .ok_or(OtlpError::InvalidMeasure)?;
+    let token_count = json_token_count(data_point)?;
+    let occurred_at = json_timestamp(data_point, "timeUnixNano")
+        .or_else(|| json_timestamp(data_point, "startTimeUnixNano"))
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let counter_start = json_timestamp(data_point, "startTimeUnixNano").unwrap_or(occurred_at);
+    Ok(TokenUsageRecord::new(
+        occurred_at,
+        counter_start,
+        repo,
+        ModelName::new(model),
+        measure,
+        token_count,
+    ))
+}
+
+fn json_cost_record(data_point: &Value, repo: RepoBucket) -> Result<CostUsageRecord, OtlpError> {
+    let attributes = data_point.get("attributes").and_then(Value::as_array);
+    let model = json_attribute(attributes, "model").ok_or(OtlpError::MissingModel)?;
+    let cost_usd = json_cost(data_point)?;
+    let occurred_at = json_timestamp(data_point, "timeUnixNano")
+        .or_else(|| json_timestamp(data_point, "startTimeUnixNano"))
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let counter_start = json_counter_start(data_point, "startTimeUnixNano")
+        .ok_or(OtlpError::MissingCounterStart)?;
+    Ok(CostUsageRecord::new(
+        occurred_at,
+        counter_start,
+        repo,
+        ModelName::new(model),
+        cost_usd,
     ))
 }
 
@@ -277,6 +365,14 @@ fn json_timestamp(value: &Value, key: &str) -> Option<TimestampMillis> {
     json_number(value, key).and_then(TimestampMillis::try_from_unix_nanos)
 }
 
+fn json_counter_start(value: &Value, key: &str) -> Option<TimestampMillis> {
+    let raw_value = json_number(value, key)?;
+    if raw_value == 0 {
+        return None;
+    }
+    TimestampMillis::try_from_unix_nanos(raw_value).filter(|timestamp| timestamp.value() != 0)
+}
+
 fn json_token_count(value: &Value) -> Result<TokenCount, OtlpError> {
     let raw_value = match (value.get("asInt"), value.get("asDouble")) {
         (Some(value), _) => json_u64_value(value).ok_or(OtlpError::NumberOutOfRange)?,
@@ -289,6 +385,15 @@ fn json_token_count(value: &Value) -> Result<TokenCount, OtlpError> {
         (None, None) => return Err(OtlpError::MissingTokenCount),
     };
     TokenCount::try_new(raw_value).ok_or(OtlpError::NumberOutOfRange)
+}
+
+fn json_cost(value: &Value) -> Result<CostUsd, OtlpError> {
+    let raw_value = match (value.get("asDouble"), value.get("asInt")) {
+        (Some(value), _) => json_cost_value(value).ok_or(OtlpError::InvalidCost)?,
+        (None, Some(value)) => json_cost_value(value).ok_or(OtlpError::InvalidCost)?,
+        (None, None) => return Err(OtlpError::MissingCost),
+    };
+    Ok(raw_value)
 }
 
 fn token_count_from_f64(value: f64) -> Result<TokenCount, OtlpError> {
@@ -318,6 +423,15 @@ fn json_u64_value(value: &Value) -> Option<u64> {
         .or_else(|| value.as_f64().and_then(valid_u64_from_f64))
 }
 
+fn json_cost_value(value: &Value) -> Option<CostUsd> {
+    match value {
+        Value::Number(number) => CostUsd::from_decimal_str(&number.to_string())
+            .or_else(|| number.as_f64().and_then(CostUsd::from_f64)),
+        Value::String(text) => CostUsd::from_decimal_str(text),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -343,7 +457,7 @@ mod tests {
         }]);
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::MissingModel)
         ));
     }
@@ -356,7 +470,7 @@ mod tests {
         .encode_to_vec();
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::MissingResourceMetrics)
         ));
     }
@@ -376,7 +490,7 @@ mod tests {
         }]);
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::NonIntegralTokenCount)
         ));
     }
@@ -426,7 +540,7 @@ mod tests {
         .encode_to_vec();
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::InvalidMetricKind)
         ));
     }
@@ -454,7 +568,7 @@ mod tests {
         }"#;
 
         assert!(matches!(
-            parse_otlp_json_metrics(payload),
+            parse_token_usage_json(payload),
             Err(OtlpError::NonIntegralTokenCount)
         ));
     }
@@ -473,7 +587,7 @@ mod tests {
         }"#;
 
         assert!(matches!(
-            parse_otlp_json_metrics(payload),
+            parse_token_usage_json(payload),
             Err(OtlpError::NoTokenUsageMetrics)
         ));
     }
@@ -507,7 +621,7 @@ mod tests {
         }"#;
 
         assert!(matches!(
-            parse_otlp_json_metrics(payload),
+            parse_token_usage_json(payload),
             Err(OtlpError::MissingDataPoints)
         ));
     }
@@ -539,7 +653,7 @@ mod tests {
             }]
         }"#;
 
-        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+        let records = parse_token_usage_json(payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -566,7 +680,7 @@ mod tests {
             }],
         );
 
-        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+        let records = parse_token_usage_protobuf(&payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -604,7 +718,7 @@ mod tests {
             }]
         }"#;
 
-        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+        let records = parse_token_usage_json(payload).expect("valid token usage");
 
         assert_eq!(records[0].repo, RepoBucket::no_repo());
     }
@@ -629,7 +743,7 @@ mod tests {
             }],
         );
 
-        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+        let records = parse_token_usage_protobuf(&payload).expect("valid token usage");
 
         assert_eq!(records[0].repo, RepoBucket::no_repo());
     }
@@ -662,7 +776,7 @@ mod tests {
             }]
         }"#;
 
-        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+        let records = parse_token_usage_json(payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -693,7 +807,7 @@ mod tests {
             }],
         );
 
-        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+        let records = parse_token_usage_protobuf(&payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -702,6 +816,193 @@ mod tests {
                 RepoPath::new("/repos/kvasir")
             ))
         );
+    }
+
+    #[test]
+    fn json_usage_parser_accepts_cost_only_payloads() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asDouble": 0.1,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_metrics(payload).expect("valid cost usage");
+
+        assert!(records.token_usage.is_empty());
+        assert_eq!(records.cost_usage.len(), 1);
+        assert_eq!(records.cost_usage[0].repo, RepoBucket::no_repo());
+        assert_eq!(
+            records.cost_usage[0].cost_usd,
+            CostUsd::from_decimal_str("0.1").unwrap()
+        );
+    }
+
+    #[test]
+    fn json_usage_parser_preserves_scientific_notation_cost() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956800000000000",
+                                    "asDouble": 1.23e-7,
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                    ]
+                                },
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956900000000000",
+                                    "asDouble": "2.5e-7",
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                    ]
+                                }
+                            ]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_metrics(payload).expect("valid cost usage");
+
+        assert_eq!(records.cost_usage.len(), 2);
+        assert_eq!(
+            records.cost_usage[0].cost_usd,
+            CostUsd::from_nanos(123).unwrap()
+        );
+        assert_eq!(
+            records.cost_usage[1].cost_usd,
+            CostUsd::from_nanos(250).unwrap()
+        );
+    }
+
+    #[test]
+    fn json_usage_parser_rejects_cost_without_counter_start() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "asDouble": 0.1,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn json_usage_parser_rejects_zero_cost_counter_start() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "cost.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "0",
+                                "timeUnixNano": "1781956800000000000",
+                                "asDouble": 0.1,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn protobuf_usage_parser_preserves_native_cost_with_repo_attributes() {
+        let payload = protobuf_cost_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("model", "claude-opus-4-20250514")],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsDouble(0.375)),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload).expect("valid cost usage");
+
+        assert!(records.token_usage.is_empty());
+        assert_eq!(records.cost_usage.len(), 1);
+        assert_eq!(
+            records.cost_usage[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir")
+            ))
+        );
+        assert_eq!(
+            records.cost_usage[0].cost_usd,
+            CostUsd::from_decimal_str("0.375").unwrap()
+        );
+    }
+
+    #[test]
+    fn protobuf_usage_parser_rejects_cost_without_counter_start() {
+        let payload = protobuf_cost_payload_with_resource_attributes(
+            Vec::new(),
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("model", "claude-opus-4-20250514")],
+                start_time_unix_nano: 0,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsDouble(0.375)),
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
     }
 
     fn protobuf_payload(data_points: Vec<NumberDataPoint>) -> Vec<u8> {
@@ -738,6 +1039,54 @@ mod tests {
             }],
         }
         .encode_to_vec()
+    }
+
+    fn protobuf_cost_payload_with_resource_attributes(
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<NumberDataPoint>,
+    ) -> Vec<u8> {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "cost.usage".to_owned(),
+                        description: String::new(),
+                        unit: "USD".to_owned(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Sum(Sum {
+                            data_points,
+                            aggregation_temporality: 2,
+                            is_monotonic: true,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn parse_token_usage_json(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+        let records = parse_otlp_json_usage_metrics(bytes)?;
+        if records.token_usage.is_empty() {
+            return Err(OtlpError::NoTokenUsageMetrics);
+        }
+        Ok(records.token_usage)
+    }
+
+    fn parse_token_usage_protobuf(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+        let records = parse_otlp_protobuf_usage_metrics(bytes)?;
+        if records.token_usage.is_empty() {
+            return Err(OtlpError::NoTokenUsageMetrics);
+        }
+        Ok(records.token_usage)
     }
 
     fn string_attribute(key: &str, value: &str) -> KeyValue {
