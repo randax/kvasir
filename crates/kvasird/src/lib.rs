@@ -16,11 +16,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use kvasir_core::rpc::{
     BearerToken, CostRollup, CostRollupQuery, RollupQuery, RpcError, RpcRequest, RpcResponse,
-    RpcStreamEvent, TokenRollup, ToolCallRollup, ToolCallRollupQuery,
+    RpcStreamEvent, TokenRollup, ToolCallRollup, ToolCallRollupQuery, Trace, TraceQuery,
 };
 use kvasir_core::{
-    PriceTable, StoreKey, UsageStore, parse_otlp_json_usage_logs, parse_otlp_json_usage_metrics,
-    parse_otlp_protobuf_usage_logs, parse_otlp_protobuf_usage_metrics,
+    PriceTable, StoreKey, UsageStore, parse_otlp_json_traces, parse_otlp_json_usage_logs,
+    parse_otlp_json_usage_metrics, parse_otlp_protobuf_traces, parse_otlp_protobuf_usage_logs,
+    parse_otlp_protobuf_usage_metrics,
 };
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -310,6 +311,7 @@ pub async fn start_with_store_key_source(
     let app = Router::new()
         .route("/v1/metrics", post(ingest_metrics))
         .route("/v1/logs", post(ingest_logs))
+        .route("/v1/traces", post(ingest_traces))
         .layer(DefaultBodyLimit::max(MAX_OTLP_REQUEST_BYTES))
         .with_state(state.clone());
     let http_task = tokio::spawn(async move {
@@ -494,6 +496,30 @@ pub async fn query_tool_call_rollup(
     }
 }
 
+pub async fn query_trace(
+    socket_path: impl Into<PathBuf>,
+    query: TraceQuery,
+) -> anyhow::Result<Vec<Trace>> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::Trace { query };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::Trace { traces } => Ok(traces),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
 async fn ingest_metrics(
     State(state): State<DaemonState>,
     request: Request,
@@ -516,6 +542,19 @@ async fn ingest_logs(
         state,
         parse_otlp_json_usage_logs,
         parse_otlp_protobuf_usage_logs,
+    )
+    .await
+}
+
+async fn ingest_traces(
+    State(state): State<DaemonState>,
+    request: Request,
+) -> Result<StatusCode, IngestError> {
+    ingest_otlp(
+        request,
+        state,
+        parse_otlp_json_traces,
+        parse_otlp_protobuf_traces,
     )
     .await
 }
@@ -649,6 +688,12 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                 },
             }
         }
+        Ok(RpcRequest::Trace { query }) => match state.store.lock().await.traces(query) {
+            Ok(traces) => RpcResponse::Trace { traces },
+            Err(_err) => RpcResponse::Error {
+                error: RpcError::Internal,
+            },
+        },
         Ok(RpcRequest::SubscribeTokenRollup { query }) => {
             let mut updates = state.usage_updates.subscribe();
             let mut shutdown = state.shutdown.subscribe();
