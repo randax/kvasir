@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 
 const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
-const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_RPC_RESPONSE_BYTES: usize = 1024 * 1024;
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_EX: c_int = 2;

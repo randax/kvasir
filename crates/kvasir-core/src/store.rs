@@ -1172,7 +1172,7 @@ fn migrate_v2_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
 fn trace_span_kind_from_storage(value: &str) -> rusqlite::Result<TraceSpanKind> {
     TraceSpanKind::from_storage(value).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            2,
+            3,
             rusqlite::types::Type::Text,
             Box::<dyn std::error::Error + Send + Sync>::from(format!(
                 "invalid trace span kind {value}"
@@ -2880,6 +2880,59 @@ mod tests {
             }],
         })?;
         assert_eq!(store.traces(trace_query)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn trace_query_reports_kind_conversion_failure_on_selected_kind_column()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store = open_test_store(&database_path)?;
+        store.connection.execute(
+            "INSERT INTO canonical_trace_spans (
+                session_id,
+                prompt_id,
+                trace_id,
+                span_id,
+                kind,
+                name,
+                started_at_ms,
+                ended_at_ms,
+                duration_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "session-12",
+                "prompt-7",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                "not-a-kind",
+                "claude.unknown",
+                1_781_956_800_000_i64,
+                1_781_956_801_000_i64,
+                1_000_i64,
+            ],
+        )?;
+
+        let error = store
+            .traces(TraceQuery {
+                session_id: crate::rpc::SessionId::new("session-12"),
+                prompt_id: crate::rpc::PromptId::new("prompt-7"),
+            })
+            .expect_err("invalid stored trace kind should fail conversion");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    _
+                ))
+            ),
+            "{error:?}"
+        );
 
         Ok(())
     }

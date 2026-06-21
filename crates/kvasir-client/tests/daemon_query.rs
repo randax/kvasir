@@ -640,7 +640,7 @@ async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyho
         .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
         .header(AUTHORIZATION, "Bearer test-token")
         .header(CONTENT_TYPE, "application/json")
-        .body(many_model_token_usage_fixture(700))
+        .body(many_model_token_usage_fixture(7_000))
         .send()
         .await?
         .error_for_status()?;
