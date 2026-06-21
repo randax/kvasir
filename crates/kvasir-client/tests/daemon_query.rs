@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -225,6 +226,54 @@ async fn client_queries_claude_trace_by_session_and_prompt() -> anyhow::Result<(
                 tool_name: Some(tool("Bash")),
             },
         ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_retrieves_trace_response_above_previous_rpc_response_cap() -> anyhow::Result<()> {
+    const TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP: usize = 400;
+
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(large_claude_trace_fixture(
+            TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP,
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            session_id: session("session-large"),
+            prompt_id: prompt("prompt-large"),
+        })
+    })
+    .await??;
+
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP);
+    assert_eq!(
+        traces[0].durations.request_ms,
+        Some(TRACE_SPAN_COUNT_ABOVE_OLD_RPC_CAP as u64)
     );
 
     Ok(())
@@ -825,6 +874,48 @@ fn two_trace_ids_for_same_prompt_fixture() -> &'static str {
             }]
         }]
     }"#
+}
+
+fn large_claude_trace_fixture(span_count: usize) -> String {
+    let mut spans = String::new();
+    for index in 0..span_count {
+        if index > 0 {
+            spans.push(',');
+        }
+        let span_id = format!("{:016x}", index + 1);
+        let start_ns = 1_781_956_800_000_000_000_u64 + (index as u64 * 1_000_000);
+        let end_ns = start_ns + 1_000_000;
+        write!(
+            spans,
+            r#"{{
+                "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "spanId": "{span_id}",
+                "name": "claude.llm_request",
+                "startTimeUnixNano": "{start_ns}",
+                "endTimeUnixNano": "{end_ns}",
+                "attributes": [
+                    {{ "key": "claude.span.kind", "value": {{ "stringValue": "llm_request" }} }}
+                ]
+            }}"#
+        )
+        .expect("writing to a String cannot fail");
+    }
+
+    format!(
+        r#"{{
+        "resourceSpans": [{{
+            "resource": {{
+                "attributes": [
+                    {{ "key": "session.id", "value": {{ "stringValue": "session-large" }} }},
+                    {{ "key": "prompt.id", "value": {{ "stringValue": "prompt-large" }} }}
+                ]
+            }},
+            "scopeSpans": [{{
+                "spans": [{spans}]
+            }}]
+        }}]
+    }}"#
+    )
 }
 
 fn claude_trace_protobuf_fixture() -> Vec<u8> {
