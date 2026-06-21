@@ -3,12 +3,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::usage::{CostUsd, RepoBucket};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BearerToken(String);
 
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BearerToken(<redacted>)")
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BearerTokenError {
+    #[error("bearer token generation failed")]
+    Random,
+}
+
 impl BearerToken {
+    pub fn generate() -> Result<Self, BearerTokenError> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| BearerTokenError::Random)?;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(hex_nibble(byte >> 4));
+            encoded.push(hex_nibble(byte & 0x0f));
+        }
+        Ok(Self(encoded))
+    }
+
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     pub fn authorization_header(&self) -> String {
@@ -150,6 +178,14 @@ fn is_known_claude_tool_name(value: &str) -> bool {
             | "WebSearch"
             | "Write"
     )
+}
+
+fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'a' + (nibble - 10)),
+        _ => unreachable!("nibble is masked to four bits"),
+    }
 }
 
 fn is_valid_mcp_tool_name(value: &str) -> bool {
