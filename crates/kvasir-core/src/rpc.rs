@@ -1,6 +1,8 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::usage::RepoBucket;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BearerToken(String);
 
@@ -82,17 +84,30 @@ impl RollupDay {
 pub struct RollupQuery {
     pub start: TimestampMillis,
     pub end: TimestampMillis,
+    pub repo: Option<RepoBucket>,
 }
 
 impl RollupQuery {
     pub fn new(start: TimestampMillis, end: TimestampMillis) -> Self {
-        Self { start, end }
+        Self {
+            start,
+            end,
+            repo: None,
+        }
+    }
+
+    pub fn with_repo(self, repo: RepoBucket) -> Self {
+        Self {
+            repo: Some(repo),
+            ..self
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRollup {
     pub day: RollupDay,
+    pub repo: RepoBucket,
     pub model: ModelName,
     pub input_tokens: u64,
     pub output_tokens: u64,

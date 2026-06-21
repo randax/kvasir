@@ -40,6 +40,23 @@ impl RepoIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
+pub enum RepoBucket {
+    NoRepo,
+    Repo(RepoIdentity),
+}
+
+impl RepoBucket {
+    pub fn repo(identity: RepoIdentity) -> Self {
+        Self::Repo(identity)
+    }
+
+    pub fn no_repo() -> Self {
+        Self::NoRepo
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenMeasure {
     Input,
@@ -91,7 +108,7 @@ impl TokenCount {
 pub struct TokenUsageRecord {
     pub occurred_at: TimestampMillis,
     pub counter_start: TimestampMillis,
-    pub repo: RepoIdentity,
+    pub repo: RepoBucket,
     pub model: ModelName,
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
@@ -101,7 +118,7 @@ impl TokenUsageRecord {
     pub fn new(
         occurred_at: TimestampMillis,
         counter_start: TimestampMillis,
-        repo: RepoIdentity,
+        repo: RepoBucket,
         model: ModelName,
         measure: TokenMeasure,
         token_count: TokenCount,
