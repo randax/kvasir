@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::net::SocketAddr;
 use std::os::raw::c_int;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
@@ -144,7 +145,32 @@ fn resolve_store_key(credential: &impl StoreKeyCredential) -> anyhow::Result<Sto
 
 fn keychain_user_for_database(database_path: &Path) -> String {
     let stable_path = canonical_database_path(database_path);
-    format!("usage.sqlite3:{}", stable_path.to_string_lossy())
+    format!("usage.sqlite3:{}", keychain_path_component(&stable_path))
+}
+
+fn keychain_path_component(stable_path: &Path) -> String {
+    if let Some(path) = stable_path.to_str() {
+        return format!("utf8:{path}");
+    }
+
+    format!("hex:{}", hex_encode(stable_path.as_os_str().as_bytes()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(hex_nibble(byte >> 4));
+        encoded.push(hex_nibble(byte & 0x0f));
+    }
+    encoded
+}
+
+fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'a' + (nibble - 10)),
+        _ => unreachable!("nibble is masked to four bits"),
+    }
 }
 
 fn canonical_database_path(database_path: &Path) -> PathBuf {
@@ -616,6 +642,22 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_utf8_database_paths_have_distinct_keychain_users() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first_path = PathBuf::from(OsString::from_vec(b"invalid-\xff.sqlite3".to_vec()));
+        let second_path = PathBuf::from(OsString::from_vec(b"invalid-\xfe.sqlite3".to_vec()));
+
+        assert_eq!(first_path.to_string_lossy(), second_path.to_string_lossy());
+        assert_ne!(
+            keychain_user_for_database(&first_path),
+            keychain_user_for_database(&second_path)
+        );
     }
 
     #[test]
