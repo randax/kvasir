@@ -8,6 +8,7 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
     BearerToken, ModelName, RollupDay, RollupQuery, TimestampMillis, TokenRollup,
 };
+use kvasir_core::{RepoBucket, RepoIdentity, RepoName, RepoPath};
 use kvasird::{DaemonConfig, query_token_rollup, start};
 use tempfile::tempdir;
 
@@ -60,6 +61,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
         vec![
             TokenRollup {
                 day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
                 model: ModelName::new("claude-opus-4-20250514"),
                 input_tokens: 1100,
                 output_tokens: 550,
@@ -67,6 +69,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
             },
             TokenRollup {
                 day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
                 model: ModelName::new("claude-sonnet-4-20250514"),
                 input_tokens: 300,
                 output_tokens: 120,
@@ -74,6 +77,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
             },
             TokenRollup {
                 day: RollupDay::parse("2026-06-21")?,
+                repo: kvasir_repo(),
                 model: ModelName::new("claude-sonnet-4-20250514"),
                 input_tokens: 2100,
                 output_tokens: 900,
@@ -92,6 +96,95 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
     .await?;
 
     assert_eq!(later_rollups, Vec::new());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_ingest_attributes_rollups_to_repo_and_no_repo_buckets() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(repo_and_no_repo_metrics_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    let rollups = query_token_rollup(rpc_socket_path.clone(), query.clone()).await?;
+
+    assert_eq!(
+        rollups,
+        vec![
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: RepoBucket::no_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 25,
+                output_tokens: 0,
+                cache_tokens: 0,
+            },
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_tokens: 0,
+            },
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: other_kvasir_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 40,
+                output_tokens: 0,
+                cache_tokens: 0,
+            },
+        ]
+    );
+
+    assert_eq!(
+        query_token_rollup(
+            rpc_socket_path.clone(),
+            query.clone().with_repo(kvasir_repo())
+        )
+        .await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("claude-opus-4-20250514"),
+            input_tokens: 100,
+            output_tokens: 0,
+            cache_tokens: 0,
+        }]
+    );
+
+    assert_eq!(
+        query_token_rollup(rpc_socket_path, query.with_repo(RepoBucket::no_repo())).await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: RepoBucket::no_repo(),
+            model: ModelName::new("claude-opus-4-20250514"),
+            input_tokens: 25,
+            output_tokens: 0,
+            cache_tokens: 0,
+        }]
+    );
 
     Ok(())
 }
@@ -270,4 +363,91 @@ async fn rpc_client_rejects_oversized_responses() -> anyhow::Result<()> {
 fn claude_token_usage_protobuf_fixture() -> anyhow::Result<Vec<u8>> {
     let encoded = include_str!("fixtures/claude_token_usage_otlp.pb.base64").trim();
     Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
+}
+
+fn kvasir_repo() -> RepoBucket {
+    RepoBucket::repo(RepoIdentity::new(
+        RepoName::new("kvasir"),
+        RepoPath::new("/Users/oyr/projects/kvasir"),
+    ))
+}
+
+fn other_kvasir_repo() -> RepoBucket {
+    RepoBucket::repo(RepoIdentity::new(
+        RepoName::new("kvasir"),
+        RepoPath::new("/tmp/other-kvasir"),
+    ))
+}
+
+fn repo_and_no_repo_metrics_fixture() -> &'static str {
+    r#"{
+        "resourceMetrics": [
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "100",
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            },
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/tmp/other-kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "40",
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            },
+            {
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "25",
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }
+        ]
+    }"#
 }

@@ -7,7 +7,9 @@ use prost::Message;
 use serde_json::Value;
 
 use crate::rpc::{ModelName, TimestampMillis};
-use crate::usage::{RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageRecord};
+use crate::usage::{
+    RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageRecord,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OtlpError {
@@ -127,7 +129,7 @@ fn records_from_resource_metrics(
         .resource
         .as_ref()
         .map(|resource| repo_from_proto_attributes(&resource.attributes))
-        .unwrap_or_else(no_repo);
+        .unwrap_or_else(RepoBucket::no_repo);
 
     if resource_metrics.scope_metrics.is_empty() {
         return Err(OtlpError::MissingScopeMetrics);
@@ -141,7 +143,7 @@ fn records_from_resource_metrics(
 
 fn records_from_scope_metrics(
     scope_metrics: ScopeMetrics,
-    repo: RepoIdentity,
+    repo: RepoBucket,
 ) -> Result<Vec<TokenUsageRecord>, OtlpError> {
     if scope_metrics.metrics.is_empty() {
         return Err(OtlpError::MissingMetrics);
@@ -155,7 +157,7 @@ fn records_from_scope_metrics(
 
 fn records_from_metric(
     metric: Metric,
-    repo: RepoIdentity,
+    repo: RepoBucket,
 ) -> Result<Vec<TokenUsageRecord>, OtlpError> {
     if metric.name != "token.usage" {
         return Ok(Vec::new());
@@ -177,7 +179,7 @@ fn records_from_metric(
 
 fn record_from_proto_data_point(
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
-    repo: RepoIdentity,
+    repo: RepoBucket,
 ) -> Result<TokenUsageRecord, OtlpError> {
     let model = proto_attribute(&data_point.attributes, "model").ok_or(OtlpError::MissingModel)?;
     let measure = proto_attribute(&data_point.attributes, "token.type")
@@ -213,22 +215,32 @@ fn record_from_proto_data_point(
     ))
 }
 
-fn repo_from_proto_attributes(attributes: &[KeyValue]) -> RepoIdentity {
-    RepoIdentity::new(
-        RepoName::new(proto_attribute(attributes, "repo.name").unwrap_or_else(|| "no-repo".into())),
-        RepoPath::new(proto_attribute(attributes, "repo.path").unwrap_or_else(|| "no-repo".into())),
+fn repo_from_proto_attributes(attributes: &[KeyValue]) -> RepoBucket {
+    repo_from_optional_attributes(
+        proto_attribute(attributes, "repo.name"),
+        proto_attribute(attributes, "repo.path"),
     )
 }
 
-fn repo_from_json_attributes(attributes: Option<&Vec<Value>>) -> RepoIdentity {
-    RepoIdentity::new(
-        RepoName::new(json_attribute(attributes, "repo.name").unwrap_or_else(|| "no-repo".into())),
-        RepoPath::new(json_attribute(attributes, "repo.path").unwrap_or_else(|| "no-repo".into())),
+fn repo_from_json_attributes(attributes: Option<&Vec<Value>>) -> RepoBucket {
+    repo_from_optional_attributes(
+        json_attribute(attributes, "repo.name"),
+        json_attribute(attributes, "repo.path"),
     )
 }
 
-fn no_repo() -> RepoIdentity {
-    RepoIdentity::new(RepoName::new("no-repo"), RepoPath::new("no-repo"))
+fn repo_from_optional_attributes(name: Option<String>, path: Option<String>) -> RepoBucket {
+    let name = meaningful_attribute(name).map(RepoName::new);
+    let path = meaningful_attribute(path).map(RepoPath::new);
+    RepoIdentity::from_parts(name, path)
+        .map(RepoBucket::repo)
+        .unwrap_or_else(RepoBucket::no_repo)
+}
+
+fn meaningful_attribute(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn proto_attribute(attributes: &[KeyValue], key: &str) -> Option<String> {
@@ -314,6 +326,7 @@ mod tests {
         Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data,
         number_data_point::Value,
     };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
     use prost::Message;
 
     use super::*;
@@ -499,10 +512,213 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn json_partial_repo_resource_attributes_preserve_repo_name() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "100",
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+
+        assert_eq!(
+            records[0].repo,
+            RepoBucket::repo(
+                RepoIdentity::from_parts(Some(RepoName::new("kvasir")), None).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn protobuf_partial_repo_resource_attributes_preserve_repo_path() {
+        let payload = protobuf_payload_with_resource_attributes(
+            vec![string_attribute("repo.path", "/repos/kvasir")],
+            vec![NumberDataPoint {
+                attributes: vec![
+                    string_attribute("model", "claude-opus-4-20250514"),
+                    string_attribute("token.type", "input"),
+                ],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(100)),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+
+        assert_eq!(
+            records[0].repo,
+            RepoBucket::repo(
+                RepoIdentity::from_parts(None, Some(RepoPath::new("/repos/kvasir"))).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn json_blank_repo_resource_attributes_use_no_repo_bucket() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": " " } },
+                        { "key": "repo.path", "value": { "stringValue": "" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "100",
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+
+        assert_eq!(records[0].repo, RepoBucket::no_repo());
+    }
+
+    #[test]
+    fn protobuf_blank_repo_resource_attributes_use_no_repo_bucket() {
+        let payload = protobuf_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "\t"),
+                string_attribute("repo.path", " "),
+            ],
+            vec![NumberDataPoint {
+                attributes: vec![
+                    string_attribute("model", "claude-opus-4-20250514"),
+                    string_attribute("token.type", "input"),
+                ],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(100)),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+
+        assert_eq!(records[0].repo, RepoBucket::no_repo());
+    }
+
+    #[test]
+    fn json_repo_resource_attributes_are_trimmed() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": " kvasir " } },
+                        { "key": "repo.path", "value": { "stringValue": "\t/repos/kvasir\n" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "sum": {
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "100",
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+
+        assert_eq!(
+            records[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir")
+            ))
+        );
+    }
+
+    #[test]
+    fn protobuf_repo_resource_attributes_are_trimmed() {
+        let payload = protobuf_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "\nkvasir"),
+                string_attribute("repo.path", "/repos/kvasir "),
+            ],
+            vec![NumberDataPoint {
+                attributes: vec![
+                    string_attribute("model", "claude-opus-4-20250514"),
+                    string_attribute("token.type", "input"),
+                ],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(100)),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+
+        assert_eq!(
+            records[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir")
+            ))
+        );
+    }
+
     fn protobuf_payload(data_points: Vec<NumberDataPoint>) -> Vec<u8> {
+        protobuf_payload_with_resource_attributes(Vec::new(), data_points)
+    }
+
+    fn protobuf_payload_with_resource_attributes(
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<NumberDataPoint>,
+    ) -> Vec<u8> {
         ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
-                resource: None,
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
                 scope_metrics: vec![ScopeMetrics {
                     scope: None,
                     metrics: vec![Metric {

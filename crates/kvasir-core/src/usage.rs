@@ -30,13 +30,41 @@ impl RepoPath {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoIdentity {
-    pub name: RepoName,
-    pub path: RepoPath,
+    pub name: Option<RepoName>,
+    pub path: Option<RepoPath>,
 }
 
 impl RepoIdentity {
     pub fn new(name: RepoName, path: RepoPath) -> Self {
-        Self { name, path }
+        Self {
+            name: Some(name),
+            path: Some(path),
+        }
+    }
+
+    pub fn from_parts(name: Option<RepoName>, path: Option<RepoPath>) -> Option<Self> {
+        if name.is_none() && path.is_none() {
+            None
+        } else {
+            Some(Self { name, path })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
+pub enum RepoBucket {
+    NoRepo,
+    Repo(RepoIdentity),
+}
+
+impl RepoBucket {
+    pub fn repo(identity: RepoIdentity) -> Self {
+        Self::Repo(identity)
+    }
+
+    pub fn no_repo() -> Self {
+        Self::NoRepo
     }
 }
 
@@ -91,7 +119,7 @@ impl TokenCount {
 pub struct TokenUsageRecord {
     pub occurred_at: TimestampMillis,
     pub counter_start: TimestampMillis,
-    pub repo: RepoIdentity,
+    pub repo: RepoBucket,
     pub model: ModelName,
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
@@ -101,7 +129,7 @@ impl TokenUsageRecord {
     pub fn new(
         occurred_at: TimestampMillis,
         counter_start: TimestampMillis,
-        repo: RepoIdentity,
+        repo: RepoBucket,
         model: ModelName,
         measure: TokenMeasure,
         token_count: TokenCount,
