@@ -145,27 +145,38 @@ impl CostUsd {
 
     pub fn from_decimal_str(value: &str) -> Option<Self> {
         let value = value.trim();
-        if value.is_empty() || value.starts_with('-') || value.contains(['e', 'E']) {
+        if value.is_empty() || value.starts_with('-') {
             return None;
         }
-        let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
-        let whole = if whole.is_empty() {
-            0
-        } else {
-            whole.parse::<u64>().ok()?
-        };
-        if fractional.len() > 9
-            || !fractional
-                .chars()
-                .all(|character| character.is_ascii_digit())
-        {
+        let (mantissa, exponent) = split_decimal_exponent(value)?;
+        let mut digits = String::with_capacity(mantissa.len());
+        let mut fractional_digits = 0_i32;
+        let mut saw_decimal = false;
+        for character in mantissa.chars() {
+            match character {
+                '.' if saw_decimal => return None,
+                '.' => saw_decimal = true,
+                digit if digit.is_ascii_digit() => {
+                    digits.push(digit);
+                    if saw_decimal {
+                        fractional_digits += 1;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if digits.is_empty() {
             return None;
         }
-        let fractional = format!("{fractional:0<9}").parse::<u64>().ok()?;
-        whole
-            .checked_mul(COST_NANOS_PER_USD)
-            .and_then(|nanos| nanos.checked_add(fractional))
-            .and_then(Self::from_nanos)
+        let nanos_scale = 9_i32 + exponent - fractional_digits;
+        if nanos_scale < 0 {
+            return None;
+        }
+        let mut nanos = digits.parse::<u64>().ok()?;
+        for _ in 0..nanos_scale {
+            nanos = nanos.checked_mul(10)?;
+        }
+        Self::from_nanos(nanos)
     }
 
     pub fn from_f64(value: f64) -> Option<Self> {
@@ -190,6 +201,16 @@ impl CostUsd {
     pub fn storage_value(self) -> i64 {
         i64::try_from(self.nanos).expect("cost is validated before storage")
     }
+}
+
+fn split_decimal_exponent(value: &str) -> Option<(&str, i32)> {
+    let Some((mantissa, exponent)) = value.split_once(['e', 'E']) else {
+        return Some((value, 0));
+    };
+    if mantissa.is_empty() || exponent.is_empty() {
+        return None;
+    }
+    Some((mantissa, exponent.parse::<i32>().ok()?))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

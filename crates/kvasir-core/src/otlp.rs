@@ -50,14 +50,6 @@ pub enum OtlpError {
     NoTokenUsageMetrics,
 }
 
-pub fn parse_otlp_protobuf_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
-    let records = parse_otlp_protobuf_usage_metrics(bytes)?;
-    if records.token_usage.is_empty() {
-        return Err(OtlpError::NoTokenUsageMetrics);
-    }
-    Ok(records.token_usage)
-}
-
 pub fn parse_otlp_protobuf_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
     let request = ExportMetricsServiceRequest::decode(bytes)?;
     if request.resource_metrics.is_empty() {
@@ -71,14 +63,6 @@ pub fn parse_otlp_protobuf_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, O
         return Err(OtlpError::NoTokenUsageMetrics);
     }
     Ok(records)
-}
-
-pub fn parse_otlp_json_metrics(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
-    let records = parse_otlp_json_usage_metrics(bytes)?;
-    if records.token_usage.is_empty() {
-        return Err(OtlpError::NoTokenUsageMetrics);
-    }
-    Ok(records.token_usage)
 }
 
 pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
@@ -473,7 +457,7 @@ mod tests {
         }]);
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::MissingModel)
         ));
     }
@@ -486,7 +470,7 @@ mod tests {
         .encode_to_vec();
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::MissingResourceMetrics)
         ));
     }
@@ -506,7 +490,7 @@ mod tests {
         }]);
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::NonIntegralTokenCount)
         ));
     }
@@ -556,7 +540,7 @@ mod tests {
         .encode_to_vec();
 
         assert!(matches!(
-            parse_otlp_protobuf_metrics(&payload),
+            parse_token_usage_protobuf(&payload),
             Err(OtlpError::InvalidMetricKind)
         ));
     }
@@ -584,7 +568,7 @@ mod tests {
         }"#;
 
         assert!(matches!(
-            parse_otlp_json_metrics(payload),
+            parse_token_usage_json(payload),
             Err(OtlpError::NonIntegralTokenCount)
         ));
     }
@@ -603,7 +587,7 @@ mod tests {
         }"#;
 
         assert!(matches!(
-            parse_otlp_json_metrics(payload),
+            parse_token_usage_json(payload),
             Err(OtlpError::NoTokenUsageMetrics)
         ));
     }
@@ -637,7 +621,7 @@ mod tests {
         }"#;
 
         assert!(matches!(
-            parse_otlp_json_metrics(payload),
+            parse_token_usage_json(payload),
             Err(OtlpError::MissingDataPoints)
         ));
     }
@@ -669,7 +653,7 @@ mod tests {
             }]
         }"#;
 
-        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+        let records = parse_token_usage_json(payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -696,7 +680,7 @@ mod tests {
             }],
         );
 
-        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+        let records = parse_token_usage_protobuf(&payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -734,7 +718,7 @@ mod tests {
             }]
         }"#;
 
-        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+        let records = parse_token_usage_json(payload).expect("valid token usage");
 
         assert_eq!(records[0].repo, RepoBucket::no_repo());
     }
@@ -759,7 +743,7 @@ mod tests {
             }],
         );
 
-        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+        let records = parse_token_usage_protobuf(&payload).expect("valid token usage");
 
         assert_eq!(records[0].repo, RepoBucket::no_repo());
     }
@@ -792,7 +776,7 @@ mod tests {
             }]
         }"#;
 
-        let records = parse_otlp_json_metrics(payload).expect("valid token usage");
+        let records = parse_token_usage_json(payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -823,7 +807,7 @@ mod tests {
             }],
         );
 
-        let records = parse_otlp_protobuf_metrics(&payload).expect("valid token usage");
+        let records = parse_token_usage_protobuf(&payload).expect("valid token usage");
 
         assert_eq!(
             records[0].repo,
@@ -868,31 +852,48 @@ mod tests {
     }
 
     #[test]
-    fn json_legacy_token_parser_rejects_cost_only_payloads() {
+    fn json_usage_parser_preserves_scientific_notation_cost() {
         let payload = br#"{
             "resourceMetrics": [{
                 "scopeMetrics": [{
                     "metrics": [{
                         "name": "cost.usage",
                         "sum": {
-                            "dataPoints": [{
-                                "startTimeUnixNano": "1781956700000000000",
-                                "timeUnixNano": "1781956800000000000",
-                                "asDouble": 0.1,
-                                "attributes": [
-                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
-                                ]
-                            }]
+                            "dataPoints": [
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956800000000000",
+                                    "asDouble": 1.23e-7,
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                    ]
+                                },
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956900000000000",
+                                    "asDouble": "2.5e-7",
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                                    ]
+                                }
+                            ]
                         }
                     }]
                 }]
             }]
         }"#;
 
-        assert!(matches!(
-            parse_otlp_json_metrics(payload),
-            Err(OtlpError::NoTokenUsageMetrics)
-        ));
+        let records = parse_otlp_json_usage_metrics(payload).expect("valid cost usage");
+
+        assert_eq!(records.cost_usage.len(), 2);
+        assert_eq!(
+            records.cost_usage[0].cost_usd,
+            CostUsd::from_nanos(123).unwrap()
+        );
+        assert_eq!(
+            records.cost_usage[1].cost_usd,
+            CostUsd::from_nanos(250).unwrap()
+        );
     }
 
     #[test]
@@ -1070,6 +1071,22 @@ mod tests {
             }],
         }
         .encode_to_vec()
+    }
+
+    fn parse_token_usage_json(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+        let records = parse_otlp_json_usage_metrics(bytes)?;
+        if records.token_usage.is_empty() {
+            return Err(OtlpError::NoTokenUsageMetrics);
+        }
+        Ok(records.token_usage)
+    }
+
+    fn parse_token_usage_protobuf(bytes: &[u8]) -> Result<Vec<TokenUsageRecord>, OtlpError> {
+        let records = parse_otlp_protobuf_usage_metrics(bytes)?;
+        if records.token_usage.is_empty() {
+            return Err(OtlpError::NoTokenUsageMetrics);
+        }
+        Ok(records.token_usage)
     }
 
     fn string_attribute(key: &str, value: &str) -> KeyValue {
