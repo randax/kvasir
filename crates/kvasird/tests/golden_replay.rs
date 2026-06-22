@@ -186,7 +186,7 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
         vec![
             TokenRollup {
                 day: RollupDay::parse("2026-06-20")?,
-                repo: kvasir_repo(),
+                repo: copilot_kvasir_repo(),
                 model: ModelName::new("gpt-4.1"),
                 input_tokens: 1200,
                 output_tokens: 450,
@@ -194,7 +194,7 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
             },
             TokenRollup {
                 day: RollupDay::parse("2026-06-20")?,
-                repo: kvasir_repo(),
+                repo: copilot_kvasir_repo(),
                 model: ModelName::new("gpt-5.4"),
                 input_tokens: 100,
                 output_tokens: 20,
@@ -212,14 +212,14 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
         vec![
             CostRollup {
                 day: RollupDay::parse("2026-06-20")?,
-                repo: kvasir_repo(),
+                repo: copilot_kvasir_repo(),
                 model: ModelName::new("gpt-4.1"),
                 cost_usd: CostUsd::from_nanos(6_000_000).unwrap(),
                 source: CostSource::Estimated,
             },
             CostRollup {
                 day: RollupDay::parse("2026-06-20")?,
-                repo: kvasir_repo(),
+                repo: copilot_kvasir_repo(),
                 model: ModelName::new("gpt-5.4"),
                 cost_usd: CostUsd::from_nanos(550_000).unwrap(),
                 source: CostSource::Estimated,
@@ -1148,6 +1148,13 @@ fn kvasir_repo() -> RepoBucket {
     RepoBucket::repo(RepoIdentity::new(
         RepoName::new("kvasir"),
         RepoPath::new("/Users/oyr/projects/kvasir"),
+    ))
+}
+
+fn copilot_kvasir_repo() -> RepoBucket {
+    RepoBucket::repo(RepoIdentity::new(
+        RepoName::new("kvasir"),
+        RepoPath::new("/repos/kvasir"),
     ))
 }
 

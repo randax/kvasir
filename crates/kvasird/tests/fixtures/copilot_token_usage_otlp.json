@@ -5,7 +5,7 @@
         "attributes": [
           { "key": "service.name", "value": { "stringValue": "github-copilot" } },
           { "key": "repo.name", "value": { "stringValue": "kvasir" } },
-          { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+          { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
         ]
       },
       "scopeMetrics": [
