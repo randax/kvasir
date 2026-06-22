@@ -12,6 +12,8 @@ const CODEX_OTEL_BLOCK_END: &str = "# END KVASIR MANAGED CODEX OTEL";
 const COPILOT_OTEL_BLOCK_START: &str = "# BEGIN KVASIR MANAGED COPILOT OTEL";
 const COPILOT_OTEL_BLOCK_END: &str = "# END KVASIR MANAGED COPILOT OTEL";
 const OPENCODE_MANAGED_EXPERIMENTAL_KEYS: &[&str] = &["openTelemetry"];
+const OPENCODE_OTEL_ENDPOINT_ENV_KEY: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const OPENCODE_OTEL_HEADERS_ENV_KEY: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 
 const MANAGED_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -31,6 +33,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
 ];
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SetupError {
     #[error("Claude Code settings must be a JSON object")]
     SettingsNotObject,
@@ -49,7 +52,7 @@ pub enum SetupError {
     #[error("OpenCode kvasir managed block must be a JSON object")]
     OpenCodeManagedBlockNotObject,
     #[error("OpenCode config JSON is invalid")]
-    InvalidOpenCodeConfigJson(serde_json::Error),
+    InvalidOpenCodeConfigJson(#[source] serde_json::Error),
     #[error("OpenCode OTLP endpoint env value contains unsupported characters")]
     InvalidOpenCodeOtlpEndpointEnvValue,
     #[error("OpenCode OTLP headers env value contains unsupported characters")]
@@ -217,6 +220,55 @@ impl CopilotShellProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeEnvironmentVariableKey {
+    OtlpEndpoint,
+    OtlpHeaders,
+}
+
+impl OpenCodeEnvironmentVariableKey {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OtlpEndpoint => OPENCODE_OTEL_ENDPOINT_ENV_KEY,
+            Self::OtlpHeaders => OPENCODE_OTEL_HEADERS_ENV_KEY,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenCodeEnvironmentVariable {
+    key: OpenCodeEnvironmentVariableKey,
+    value: String,
+}
+
+impl std::fmt::Debug for OpenCodeEnvironmentVariable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self.key {
+            OpenCodeEnvironmentVariableKey::OtlpEndpoint => self.value.as_str(),
+            OpenCodeEnvironmentVariableKey::OtlpHeaders => "<redacted>",
+        };
+        formatter
+            .debug_struct("OpenCodeEnvironmentVariable")
+            .field("key", &self.key)
+            .field("value", &value)
+            .finish()
+    }
+}
+
+impl OpenCodeEnvironmentVariable {
+    fn new(key: OpenCodeEnvironmentVariableKey, value: String) -> Self {
+        Self { key, value }
+    }
+
+    pub fn key(&self) -> OpenCodeEnvironmentVariableKey {
+        self.key
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenCodeEnvironment {
     endpoint: KvasirEndpoint,
@@ -246,6 +298,24 @@ impl OpenCodeEnvironment {
 
     pub fn otlp_headers(&self) -> String {
         otlp_headers_env_value(&self.bearer_token)
+    }
+
+    pub fn otlp_endpoint_variable(&self) -> OpenCodeEnvironmentVariable {
+        OpenCodeEnvironmentVariable::new(
+            OpenCodeEnvironmentVariableKey::OtlpEndpoint,
+            self.endpoint.as_str().to_owned(),
+        )
+    }
+
+    pub fn otlp_headers_variable(&self) -> OpenCodeEnvironmentVariable {
+        OpenCodeEnvironmentVariable::new(
+            OpenCodeEnvironmentVariableKey::OtlpHeaders,
+            self.otlp_headers(),
+        )
+    }
+
+    pub fn variables(&self) -> [OpenCodeEnvironmentVariable; 2] {
+        [self.otlp_endpoint_variable(), self.otlp_headers_variable()]
     }
 }
 
@@ -279,6 +349,14 @@ impl OpenCodeSetup {
 
     pub fn env(&self) -> &OpenCodeEnvironment {
         &self.env
+    }
+
+    pub fn otlp_endpoint_variable(&self) -> OpenCodeEnvironmentVariable {
+        self.env.otlp_endpoint_variable()
+    }
+
+    pub fn otlp_headers_variable(&self) -> OpenCodeEnvironmentVariable {
+        self.env.otlp_headers_variable()
     }
 
     pub fn opencode_json(&self) -> &str {

@@ -584,6 +584,18 @@ fn opencode_setup_generates_otlp_env_and_enables_open_telemetry()
         generated.env().otlp_headers(),
         "Authorization=Bearer test-token"
     );
+    let endpoint_variable = generated.otlp_endpoint_variable();
+    assert_eq!(
+        endpoint_variable.key().as_str(),
+        "OTEL_EXPORTER_OTLP_ENDPOINT"
+    );
+    assert_eq!(endpoint_variable.value(), "http://127.0.0.1:4318");
+    let headers_variable = generated.otlp_headers_variable();
+    assert_eq!(
+        headers_variable.key().as_str(),
+        "OTEL_EXPORTER_OTLP_HEADERS"
+    );
+    assert_eq!(headers_variable.value(), "Authorization=Bearer test-token");
 
     let opencode_json: serde_json::Value = serde_json::from_str(generated.opencode_json())?;
     assert_eq!(opencode_json["theme"], "system");
@@ -678,6 +690,9 @@ fn opencode_setup_rejects_invalid_json() {
         err,
         kvasir_core::SetupError::InvalidOpenCodeConfigJson(_)
     ));
+    let source = std::error::Error::source(&err)
+        .expect("invalid OpenCode JSON should expose serde_json::Error as source");
+    assert!(source.downcast_ref::<serde_json::Error>().is_some());
 }
 
 #[test]
