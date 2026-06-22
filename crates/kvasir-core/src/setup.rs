@@ -234,8 +234,6 @@ fn shell_single_quote(value: &str) -> String {
     for character in value.chars() {
         match character {
             '\'' => quoted.push_str("'\\''"),
-            '\n' => quoted.push_str("'$'\\n''"),
-            '\r' => quoted.push_str("'$'\\r''"),
             _ => quoted.push(character),
         }
     }
@@ -372,7 +370,7 @@ fn remove_managed_block(
         let is_end_marker = marker_candidate == end_marker;
         let is_corrupted_marker = !is_start_marker
             && !is_end_marker
-            && is_kvasir_managed_marker_like_comment(trimmed_marker_candidate);
+            && is_kvasir_managed_marker_like_comment(trimmed_marker_candidate, start_marker);
 
         if is_corrupted_marker {
             return Err(SetupError::MalformedManagedBlock);
@@ -440,17 +438,28 @@ fn toml_basic_string_content(value: &str) -> String {
     escaped
 }
 
-fn is_kvasir_managed_marker_like_comment(line: &str) -> bool {
+fn is_kvasir_managed_marker_like_comment(line: &str, start_marker: &str) -> bool {
     if !line.starts_with("# BEGIN KVASIR") && !line.starts_with("# END KVASIR") {
         return false;
     }
 
     let words = line.split_whitespace().collect::<Vec<_>>();
+    let Some(identifier) = managed_marker_identifier(start_marker) else {
+        return false;
+    };
+
     words.len() >= 4
         && words[0] == "#"
         && matches!(words[1], "BEGIN" | "END")
         && words[2] == "KVASIR"
+        && words.iter().skip(3).any(|word| *word == identifier)
         && words.iter().skip(3).any(|word| *word == "OTEL")
+}
+
+fn managed_marker_identifier(marker: &str) -> Option<&str> {
+    marker
+        .split_whitespace()
+        .find(|word| matches!(*word, "CODEX" | "COPILOT"))
 }
 
 fn trim_one_blank_line_at_removal_boundary(output: &mut String) {

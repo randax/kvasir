@@ -439,12 +439,16 @@ fn copilot_shell_profile_quotes_values_without_raw_newlines()
         ),
     )?;
 
-    assert!(generated.as_str().contains(
-        "export OTEL_EXPORTER_OTLP_ENDPOINT='http://127.0.0.1:4318/it'\\''s'$'\\n''next'"
-    ));
-    assert!(generated.as_str().contains(
-        "export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer test'\\''token'$'\\n''line'"
-    ));
+    assert!(
+        generated
+            .as_str()
+            .contains("export OTEL_EXPORTER_OTLP_ENDPOINT='http://127.0.0.1:4318/it'\\''s\nnext'")
+    );
+    assert!(
+        generated.as_str().contains(
+            "export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer test'\\''token\nline'"
+        )
+    );
     Ok(())
 }
 
@@ -535,6 +539,71 @@ echo '# END KVASIR MANAGED COPILOT OTEL is documentation'
             .contains("echo '# END KVASIR MANAGED COPILOT OTEL is documentation'")
     );
     assert!(!generated.as_str().contains("http://old.example"));
+    Ok(())
+}
+
+#[test]
+fn copilot_shell_profile_preserves_valid_codex_managed_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CopilotShellProfile::generate(
+        r#"# BEGIN KVASIR MANAGED CODEX OTEL
+[otel]
+exporter = { otlp-http = { endpoint = "http://old.example/v1/logs", protocol = "binary", headers = { "Authorization" = "Bearer codex-token" } } }
+# END KVASIR MANAGED CODEX OTEL
+"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("copilot-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert!(
+        generated
+            .as_str()
+            .contains("# BEGIN KVASIR MANAGED CODEX OTEL")
+    );
+    assert!(generated.as_str().contains("Bearer codex-token"));
+    assert!(
+        generated
+            .as_str()
+            .contains("# BEGIN KVASIR MANAGED COPILOT OTEL")
+    );
+    assert!(
+        generated
+            .as_str()
+            .contains("Authorization=Bearer copilot-token")
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_config_toml_preserves_valid_copilot_managed_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CodexConfigToml::generate(
+        r#"# BEGIN KVASIR MANAGED COPILOT OTEL
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer copilot-token'
+# END KVASIR MANAGED COPILOT OTEL
+"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("codex-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert!(
+        generated
+            .as_str()
+            .contains("# BEGIN KVASIR MANAGED COPILOT OTEL")
+    );
+    assert!(generated.as_str().contains("Bearer copilot-token"));
+    assert!(
+        generated
+            .as_str()
+            .contains("# BEGIN KVASIR MANAGED CODEX OTEL")
+    );
+    assert!(generated.as_str().contains("Bearer codex-token"));
     Ok(())
 }
 
