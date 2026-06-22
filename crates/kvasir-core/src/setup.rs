@@ -11,6 +11,8 @@ const CODEX_OTEL_BLOCK_START: &str = "# BEGIN KVASIR MANAGED CODEX OTEL";
 const CODEX_OTEL_BLOCK_END: &str = "# END KVASIR MANAGED CODEX OTEL";
 const COPILOT_OTEL_BLOCK_START: &str = "# BEGIN KVASIR MANAGED COPILOT OTEL";
 const COPILOT_OTEL_BLOCK_END: &str = "# END KVASIR MANAGED COPILOT OTEL";
+const REPO_INJECTION_BLOCK_START: &str = "# BEGIN KVASIR MANAGED REPO OTEL";
+const REPO_INJECTION_BLOCK_END: &str = "# END KVASIR MANAGED REPO OTEL";
 const OPENCODE_MANAGED_EXPERIMENTAL_KEYS: &[&str] = &["openTelemetry"];
 const OPENCODE_OTEL_ENDPOINT_ENV_KEY: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OPENCODE_OTEL_HEADERS_ENV_KEY: &str = "OTEL_EXPORTER_OTLP_HEADERS";
@@ -221,6 +223,56 @@ impl CopilotShellProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoInjectionShell {
+    Zsh,
+    Bash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoInjectionShellHook {
+    shell: String,
+}
+
+impl RepoInjectionShellHook {
+    pub fn generate(shell: RepoInjectionShell) -> Self {
+        Self {
+            shell: repo_injection_shell_hook(shell),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.shell
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoInjectionShellProfile {
+    shell: String,
+}
+
+impl RepoInjectionShellProfile {
+    pub fn generate(existing_profile: &str, hook_path: &Path) -> Result<Self, SetupError> {
+        let unmanaged_profile = remove_managed_block(
+            existing_profile,
+            REPO_INJECTION_BLOCK_START,
+            REPO_INJECTION_BLOCK_END,
+        )?;
+        let line_ending = preferred_line_ending(&unmanaged_profile, existing_profile);
+        let mut shell = unmanaged_profile.trim_end().to_owned();
+        if !shell.is_empty() {
+            shell.push_str(line_ending);
+            shell.push_str(line_ending);
+        }
+        shell.push_str(&repo_injection_shell_profile_block(hook_path, line_ending));
+        Ok(Self { shell })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.shell
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenCodeEnvironmentVariableKey {
     OtlpEndpoint,
     OtlpHeaders,
@@ -389,6 +441,150 @@ fn otlp_headers_env_value(bearer_token: &BearerToken) -> String {
 
 fn contains_control_character(value: &str) -> bool {
     value.chars().any(char::is_control)
+}
+
+fn repo_injection_shell_profile_block(hook_path: &Path, line_ending: &str) -> String {
+    let hook_path = hook_path.display().to_string();
+    format!(
+        "{REPO_INJECTION_BLOCK_START}{line_ending}\
+         . {}\
+         {line_ending}{REPO_INJECTION_BLOCK_END}{line_ending}",
+        shell_single_quote(&hook_path),
+    )
+}
+
+fn repo_injection_shell_hook(shell: RepoInjectionShell) -> String {
+    let mut hook = String::from(
+        r#"_kvasir_escape_otel_resource_attribute_value() {
+    local value="${1-}"
+    value="${value//\\/\\\\}"
+    value="${value//,/\\,}"
+    value="${value//=/\\=}"
+    value="$(printf '%s' "$value" | tr '\000-\037\177' ' ')"
+    printf '%s' "$value"
+}
+
+_kvasir_append_preserved_otel_resource_attribute() {
+    local attribute="${1-}"
+    local raw_key="${attribute%%=*}"
+    local key="${raw_key#"${raw_key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    if [ -z "$attribute" ] || [ "$key" = "repo.name" ] || [ "$key" = "repo.path" ]; then
+        return
+    fi
+    if [ -n "$_kvasir_preserved_otel_resource_attributes" ]; then
+        _kvasir_preserved_otel_resource_attributes="${_kvasir_preserved_otel_resource_attributes},${attribute}"
+    else
+        _kvasir_preserved_otel_resource_attributes="$attribute"
+    fi
+}
+
+_kvasir_without_repo_resource_attributes() {
+    local input="${1-}"
+    local pair=''
+    local char=''
+    local escaped=''
+    _kvasir_preserved_otel_resource_attributes=''
+
+    while [ -n "$input" ]; do
+        char="${input%"${input#?}"}"
+        input="${input#?}"
+        if [ -n "$escaped" ]; then
+            pair="${pair}${char}"
+            escaped=''
+            continue
+        fi
+
+        case "$char" in
+            \\)
+                pair="${pair}${char}"
+                escaped=1
+                ;;
+            ,)
+                _kvasir_append_preserved_otel_resource_attribute "$pair"
+                pair=''
+                ;;
+            *)
+                pair="${pair}${char}"
+                ;;
+        esac
+    done
+
+    _kvasir_append_preserved_otel_resource_attribute "$pair"
+    printf '%s' "$_kvasir_preserved_otel_resource_attributes"
+    unset _kvasir_preserved_otel_resource_attributes
+}
+
+_kvasir_update_otel_repo_resource() {
+    local repo_path
+    local repo_name
+    local escaped_repo_name
+    local escaped_repo_path
+    local current_resource_attributes
+
+    if repo_path="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$repo_path" ]; then
+        repo_name="${repo_path##*/}"
+    else
+        repo_name=''
+        repo_path=''
+    fi
+
+    current_resource_attributes="$(_kvasir_without_repo_resource_attributes "${OTEL_RESOURCE_ATTRIBUTES-}")"
+    escaped_repo_name="$(_kvasir_escape_otel_resource_attribute_value "$repo_name")"
+    escaped_repo_path="$(_kvasir_escape_otel_resource_attribute_value "$repo_path")"
+    export OTEL_RESOURCE_ATTRIBUTES="${current_resource_attributes:+${current_resource_attributes},}repo.name=${escaped_repo_name},repo.path=${escaped_repo_path}"
+}
+
+"#,
+    );
+
+    match shell {
+        RepoInjectionShell::Zsh => {
+            hook.push_str(
+                "autoload -Uz add-zsh-hook\n\
+                 add-zsh-hook -d chpwd _kvasir_update_otel_repo_resource 2>/dev/null || true\n\
+                 add-zsh-hook -d precmd _kvasir_update_otel_repo_resource 2>/dev/null || true\n\
+                 add-zsh-hook chpwd _kvasir_update_otel_repo_resource\n\
+                 add-zsh-hook precmd _kvasir_update_otel_repo_resource\n\
+                 _kvasir_update_otel_repo_resource\n",
+            );
+        }
+        RepoInjectionShell::Bash => {
+            hook.push_str(
+                r#"_kvasir_install_bash_prompt_command() {
+    case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
+        "declare -a "*)
+            local command
+            for command in "${PROMPT_COMMAND[@]}"; do
+                if [ "$command" = "_kvasir_update_otel_repo_resource" ]; then
+                    return
+                fi
+            done
+            PROMPT_COMMAND=("_kvasir_update_otel_repo_resource" "${PROMPT_COMMAND[@]}")
+            ;;
+        *)
+            case ";${PROMPT_COMMAND:-};" in
+                *";_kvasir_update_otel_repo_resource;"*) ;;
+                *)
+                    if [ -n "${PROMPT_COMMAND:-}" ]; then
+                        PROMPT_COMMAND="_kvasir_update_otel_repo_resource; ${PROMPT_COMMAND}"
+                    else
+                        PROMPT_COMMAND='_kvasir_update_otel_repo_resource'
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_kvasir_install_bash_prompt_command
+_kvasir_update_otel_repo_resource
+"#,
+            );
+        }
+    }
+
+    hook
 }
 
 fn copilot_otel_block(config: &SetupConfig, line_ending: &str) -> String {
@@ -648,7 +844,7 @@ fn is_kvasir_managed_marker_like_comment(line: &str, start_marker: &str) -> bool
 fn managed_marker_identifier(marker: &str) -> Option<&str> {
     marker
         .split_whitespace()
-        .find(|word| matches!(*word, "CODEX" | "COPILOT"))
+        .find(|word| matches!(*word, "CODEX" | "COPILOT" | "REPO"))
 }
 
 fn dominant_line_ending(text: &str) -> &'static str {
