@@ -15,7 +15,7 @@ use kvasir_core::{
     CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity, RepoName, RepoPath,
 };
 use kvasird::{
-    DaemonConfig, RunningDaemon, StoreKeySource, query_cost_rollup, query_token_rollup,
+    DaemonConfig, RunningDaemon, StoreKeySource, query_cost_rollup, query_token_rollup, query_trace,
     query_tool_call_rollup, start_with_store_key_source,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -226,6 +226,102 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
             }
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let token_query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), token_query).await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: opencode_kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            input_tokens: 1200,
+            output_tokens: 450,
+            cache_tokens: 80,
+        }]
+    );
+
+    let cost_query = CostRollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_cost_rollup(rpc_socket_path.clone(), cost_query).await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: opencode_kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            cost_usd: CostUsd::from_nanos(6_040_000).unwrap(),
+            source: CostSource::Estimated,
+        }]
+    );
+
+    let tool_query = ToolCallRollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_tool_call_rollup(rpc_socket_path.clone(), tool_query).await?,
+        vec![ToolCallRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: opencode_kvasir_repo(),
+            harness: HarnessName::new("opencode"),
+            tool_name: ToolName::new("Read"),
+            call_count: 1,
+        }]
+    );
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(120));
+    assert_eq!(traces[0].durations.request_ms, Some(1800));
+    assert_eq!(traces[0].durations.tool_ms, Some(250));
 
     Ok(())
 }
@@ -1151,6 +1247,13 @@ fn kvasir_repo() -> RepoBucket {
     ))
 }
 
+fn opencode_kvasir_repo() -> RepoBucket {
+    RepoBucket::repo(RepoIdentity::new(
+        RepoName::new("kvasir"),
+        RepoPath::new("/Users/oyr/projects/kvasir"),
+    ))
+}
+
 fn copilot_kvasir_repo() -> RepoBucket {
     RepoBucket::repo(RepoIdentity::new(
         RepoName::new("kvasir"),
@@ -1171,6 +1274,87 @@ fn claude_code_harness() -> HarnessName {
 
 fn cost_usd(value: &str) -> CostUsd {
     CostUsd::from_decimal_str(value).expect("test cost must be valid")
+}
+
+fn opencode_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.session",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "opencode.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "ai.generateText.doGenerate",
+                        "startTimeUnixNano": "1781956800120000000",
+                        "endTimeUnixNano": "1781956801920000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "ai.generateText" } },
+                            { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                            { "key": "ai.usage.promptTokens", "value": { "intValue": "1200" } },
+                            { "key": "ai.usage.completionTokens", "value": { "intValue": "450" } },
+                            { "key": "ai.usage.cachedInputTokens", "value": { "intValue": "80" } }
+                        ]
+                    },
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "execute Read",
+                        "startTimeUnixNano": "1781956801920000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "toolCall" } },
+                            { "key": "ai.toolCall.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn opencode_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "opencode.content",
+                    "body": { "stringValue": "content capture is opt-in and intentionally ignored by this rollup fixture" },
+                    "attributes": [
+                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
 }
 
 fn repo_and_no_repo_metrics_fixture() -> &'static str {
