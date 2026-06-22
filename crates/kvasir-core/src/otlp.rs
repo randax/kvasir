@@ -140,7 +140,7 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
                 .ok_or(OtlpError::MissingMetrics)?;
             for metric in metrics {
                 match metric.get("name").and_then(Value::as_str) {
-                    Some("token.usage") | Some("codex.turn.token_usage") => {
+                    Some(name) if is_token_metric_name(name) => {
                         let data_points = json_data_points(metric)?;
                         for data_point in data_points {
                             if let Some(record) = json_token_record(
@@ -319,7 +319,7 @@ fn records_from_metric(
 ) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
     match metric.name.as_str() {
-        "token.usage" => {
+        name if is_cumulative_token_metric_name(name) => {
             for data_point in proto_sum_data_points(metric)? {
                 records
                     .token_usage
@@ -446,11 +446,23 @@ fn record_from_proto_sum_data_point(
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     repo: RepoBucket,
 ) -> Result<TokenUsageRecord, OtlpError> {
-    let model = proto_attribute(&data_point.attributes, "model").ok_or(OtlpError::MissingModel)?;
-    let measure = proto_attribute(&data_point.attributes, "token.type")
-        .or_else(|| proto_attribute(&data_point.attributes, "type"))
-        .and_then(|value| TokenMeasure::from_attribute(&value))
-        .ok_or(OtlpError::InvalidMeasure)?;
+    let model = first_meaningful_proto_attribute(
+        &data_point.attributes,
+        &["model", "gen_ai.request.model"],
+    )
+    .ok_or(OtlpError::MissingModel)?;
+    let measure = first_meaningful_proto_attribute(
+        &data_point.attributes,
+        &[
+            "token.type",
+            "type",
+            "direction",
+            "token_type",
+            "gen_ai.token.type",
+        ],
+    )
+    .and_then(|value| TokenMeasure::from_attribute(&value))
+    .ok_or(OtlpError::InvalidMeasure)?;
     let token_count = match data_point.value.ok_or(OtlpError::MissingTokenCount)? {
         number_data_point::Value::AsInt(value) => {
             TokenCount::try_new(u64::try_from(value).map_err(|_| OtlpError::NumberOutOfRange)?)
@@ -583,7 +595,7 @@ fn json_data_points(metric: &Value) -> Result<&Vec<Value>, OtlpError> {
 
 fn metric_data(metric: &Value) -> Result<Option<&Value>, OtlpError> {
     match metric.get("name").and_then(Value::as_str) {
-        Some("token.usage") | Some("cost.usage") => metric
+        Some(name) if is_cumulative_token_metric_name(name) || name == "cost.usage" => metric
             .get("sum")
             .map(|sum| sum.get("dataPoints"))
             .ok_or(OtlpError::InvalidMetricKind),
@@ -615,11 +627,19 @@ fn json_token_record(
     repo: RepoBucket,
 ) -> Result<Option<TokenUsageRecord>, OtlpError> {
     let attributes = data_point.get("attributes").and_then(Value::as_array);
-    let model = json_attribute(attributes, "model").ok_or(OtlpError::MissingModel)?;
-    let token_type = json_attribute(attributes, "token_type")
-        .or_else(|| json_attribute(attributes, "token.type"))
-        .or_else(|| json_attribute(attributes, "type"))
-        .ok_or(OtlpError::InvalidMeasure)?;
+    let model = first_meaningful_json_attribute(attributes, &["model", "gen_ai.request.model"])
+        .ok_or(OtlpError::MissingModel)?;
+    let token_type = first_meaningful_json_attribute(
+        attributes,
+        &[
+            "token_type",
+            "token.type",
+            "type",
+            "direction",
+            "gen_ai.token.type",
+        ],
+    )
+    .ok_or(OtlpError::InvalidMeasure)?;
     let Some(measure) = token_measure_for_metric(metric, &token_type) else {
         if is_codex_token_metric(metric) && is_ignored_codex_token_type(&token_type) {
             return Ok(None);
@@ -685,6 +705,14 @@ fn token_measure_for_metric(metric: &Value, value: &str) -> Option<TokenMeasure>
     } else {
         TokenMeasure::from_attribute(value)
     }
+}
+
+fn is_token_metric_name(name: &str) -> bool {
+    is_cumulative_token_metric_name(name) || name == "codex.turn.token_usage"
+}
+
+fn is_cumulative_token_metric_name(name: &str) -> bool {
+    matches!(name, "token.usage" | "github.copilot.chat.tokens")
 }
 
 fn is_codex_token_metric(metric: &Value) -> bool {
@@ -932,8 +960,21 @@ fn first_proto_attribute(attributes: &[KeyValue], keys: &[&str]) -> Option<Strin
     keys.iter().find_map(|key| proto_attribute(attributes, key))
 }
 
+fn first_meaningful_proto_attribute(attributes: &[KeyValue], keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| meaningful_attribute(proto_attribute(attributes, key)))
+}
+
 fn first_json_attribute(attributes: Option<&Vec<Value>>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| json_attribute(attributes, key))
+}
+
+fn first_meaningful_json_attribute(
+    attributes: Option<&Vec<Value>>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| meaningful_attribute(json_attribute(attributes, key)))
 }
 
 fn canonical_proto_trace_id(bytes: Vec<u8>) -> Result<String, OtlpError> {
@@ -1598,6 +1639,75 @@ mod tests {
     }
 
     #[test]
+    fn json_copilot_token_metrics_normalize_to_cumulative_token_records() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tokens",
+                        "sum": {
+                            "dataPoints": [
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956800000000000",
+                                    "asInt": "1200",
+                                    "attributes": [
+                                        { "key": "model", "value": { "stringValue": " " } },
+                                        { "key": "gen_ai.request.model", "value": { "stringValue": "gpt-4.1" } },
+                                        { "key": "token.type", "value": { "stringValue": "" } },
+                                        { "key": "direction", "value": { "stringValue": "input" } }
+                                    ]
+                                },
+                                {
+                                    "startTimeUnixNano": "1781956700000000000",
+                                    "timeUnixNano": "1781956800000000000",
+                                    "asInt": "450",
+                                    "attributes": [
+                                        { "key": "gen_ai.request.model", "value": { "stringValue": "gpt-4.1" } },
+                                        { "key": "gen_ai.token.type", "value": { "stringValue": "output" } }
+                                    ]
+                                }
+                            ]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+
+        assert_eq!(
+            parse_token_usage_json(payload).expect("valid Copilot token usage"),
+            vec![
+                TokenUsageRecord::new(
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_700_000),
+                    repo.clone(),
+                    ModelName::new("gpt-4.1"),
+                    TokenMeasure::Input,
+                    TokenCount::new(1200),
+                ),
+                TokenUsageRecord::new(
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_700_000),
+                    repo,
+                    ModelName::new("gpt-4.1"),
+                    TokenMeasure::Output,
+                    TokenCount::new(450),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn protobuf_codex_turn_token_usage_metrics_normalize_to_token_records() {
         let payload = protobuf_codex_histogram_payload_with_resource_attributes(
             vec![
@@ -1633,6 +1743,69 @@ mod tests {
                 && record.occurred_at == TimestampMillis::new_for_test(1_781_956_800_000)
                 && record.counter_start == TimestampMillis::new_for_test(1_781_956_799_000)
         }));
+    }
+
+    #[test]
+    fn protobuf_copilot_token_metrics_normalize_to_cumulative_token_records() {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tokens",
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![
+                NumberDataPoint {
+                    attributes: vec![
+                        string_attribute("model", " "),
+                        string_attribute("gen_ai.request.model", "gpt-4.1"),
+                        string_attribute("token.type", ""),
+                        string_attribute("direction", "input"),
+                    ],
+                    start_time_unix_nano: 1_781_956_700_000_000_000,
+                    time_unix_nano: 1_781_956_800_000_000_000,
+                    exemplars: Vec::new(),
+                    flags: 0,
+                    value: Some(Value::AsInt(1200)),
+                },
+                NumberDataPoint {
+                    attributes: vec![
+                        string_attribute("gen_ai.request.model", "gpt-4.1"),
+                        string_attribute("gen_ai.token.type", "output"),
+                    ],
+                    start_time_unix_nano: 1_781_956_700_000_000_000,
+                    time_unix_nano: 1_781_956_800_000_000_000,
+                    exemplars: Vec::new(),
+                    flags: 0,
+                    value: Some(Value::AsInt(450)),
+                },
+            ],
+        );
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+
+        assert_eq!(
+            parse_token_usage_protobuf(&payload).expect("valid Copilot token usage"),
+            vec![
+                TokenUsageRecord::new(
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_700_000),
+                    repo.clone(),
+                    ModelName::new("gpt-4.1"),
+                    TokenMeasure::Input,
+                    TokenCount::new(1200),
+                ),
+                TokenUsageRecord::new(
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_700_000),
+                    repo,
+                    ModelName::new("gpt-4.1"),
+                    TokenMeasure::Output,
+                    TokenCount::new(450),
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -2598,6 +2771,18 @@ mod tests {
         resource_attributes: Vec<KeyValue>,
         data_points: Vec<NumberDataPoint>,
     ) -> Vec<u8> {
+        protobuf_payload_with_metric_name_and_resource_attributes(
+            "token.usage",
+            resource_attributes,
+            data_points,
+        )
+    }
+
+    fn protobuf_payload_with_metric_name_and_resource_attributes(
+        metric_name: &str,
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<NumberDataPoint>,
+    ) -> Vec<u8> {
         ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
@@ -2608,7 +2793,7 @@ mod tests {
                 scope_metrics: vec![ScopeMetrics {
                     scope: None,
                     metrics: vec![Metric {
-                        name: "token.usage".to_owned(),
+                        name: metric_name.to_owned(),
                         description: String::new(),
                         unit: "{token}".to_owned(),
                         metadata: Vec::new(),

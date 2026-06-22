@@ -36,6 +36,7 @@ impl PriceTable {
     pub fn bundled_defaults() -> Self {
         Self {
             prices: vec![
+                gpt_4_1_prices("gpt-4.1"),
                 gpt_5_4_prices("gpt-5.4"),
                 gpt_5_4_mini_prices("gpt-5.4-mini"),
                 claude_opus_4_prices("claude-opus-4-20250514"),
@@ -121,6 +122,15 @@ impl ModelTokenPrices {
     }
 }
 
+fn gpt_4_1_prices(model: &str) -> ModelTokenPrices {
+    ModelTokenPrices::new(
+        ModelName::new(model),
+        CostUsd::from_nanos(2_000).expect("default price must fit storage"),
+        CostUsd::from_nanos(8_000).expect("default price must fit storage"),
+        CostUsd::from_nanos(500).expect("default price must fit storage"),
+    )
+}
+
 fn claude_opus_4_prices(model: &str) -> ModelTokenPrices {
     ModelTokenPrices::new(
         ModelName::new(model),
@@ -169,6 +179,15 @@ mod tests {
     fn bundled_price_table_computes_representative_claude_model_costs() {
         let table = PriceTable::bundled_defaults();
 
+        assert_eq!(
+            table.estimate_cost(
+                &ModelName::new("gpt-4.1"),
+                TokenCount::new(1_200),
+                TokenCount::new(450),
+                TokenCount::new(80),
+            ),
+            CostUsd::from_nanos(6_040_000)
+        );
         assert_eq!(
             table.estimate_cost(
                 &ModelName::new("gpt-5.4"),
