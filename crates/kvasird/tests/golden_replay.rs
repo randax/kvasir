@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
@@ -16,14 +17,16 @@ use kvasir_core::{
 };
 use kvasird::{
     DaemonConfig, RunningDaemon, StoreKeySource, query_cost_rollup, query_token_rollup,
-    query_tool_call_rollup, start_with_store_key_source,
+    query_tool_call_rollup, query_trace, start_with_store_key_source,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{
     LogRecord, ResourceLogs as OtlpResourceLogs, ScopeLogs,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -226,6 +229,262 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
             }
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: database_path.clone(),
+        bearer_token,
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let token_query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), token_query).await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            input_tokens: 1200,
+            output_tokens: 450,
+            cache_tokens: 80,
+        }]
+    );
+
+    let cost_query = CostRollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_cost_rollup(rpc_socket_path.clone(), cost_query).await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            cost_usd: CostUsd::from_nanos(6_040_000).unwrap(),
+            source: CostSource::Estimated,
+        }]
+    );
+
+    let tool_query = ToolCallRollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_tool_call_rollup(rpc_socket_path.clone(), tool_query).await?,
+        vec![ToolCallRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            harness: HarnessName::new("opencode"),
+            tool_name: ToolName::new("Read"),
+            call_count: 1,
+        }]
+    );
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(120));
+    assert_eq!(traces[0].durations.request_ms, Some(1800));
+    assert_eq!(traces[0].durations.tool_ms, Some(250));
+
+    drop(daemon);
+    assert_eq!(
+        persisted_opencode_content_rows(&database_path)?,
+        vec![(
+            "opencode".to_owned(),
+            "assistant_message".to_owned(),
+            "content capture is opt-in and intentionally ignored by this rollup fixture".to_owned()
+        )]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(opencode_trace_protobuf_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), query).await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            input_tokens: 1200,
+            output_tokens: 450,
+            cache_tokens: 80,
+        }]
+    );
+
+    assert_eq!(
+        query_tool_call_rollup(
+            rpc_socket_path.clone(),
+            ToolCallRollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        vec![ToolCallRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            harness: HarnessName::new("opencode"),
+            tool_name: ToolName::new("Read"),
+            call_count: 1,
+        }]
+    );
+
+    assert_eq!(
+        query_cost_rollup(
+            rpc_socket_path.clone(),
+            CostRollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            cost_usd: CostUsd::from_nanos(6_040_000).unwrap(),
+            source: CostSource::Estimated,
+        }]
+    );
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(120));
+    assert_eq!(traces[0].durations.request_ms, Some(1800));
+    assert_eq!(traces[0].durations.tool_ms, Some(250));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn opencode_trace_ingest_degrades_when_experimental_attributes_are_missing()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_degraded_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), query).await?,
+        Vec::new()
+    );
+    assert_eq!(
+        query_tool_call_rollup(
+            rpc_socket_path.clone(),
+            ToolCallRollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        Vec::new()
+    );
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-2"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-2"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].spans[2].tool_name, None);
 
     Ok(())
 }
@@ -1173,6 +1432,239 @@ fn cost_usd(value: &str) -> CostUsd {
     CostUsd::from_decimal_str(value).expect("test cost must be valid")
 }
 
+fn opencode_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.session",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "opencode.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "ai.generateText.doGenerate",
+                        "startTimeUnixNano": "1781956800120000000",
+                        "endTimeUnixNano": "1781956801920000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "ai.generateText" } },
+                            { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                            { "key": "ai.usage.promptTokens", "value": { "intValue": "1200" } },
+                            { "key": "ai.usage.completionTokens", "value": { "intValue": "450" } },
+                            { "key": "ai.usage.cachedInputTokens", "value": { "intValue": "80" } }
+                        ]
+                    },
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "execute Read",
+                        "startTimeUnixNano": "1781956801920000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "toolCall" } },
+                            { "key": "ai.toolCall.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn opencode_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "opencode.content",
+                    "body": { "stringValue": "content capture is opt-in and intentionally ignored by this rollup fixture" },
+                    "attributes": [
+                        { "key": "content.opt_in", "value": { "boolValue": true } },
+                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
+}
+
+fn opencode_degraded_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-2" } },
+                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-2" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "dddddddddddddddddddddddddddddddd",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.session",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "opencode.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "dddddddddddddddddddddddddddddddd",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "ai.generateText.doGenerate",
+                        "startTimeUnixNano": "1781956800120000000",
+                        "endTimeUnixNano": "1781956801920000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "ai.generateText" } },
+                            { "key": "ai.usage.promptTokens", "value": { "intValue": "1200" } }
+                        ]
+                    },
+                    {
+                        "traceId": "dddddddddddddddddddddddddddddddd",
+                        "spanId": "4444444444444444",
+                        "parentSpanId": "1111111111111111",
+                        "name": "runtime.flush",
+                        "startTimeUnixNano": "1781956802170000000",
+                        "endTimeUnixNano": "1781956802180000000",
+                        "attributes": []
+                    },
+                    {
+                        "traceId": "dddddddddddddddddddddddddddddddd",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "execute missing tool name",
+                        "startTimeUnixNano": "1781956801920000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "toolCall" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn opencode_trace_protobuf_fixture() -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "opencode"),
+                    string_attribute("repo.name", "kvasir"),
+                    string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
+                    string_attribute("session.id", "opencode-session-1"),
+                    string_attribute("prompt.id", "opencode-turn-1"),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![
+                    Span {
+                        trace_id: hex_bytes("cccccccccccccccccccccccccccccccc"),
+                        span_id: hex_bytes("1111111111111111"),
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "opencode.session".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_802_170_000_000,
+                        attributes: vec![string_attribute("opencode.span.kind", "interaction")],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("cccccccccccccccccccccccccccccccc"),
+                        span_id: hex_bytes("2222222222222222"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "ai.generateText.doGenerate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_120_000_000,
+                        end_time_unix_nano: 1_781_956_801_920_000_000,
+                        attributes: vec![
+                            string_attribute("ai.operationId", "ai.generateText"),
+                            string_attribute("ai.model.id", "gpt-4.1"),
+                            int_attribute("ai.usage.promptTokens", 1200),
+                            int_attribute("ai.usage.completionTokens", 450),
+                            int_attribute("ai.usage.cachedInputTokens", 80),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("cccccccccccccccccccccccccccccccc"),
+                        span_id: hex_bytes("3333333333333333"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "execute Read".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_801_920_000_000,
+                        end_time_unix_nano: 1_781_956_802_170_000_000,
+                        attributes: vec![
+                            string_attribute("ai.operationId", "toolCall"),
+                            string_attribute("ai.toolCall.name", "Read"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
 fn repo_and_no_repo_metrics_fixture() -> &'static str {
     r#"{
         "resourceMetrics": [
@@ -1495,6 +1987,37 @@ fn string_attribute(key: &str, value: &str) -> KeyValue {
     }
 }
 
+fn int_attribute(key: &str, value: i64) -> KeyValue {
+    KeyValue {
+        key: key.to_owned(),
+        key_strindex: 0,
+        value: Some(AnyValue {
+            value: Some(any_value::Value::IntValue(value)),
+        }),
+    }
+}
+
+fn hex_bytes(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_nibble(chunk[0]);
+            let low = hex_nibble(chunk[1]);
+            (high << 4) | low
+        })
+        .collect()
+}
+
+fn hex_nibble(character: u8) -> u8 {
+    match character {
+        b'0'..=b'9' => character - b'0',
+        b'a'..=b'f' => character - b'a' + 10,
+        b'A'..=b'F' => character - b'A' + 10,
+        _ => panic!("test fixture hex contains invalid character"),
+    }
+}
+
 fn claude_non_tool_logs_fixture() -> &'static str {
     r#"{
         "resourceLogs": [{
@@ -1640,4 +2163,27 @@ fn custom_price_token_usage_fixture() -> &'static str {
             }]
         }]
     }"#
+}
+
+fn persisted_opencode_content_rows(
+    database_path: &Path,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = "0b".repeat(32);
+    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let mut statement = connection.prepare(
+        "SELECT harness, content_kind, content
+         FROM canonical_content_records
+         ORDER BY event_key",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }

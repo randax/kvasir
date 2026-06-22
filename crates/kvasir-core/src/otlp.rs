@@ -21,9 +21,10 @@ use crate::rpc::{
     TraceId, TraceSpanKind,
 };
 use crate::usage::{
-    CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal, ToolCallEventKey,
-    ToolCallRecord, TraceSpanRecord, UsageRecords,
+    ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
+    RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageEventKey,
+    TokenUsageRecord, TokenUsageSignal, ToolCallEventKey, ToolCallRecord, TraceSpanRecord,
+    UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -197,6 +198,7 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
             .and_then(|resource| resource.get("attributes"))
             .and_then(Value::as_array);
         let repo = repo_from_json_attributes(resource_attributes);
+        let harness = harness_from_json_attributes(resource_attributes);
         let scope_logs = resource_logs
             .get("scopeLogs")
             .and_then(Value::as_array)
@@ -213,6 +215,11 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
                 if let Some(record) = json_tool_call_record(log_record, repo.clone())? {
                     records.tool_calls.push(record);
                 }
+                if let Some(record) =
+                    json_opencode_content_record(log_record, repo.clone(), harness.as_deref())?
+                {
+                    records.content.push(record);
+                }
             }
         }
     }
@@ -228,7 +235,7 @@ pub fn parse_otlp_protobuf_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
     for resource_spans in request.resource_spans {
         records.extend(records_from_resource_spans(resource_spans)?);
     }
-    if records.trace_spans.is_empty() {
+    if records.is_empty() {
         return Err(OtlpError::MissingSpans);
     }
     Ok(records)
@@ -248,6 +255,8 @@ pub fn parse_otlp_json_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
             .and_then(Value::as_array);
         let session_id = json_session_id(resource_attributes);
         let prompt_id = json_prompt_id(resource_attributes);
+        let repo = repo_from_json_attributes(resource_attributes);
+        let harness = harness_from_json_attributes(resource_attributes);
         let scope_spans = resource_spans
             .get("scopeSpans")
             .and_then(Value::as_array)
@@ -258,15 +267,23 @@ pub fn parse_otlp_json_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
                 .and_then(Value::as_array)
                 .ok_or(OtlpError::MissingSpans)?;
             for span in spans {
-                records.trace_spans.push(json_trace_span_record(
+                records.extend(json_opencode_span_records(
+                    span,
+                    repo.clone(),
+                    harness.as_deref(),
+                )?);
+                if let Some(record) = json_trace_span_record(
                     span,
                     session_id.clone(),
                     prompt_id.clone(),
-                )?);
+                    harness.as_deref(),
+                )? {
+                    records.trace_spans.push(record);
+                }
             }
         }
     }
-    if records.trace_spans.is_empty() {
+    if records.is_empty() {
         return Err(OtlpError::MissingSpans);
     }
     Ok(records)
@@ -358,10 +375,18 @@ fn records_from_resource_logs(resource_logs: OtlpResourceLogs) -> Result<UsageRe
         .as_ref()
         .map(|resource| repo_from_proto_attributes(&resource.attributes))
         .unwrap_or_else(RepoBucket::no_repo);
+    let harness = resource_logs
+        .resource
+        .as_ref()
+        .and_then(|resource| harness_from_proto_attributes(&resource.attributes));
 
     let mut records = UsageRecords::default();
     for scope_logs in resource_logs.scope_logs {
-        records.extend(records_from_scope_logs_for_logs(scope_logs, repo.clone())?);
+        records.extend(records_from_scope_logs_for_logs(
+            scope_logs,
+            repo.clone(),
+            harness.as_deref(),
+        )?);
     }
     Ok(records)
 }
@@ -369,14 +394,20 @@ fn records_from_resource_logs(resource_logs: OtlpResourceLogs) -> Result<UsageRe
 fn records_from_scope_logs_for_logs(
     scope_logs: ScopeLogs,
     repo: RepoBucket,
+    resource_harness: Option<&str>,
 ) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
     for log_record in scope_logs.log_records {
         if let Some(record) = proto_token_usage_log_record(&log_record, repo.clone())? {
             records.token_usage.push(record);
         }
-        if let Some(record) = proto_tool_call_record(log_record, repo.clone())? {
+        if let Some(record) = proto_tool_call_record(log_record.clone(), repo.clone())? {
             records.tool_calls.push(record);
+        }
+        if let Some(record) =
+            proto_opencode_content_record(&log_record, repo.clone(), resource_harness)?
+        {
+            records.content.push(record);
         }
     }
     Ok(records)
@@ -392,12 +423,16 @@ fn records_from_resource_spans(
         .unwrap_or(&[]);
     let session_id = proto_session_id(resource_attributes);
     let prompt_id = proto_prompt_id(resource_attributes);
+    let repo = repo_from_proto_attributes(resource_attributes);
+    let harness = harness_from_proto_attributes(resource_attributes);
     let mut records = UsageRecords::default();
     for scope_spans in resource_spans.scope_spans {
         records.extend(records_from_scope_spans_for_traces(
             scope_spans,
             session_id.clone(),
             prompt_id.clone(),
+            repo.clone(),
+            harness.as_deref(),
         )?);
     }
     Ok(records)
@@ -407,14 +442,24 @@ fn records_from_scope_spans_for_traces(
     scope_spans: ScopeSpans,
     resource_session_id: Option<SessionId>,
     resource_prompt_id: Option<PromptId>,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
 ) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
     for span in scope_spans.spans {
-        records.trace_spans.push(proto_trace_span_record(
+        records.extend(proto_opencode_span_records(
+            &span,
+            repo.clone(),
+            resource_harness,
+        )?);
+        if let Some(record) = proto_trace_span_record(
             span,
             resource_session_id.clone(),
             resource_prompt_id.clone(),
-        )?);
+            resource_harness,
+        )? {
+            records.trace_spans.push(record);
+        }
     }
     Ok(records)
 }
@@ -937,17 +982,113 @@ fn json_tool_call_record(
     )))
 }
 
+fn proto_opencode_content_record(
+    log_record: &LogRecord,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<Option<ContentRecord>, OtlpError> {
+    if !is_opencode_context(resource_harness)
+        || !is_opencode_content_event(Some(log_record.event_name.as_str()), || {
+            proto_attribute(&log_record.attributes, "event.name")
+        })
+        || !proto_bool_attribute(&log_record.attributes, "content.opt_in")
+    {
+        return Ok(None);
+    }
+    let Some(kind) = proto_attribute(&log_record.attributes, "content.type")
+        .and_then(|value| ContentKind::from_attribute(&value))
+    else {
+        return Ok(None);
+    };
+    let Some(content) = log_record
+        .body
+        .as_ref()
+        .and_then(proto_string_value)
+        .and_then(ContentText::new)
+    else {
+        return Ok(None);
+    };
+    let occurred_at_nanos = if log_record.time_unix_nano == 0 {
+        log_record.observed_time_unix_nano
+    } else {
+        log_record.time_unix_nano
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let event_key = content_event_key(&repo, "opencode", kind, occurred_at_nanos, content.as_str());
+    Ok(Some(ContentRecord::new(
+        event_key,
+        occurred_at,
+        repo,
+        HarnessName::new("opencode"),
+        kind,
+        content,
+    )))
+}
+
+fn json_opencode_content_record(
+    log_record: &Value,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<Option<ContentRecord>, OtlpError> {
+    let attributes = log_record.get("attributes").and_then(Value::as_array);
+    if !is_opencode_context(resource_harness)
+        || !is_opencode_content_event(log_record.get("eventName").and_then(Value::as_str), || {
+            json_attribute(attributes, "event.name")
+        })
+        || !json_bool_attribute(attributes, "content.opt_in")
+    {
+        return Ok(None);
+    }
+    let Some(kind) = json_attribute(attributes, "content.type")
+        .and_then(|value| ContentKind::from_attribute(&value))
+    else {
+        return Ok(None);
+    };
+    let Some(content) = log_record
+        .get("body")
+        .and_then(json_string_any_value)
+        .and_then(ContentText::new)
+    else {
+        return Ok(None);
+    };
+    let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
+    let event_key = content_event_key(&repo, "opencode", kind, occurred_at_nanos, content.as_str());
+    Ok(Some(ContentRecord::new(
+        event_key,
+        occurred_at,
+        repo,
+        HarnessName::new("opencode"),
+        kind,
+        content,
+    )))
+}
+
 fn proto_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
-    let value = proto_attribute(attributes, "tool.name")
-        .or_else(|| proto_attribute(attributes, "tool_name"))
-        .ok_or(OtlpError::MissingToolName)?;
+    let value = first_proto_attribute(
+        attributes,
+        &[
+            "tool.name",
+            "tool_name",
+            "ai.toolCall.name",
+            "gen_ai.tool.name",
+        ],
+    )
+    .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
 }
 
 fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError> {
-    let value = json_attribute(attributes, "tool.name")
-        .or_else(|| json_attribute(attributes, "tool_name"))
-        .ok_or(OtlpError::MissingToolName)?;
+    let value = first_json_attribute(
+        attributes,
+        &[
+            "tool.name",
+            "tool_name",
+            "ai.toolCall.name",
+            "gen_ai.tool.name",
+        ],
+    )
+    .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
 }
 
@@ -1187,14 +1328,29 @@ fn proto_trace_span_record(
     span: OtlpSpan,
     resource_session_id: Option<SessionId>,
     resource_prompt_id: Option<PromptId>,
-) -> Result<TraceSpanRecord, OtlpError> {
-    let session_id = resource_session_id
-        .or_else(|| proto_session_id(&span.attributes))
-        .ok_or(OtlpError::MissingSessionId)?;
-    let prompt_id = resource_prompt_id
-        .or_else(|| proto_prompt_id(&span.attributes))
-        .ok_or(OtlpError::MissingPromptId)?;
-    let kind = proto_trace_span_kind(&span.attributes).ok_or(OtlpError::InvalidTraceSpanKind)?;
+    resource_harness: Option<&str>,
+) -> Result<Option<TraceSpanRecord>, OtlpError> {
+    let Some(kind) = proto_trace_span_kind(&span.attributes)
+        .or_else(|| opencode_inferred_proto_span_kind(resource_harness, &span))
+    else {
+        if is_opencode_context(resource_harness) {
+            return Ok(None);
+        }
+        return Err(OtlpError::InvalidTraceSpanKind);
+    };
+    let Some(session_id) = resource_session_id.or_else(|| proto_session_id(&span.attributes))
+    else {
+        if is_opencode_context(resource_harness) {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingSessionId);
+    };
+    let Some(prompt_id) = resource_prompt_id.or_else(|| proto_prompt_id(&span.attributes)) else {
+        if is_opencode_context(resource_harness) {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingPromptId);
+    };
     let trace_id = canonical_proto_trace_id(span.trace_id)?;
     let span_id = canonical_proto_span_id(span.span_id)?;
     let parent_span_id = canonical_proto_parent_span_id(span.parent_span_id)?.map(SpanId::new);
@@ -1203,11 +1359,17 @@ fn proto_trace_span_record(
     let ended_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
         .ok_or(OtlpError::MissingTimestamp)?;
     let tool_name = if kind == TraceSpanKind::ToolCall {
-        Some(proto_tool_name(&span.attributes)?)
+        proto_tool_name(&span.attributes).map(Some).or_else(|err| {
+            if is_opencode_context(resource_harness) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        })?
     } else {
         None
     };
-    Ok(TraceSpanRecord {
+    Ok(Some(TraceSpanRecord {
         session_id,
         prompt_id,
         trace_id: TraceId::new(trace_id),
@@ -1219,22 +1381,220 @@ fn proto_trace_span_record(
         ended_at,
         duration_ms: duration_ms(started_at, ended_at),
         tool_name,
-    })
+    }))
+}
+
+fn proto_opencode_span_records(
+    span: &OtlpSpan,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<UsageRecords, OtlpError> {
+    if !is_opencode_span(resource_harness, &span.name, |key| {
+        proto_attribute(&span.attributes, key)
+    }) {
+        return Ok(UsageRecords::default());
+    }
+    let mut records = UsageRecords::default();
+    records.extend(proto_opencode_token_records(span, repo.clone())?);
+    if let Some(record) = proto_opencode_tool_call_record(span, repo)? {
+        records.tool_calls.push(record);
+    }
+    Ok(records)
+}
+
+fn json_opencode_span_records(
+    span: &Value,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<UsageRecords, OtlpError> {
+    let attributes = span.get("attributes").and_then(Value::as_array);
+    let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
+    if !is_opencode_span(resource_harness, name, |key| {
+        json_attribute(attributes, key)
+    }) {
+        return Ok(UsageRecords::default());
+    }
+    let mut records = UsageRecords::default();
+    records.extend(json_opencode_token_records(span, attributes, repo.clone())?);
+    if let Some(record) = json_opencode_tool_call_record(span, attributes, repo)? {
+        records.tool_calls.push(record);
+    }
+    Ok(records)
+}
+
+fn proto_opencode_token_records(
+    span: &OtlpSpan,
+    repo: RepoBucket,
+) -> Result<UsageRecords, OtlpError> {
+    let Some(model) = opencode_proto_model(&span.attributes) else {
+        return Ok(UsageRecords::default());
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let counter_start = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let mut records = UsageRecords::default();
+    for (measure, keys) in opencode_token_attribute_keys() {
+        let Some(token_count) = proto_token_count_attribute(&span.attributes, keys).transpose()?
+        else {
+            continue;
+        };
+        let event_key = trace_token_usage_event_key(
+            &repo,
+            model.as_str(),
+            measure,
+            &canonical_proto_trace_id(span.trace_id.clone())?,
+            &canonical_proto_span_id(span.span_id.clone())?,
+            token_count,
+        );
+        records
+            .token_usage
+            .push(TokenUsageRecord::new_delta_from_signal(
+                TokenUsageSignal::OpenCodeTraces,
+                event_key,
+                occurred_at,
+                repo.clone(),
+                model.clone(),
+                measure,
+                token_count,
+            ));
+        records
+            .token_usage
+            .last_mut()
+            .expect("record was just pushed")
+            .counter_start = counter_start;
+    }
+    Ok(records)
+}
+
+fn json_opencode_token_records(
+    span: &Value,
+    attributes: Option<&Vec<Value>>,
+    repo: RepoBucket,
+) -> Result<UsageRecords, OtlpError> {
+    let Some(model) = opencode_json_model(attributes) else {
+        return Ok(UsageRecords::default());
+    };
+    let occurred_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
+    let counter_start =
+        json_timestamp(span, "startTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
+    let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
+    let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
+    let mut records = UsageRecords::default();
+    for (measure, keys) in opencode_token_attribute_keys() {
+        let Some(token_count) = json_token_count_attribute(attributes, keys).transpose()? else {
+            continue;
+        };
+        let event_key = trace_token_usage_event_key(
+            &repo,
+            model.as_str(),
+            measure,
+            &trace_id,
+            &span_id,
+            token_count,
+        );
+        records
+            .token_usage
+            .push(TokenUsageRecord::new_delta_from_signal(
+                TokenUsageSignal::OpenCodeTraces,
+                event_key,
+                occurred_at,
+                repo.clone(),
+                model.clone(),
+                measure,
+                token_count,
+            ));
+        records
+            .token_usage
+            .last_mut()
+            .expect("record was just pushed")
+            .counter_start = counter_start;
+    }
+    Ok(records)
+}
+
+fn proto_opencode_tool_call_record(
+    span: &OtlpSpan,
+    repo: RepoBucket,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    if opencode_inferred_proto_span_kind(Some("opencode"), span) != Some(TraceSpanKind::ToolCall) {
+        return Ok(None);
+    }
+    let Ok(tool_name) = proto_tool_name(&span.attributes) else {
+        return Ok(None);
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let event_key = trace_tool_call_event_key(
+        &repo,
+        &canonical_proto_trace_id(span.trace_id.clone())?,
+        &canonical_proto_span_id(span.span_id.clone())?,
+        tool_name.as_str(),
+    );
+    Ok(Some(ToolCallRecord::new(
+        event_key,
+        occurred_at,
+        repo,
+        HarnessName::new("opencode"),
+        tool_name,
+    )))
+}
+
+fn json_opencode_tool_call_record(
+    span: &Value,
+    attributes: Option<&Vec<Value>>,
+    repo: RepoBucket,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    if opencode_inferred_json_span_kind(Some("opencode"), span) != Some(TraceSpanKind::ToolCall) {
+        return Ok(None);
+    }
+    let Ok(tool_name) = json_tool_name(attributes) else {
+        return Ok(None);
+    };
+    let occurred_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
+    let event_key = trace_tool_call_event_key(
+        &repo,
+        &canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?,
+        &canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?,
+        tool_name.as_str(),
+    );
+    Ok(Some(ToolCallRecord::new(
+        event_key,
+        occurred_at,
+        repo,
+        HarnessName::new("opencode"),
+        tool_name,
+    )))
 }
 
 fn json_trace_span_record(
     span: &Value,
     resource_session_id: Option<SessionId>,
     resource_prompt_id: Option<PromptId>,
-) -> Result<TraceSpanRecord, OtlpError> {
+    resource_harness: Option<&str>,
+) -> Result<Option<TraceSpanRecord>, OtlpError> {
     let attributes = span.get("attributes").and_then(Value::as_array);
-    let session_id = resource_session_id
-        .or_else(|| json_session_id(attributes))
-        .ok_or(OtlpError::MissingSessionId)?;
-    let prompt_id = resource_prompt_id
-        .or_else(|| json_prompt_id(attributes))
-        .ok_or(OtlpError::MissingPromptId)?;
-    let kind = json_trace_span_kind(attributes).ok_or(OtlpError::InvalidTraceSpanKind)?;
+    let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
+    let Some(kind) = json_trace_span_kind(attributes)
+        .or_else(|| opencode_inferred_json_span_kind(resource_harness, span))
+    else {
+        if is_opencode_context(resource_harness) {
+            return Ok(None);
+        }
+        return Err(OtlpError::InvalidTraceSpanKind);
+    };
+    let Some(session_id) = resource_session_id.or_else(|| json_session_id(attributes)) else {
+        if is_opencode_context(resource_harness) {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingSessionId);
+    };
+    let Some(prompt_id) = resource_prompt_id.or_else(|| json_prompt_id(attributes)) else {
+        if is_opencode_context(resource_harness) {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingPromptId);
+    };
     let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
     let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
     let parent_span_id = span
@@ -1244,16 +1604,21 @@ fn json_trace_span_record(
         .transpose()?
         .flatten()
         .map(SpanId::new);
-    let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
     let started_at =
         json_timestamp(span, "startTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
     let ended_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
     let tool_name = if kind == TraceSpanKind::ToolCall {
-        Some(json_tool_name(attributes)?)
+        json_tool_name(attributes).map(Some).or_else(|err| {
+            if is_opencode_context(resource_harness) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        })?
     } else {
         None
     };
-    Ok(TraceSpanRecord {
+    Ok(Some(TraceSpanRecord {
         session_id,
         prompt_id,
         trace_id: TraceId::new(trace_id),
@@ -1265,11 +1630,179 @@ fn json_trace_span_record(
         ended_at,
         duration_ms: duration_ms(started_at, ended_at),
         tool_name,
-    })
+    }))
 }
 
 fn duration_ms(started_at: TimestampMillis, ended_at: TimestampMillis) -> u64 {
     u64::try_from(ended_at.value().saturating_sub(started_at.value())).unwrap_or(0)
+}
+
+fn harness_from_proto_attributes(attributes: &[KeyValue]) -> Option<String> {
+    first_meaningful_proto_attribute(
+        attributes,
+        &[
+            "kvasir.harness",
+            "harness",
+            "service.name",
+            "service.namespace",
+        ],
+    )
+}
+
+fn harness_from_json_attributes(attributes: Option<&Vec<Value>>) -> Option<String> {
+    first_meaningful_json_attribute(
+        attributes,
+        &[
+            "kvasir.harness",
+            "harness",
+            "service.name",
+            "service.namespace",
+        ],
+    )
+}
+
+fn is_opencode_span(
+    resource_harness: Option<&str>,
+    span_name: &str,
+    attribute: impl Fn(&str) -> Option<String>,
+) -> bool {
+    // OpenCode's OTLP shape is experimental and not a stable public contract.
+    // Keep detection attribute-based and conservative rather than depending on a
+    // single span name emitted by today's AI SDK/framework stack.
+    is_opencode_context(resource_harness)
+        || span_name.starts_with("opencode.")
+        || attribute("opencode.span.kind").is_some()
+}
+
+fn is_opencode_context(resource_harness: Option<&str>) -> bool {
+    resource_harness.is_some_and(|value| value.eq_ignore_ascii_case("opencode"))
+}
+
+fn opencode_inferred_proto_span_kind(
+    resource_harness: Option<&str>,
+    span: &OtlpSpan,
+) -> Option<TraceSpanKind> {
+    if !is_opencode_span(resource_harness, &span.name, |key| {
+        proto_attribute(&span.attributes, key)
+    }) {
+        return None;
+    }
+    inferred_opencode_span_kind(&span.name, |key| proto_attribute(&span.attributes, key))
+}
+
+fn opencode_inferred_json_span_kind(
+    resource_harness: Option<&str>,
+    span: &Value,
+) -> Option<TraceSpanKind> {
+    let attributes = span.get("attributes").and_then(Value::as_array);
+    let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
+    if !is_opencode_span(resource_harness, name, |key| {
+        json_attribute(attributes, key)
+    }) {
+        return None;
+    }
+    inferred_opencode_span_kind(name, |key| json_attribute(attributes, key))
+}
+
+fn inferred_opencode_span_kind(
+    span_name: &str,
+    attribute: impl Fn(&str) -> Option<String>,
+) -> Option<TraceSpanKind> {
+    first_meaningful_attribute_from(&attribute, &["ai.operationId", "gen_ai.operation.name"])
+        .and_then(|operation| {
+            let operation = operation.to_ascii_lowercase();
+            if operation.contains("tool") {
+                Some(TraceSpanKind::ToolCall)
+            } else if operation.contains("generate")
+                || operation.contains("chat")
+                || operation.contains("completion")
+            {
+                Some(TraceSpanKind::LlmRequest)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let name = span_name.to_ascii_lowercase();
+            if name.contains("tool") || name.starts_with("execute ") {
+                Some(TraceSpanKind::ToolCall)
+            } else if name.contains("generate")
+                || name.contains("chat")
+                || name.contains("completion")
+            {
+                Some(TraceSpanKind::LlmRequest)
+            } else if name.starts_with("opencode.") {
+                Some(TraceSpanKind::Interaction)
+            } else {
+                None
+            }
+        })
+}
+
+fn first_meaningful_attribute_from(
+    attribute: &impl Fn(&str) -> Option<String>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| meaningful_attribute(attribute(key)))
+}
+
+fn opencode_proto_model(attributes: &[KeyValue]) -> Option<ModelName> {
+    first_meaningful_proto_attribute(
+        attributes,
+        &[
+            "ai.model.id",
+            "model",
+            "gen_ai.request.model",
+            "gen_ai.response.model",
+        ],
+    )
+    .map(ModelName::new)
+}
+
+fn opencode_json_model(attributes: Option<&Vec<Value>>) -> Option<ModelName> {
+    first_meaningful_json_attribute(
+        attributes,
+        &[
+            "ai.model.id",
+            "model",
+            "gen_ai.request.model",
+            "gen_ai.response.model",
+        ],
+    )
+    .map(ModelName::new)
+}
+
+fn opencode_token_attribute_keys() -> [(TokenMeasure, &'static [&'static str]); 3] {
+    [
+        (
+            TokenMeasure::Input,
+            &[
+                "ai.usage.promptTokens",
+                "ai.usage.inputTokens",
+                "gen_ai.usage.input_tokens",
+                "gen_ai.usage.prompt_tokens",
+            ],
+        ),
+        (
+            TokenMeasure::Output,
+            &[
+                "ai.usage.completionTokens",
+                "ai.usage.outputTokens",
+                "gen_ai.usage.output_tokens",
+                "gen_ai.usage.completion_tokens",
+            ],
+        ),
+        (
+            TokenMeasure::Cache,
+            &[
+                "ai.usage.cachedInputTokens",
+                "ai.usage.cacheReadInputTokens",
+                "gen_ai.usage.cached_input_tokens",
+                "gen_ai.usage.cache_read_input_tokens",
+            ],
+        ),
+    ]
 }
 
 fn proto_session_id(attributes: &[KeyValue]) -> Option<SessionId> {
@@ -1299,7 +1832,12 @@ fn json_prompt_id(attributes: Option<&Vec<Value>>) -> Option<PromptId> {
 fn proto_trace_span_kind(attributes: &[KeyValue]) -> Option<TraceSpanKind> {
     first_proto_attribute(
         attributes,
-        &["claude.span.kind", "span.kind", "kvasir.span.kind"],
+        &[
+            "claude.span.kind",
+            "opencode.span.kind",
+            "span.kind",
+            "kvasir.span.kind",
+        ],
     )
     .as_deref()
     .and_then(TraceSpanKind::from_attribute)
@@ -1308,7 +1846,12 @@ fn proto_trace_span_kind(attributes: &[KeyValue]) -> Option<TraceSpanKind> {
 fn json_trace_span_kind(attributes: Option<&Vec<Value>>) -> Option<TraceSpanKind> {
     first_json_attribute(
         attributes,
-        &["claude.span.kind", "span.kind", "kvasir.span.kind"],
+        &[
+            "claude.span.kind",
+            "opencode.span.kind",
+            "span.kind",
+            "kvasir.span.kind",
+        ],
     )
     .as_deref()
     .and_then(TraceSpanKind::from_attribute)
@@ -1475,6 +2018,101 @@ fn log_token_usage_event_key(
     TokenUsageEventKey::new(canonical)
 }
 
+fn content_event_key(
+    repo: &RepoBucket,
+    harness: &str,
+    kind: ContentKind,
+    occurred_at_nanos: u64,
+    content: &str,
+) -> ContentEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-log-content");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("harness=");
+    canonical.push_str(harness);
+    canonical.push('\n');
+    canonical.push_str("kind=");
+    canonical.push_str(kind.storage_name());
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("content_len=");
+    canonical.push_str(&content.len().to_string());
+    canonical.push('\n');
+    canonical.push_str("content_fingerprint=");
+    canonical.push_str(&content_fingerprint(content));
+    canonical.push('\n');
+    ContentEventKey::new(canonical)
+}
+
+fn content_fingerprint(content: &str) -> String {
+    let mut forward_hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in content.as_bytes() {
+        forward_hash ^= u64::from(*byte);
+        forward_hash = forward_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut reverse_hash = 0xaf63_dc4c_8601_ec8c_u64;
+    for byte in content.as_bytes().iter().rev() {
+        reverse_hash ^= u64::from(*byte);
+        reverse_hash = reverse_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{forward_hash:016x}{reverse_hash:016x}")
+}
+
+fn trace_token_usage_event_key(
+    repo: &RepoBucket,
+    model: &str,
+    measure: TokenMeasure,
+    trace_id: &str,
+    span_id: &str,
+    token_count: TokenCount,
+) -> TokenUsageEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-trace-token-usage");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("model=");
+    canonical.push_str(model);
+    canonical.push('\n');
+    canonical.push_str("measure=");
+    canonical.push_str(measure.storage_name());
+    canonical.push('\n');
+    canonical.push_str("trace_id=");
+    canonical.push_str(trace_id);
+    canonical.push('\n');
+    canonical.push_str("span_id=");
+    canonical.push_str(span_id);
+    canonical.push('\n');
+    canonical.push_str("token_count=");
+    canonical.push_str(&token_count.value().to_string());
+    canonical.push('\n');
+    TokenUsageEventKey::new(canonical)
+}
+
+fn trace_tool_call_event_key(
+    repo: &RepoBucket,
+    trace_id: &str,
+    span_id: &str,
+    tool_name: &str,
+) -> ToolCallEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-trace-tool-call");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("trace_id=");
+    canonical.push_str(trace_id);
+    canonical.push('\n');
+    canonical.push_str("span_id=");
+    canonical.push_str(span_id);
+    canonical.push('\n');
+    canonical.push_str("tool_name=");
+    canonical.push_str(tool_name);
+    canonical.push('\n');
+    ToolCallEventKey::new(canonical)
+}
+
 fn codex_token_usage_event_key(
     repo: &RepoBucket,
     model: &str,
@@ -1589,6 +2227,19 @@ fn matches_tool_result(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn is_opencode_content_event(
+    event_name: Option<&str>,
+    attribute_event_name: impl FnOnce() -> Option<String>,
+) -> bool {
+    matches!(
+        event_name
+            .and_then(|value| meaningful_attribute(Some(value.to_owned())))
+            .or_else(|| meaningful_attribute(attribute_event_name()))
+            .as_deref(),
+        Some("opencode.content")
+    )
+}
+
 fn repo_from_proto_attributes(attributes: &[KeyValue]) -> RepoBucket {
     repo_from_optional_attributes(
         proto_attribute(attributes, "repo.name"),
@@ -1632,12 +2283,51 @@ fn proto_string_value(value: &AnyValue) -> Option<String> {
     }
 }
 
+fn proto_bool_attribute(attributes: &[KeyValue], key: &str) -> bool {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(|value| match value.value.as_ref()? {
+            any_value::Value::BoolValue(value) => Some(*value),
+            any_value::Value::StringValue(value) => value.parse::<bool>().ok(),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 fn json_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<String> {
     attributes?
         .iter()
         .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(key))
         .and_then(|attribute| attribute.get("value"))
         .and_then(|value| value.get("stringValue"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn json_bool_attribute(attributes: Option<&Vec<Value>>, key: &str) -> bool {
+    attributes
+        .and_then(|attributes| {
+            attributes
+                .iter()
+                .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(key))
+        })
+        .and_then(|attribute| attribute.get("value"))
+        .and_then(|value| {
+            value.get("boolValue").and_then(Value::as_bool).or_else(|| {
+                value
+                    .get("stringValue")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<bool>().ok())
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn json_string_any_value(value: &Value) -> Option<String> {
+    value
+        .get("stringValue")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -1737,10 +2427,11 @@ mod tests {
         number_data_point::Value,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use prost::Message;
 
     use super::*;
-    use crate::usage::TokenUsageKind;
+    use crate::usage::{ContentKind, TokenUsageKind};
 
     #[test]
     fn protobuf_rejects_missing_required_token_datapoint_fields() {
@@ -1841,6 +2532,58 @@ mod tests {
             records.trace_spans[0].trace_id.as_str(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn json_opencode_trace_tokens_survive_missing_trace_session_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = json_opencode_trace_payload_with_resource_ids(None, Some("prompt-7"));
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 0);
+        assert_eq!(records.token_usage.len(), 1);
+        assert_eq!(records.tool_calls.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_tokens_survive_missing_trace_prompt_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = json_opencode_trace_payload_with_resource_ids(Some("session-12"), None);
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 0);
+        assert_eq!(records.token_usage.len(), 1);
+        assert_eq!(records.tool_calls.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_tokens_survive_missing_trace_session_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_opencode_trace_payload_with_resource_ids(None, Some("prompt-7"));
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 0);
+        assert_eq!(records.token_usage.len(), 1);
+        assert_eq!(records.tool_calls.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_tokens_survive_missing_trace_prompt_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_opencode_trace_payload_with_resource_ids(Some("session-12"), None);
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 0);
+        assert_eq!(records.token_usage.len(), 1);
+        assert_eq!(records.tool_calls.len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -2666,6 +3409,59 @@ mod tests {
     }
 
     #[test]
+    fn json_opencode_content_logs_require_opt_in_and_normalize_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+                    ]
+                },
+                "scopeLogs": [{
+                    "logRecords": [
+                        {
+                            "timeUnixNano": "1781956800000000000",
+                            "body": { "stringValue": "stored assistant text" },
+                            "attributes": [
+                                { "key": "event.name", "value": { "stringValue": " opencode.content " } },
+                                { "key": "content.opt_in", "value": { "boolValue": true } },
+                                { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                            ]
+                        },
+                        {
+                            "timeUnixNano": "1781956801000000000",
+                            "eventName": "opencode.content",
+                            "body": { "stringValue": "not opted in" },
+                            "attributes": [
+                                { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                            ]
+                        }
+                    ]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
+        assert_eq!(records.content[0].content.as_str(), "stored assistant text");
+        assert_eq!(
+            records.content[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir"),
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn json_usage_logs_use_counter_start_when_present() -> Result<(), Box<dyn std::error::Error>> {
         let payload = br#"{
             "resourceLogs": [{
@@ -2880,6 +3676,85 @@ mod tests {
             HarnessName::new("claude_code")
         );
         assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_content_logs_require_opt_in_and_reject_raw_api_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_logs_payload_with_resource_attributes(
+            vec![
+                string_attribute("service.name", "opencode"),
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![
+                LogRecord {
+                    time_unix_nano: 1_781_956_800_000_000_000,
+                    observed_time_unix_nano: 0,
+                    severity_number: 0,
+                    severity_text: String::new(),
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(
+                            "stored assistant text".to_owned(),
+                        )),
+                    }),
+                    attributes: vec![
+                        string_attribute("event.name", " opencode.content "),
+                        bool_attribute("content.opt_in", true),
+                        string_attribute("content.type", "assistant_message"),
+                    ],
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                    trace_id: Vec::new(),
+                    span_id: Vec::new(),
+                    event_name: String::new(),
+                },
+                LogRecord {
+                    time_unix_nano: 1_781_956_801_000_000_000,
+                    observed_time_unix_nano: 0,
+                    severity_number: 0,
+                    severity_text: String::new(),
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("not opted in".to_owned())),
+                    }),
+                    attributes: vec![string_attribute("content.type", "assistant_message")],
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                    trace_id: Vec::new(),
+                    span_id: Vec::new(),
+                    event_name: "opencode.content".to_owned(),
+                },
+                LogRecord {
+                    time_unix_nano: 1_781_956_802_000_000_000,
+                    observed_time_unix_nano: 0,
+                    severity_number: 0,
+                    severity_text: String::new(),
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(
+                            "authorization: bearer secret".to_owned(),
+                        )),
+                    }),
+                    attributes: vec![
+                        bool_attribute("content.opt_in", true),
+                        string_attribute("content.type", "raw_api_request"),
+                    ],
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                    trace_id: Vec::new(),
+                    span_id: Vec::new(),
+                    event_name: "opencode.content".to_owned(),
+                },
+            ],
+        );
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
+        assert_eq!(records.content[0].content.as_str(), "stored assistant text");
 
         Ok(())
     }
@@ -3449,6 +4324,26 @@ mod tests {
         }
     }
 
+    fn bool_attribute(key: &str, value: bool) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::BoolValue(value)),
+            }),
+        }
+    }
+
+    fn int_attribute(key: &str, value: i64) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::IntValue(value)),
+            }),
+        }
+    }
+
     fn trace_json_payload(trace_id: &str, span_id: &str, kind: &str) -> String {
         format!(
             r#"{{
@@ -3474,5 +4369,141 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn json_opencode_trace_payload_with_resource_ids(
+        session_id: Option<&str>,
+        prompt_id: Option<&str>,
+    ) -> String {
+        let mut attributes = vec![
+            r#"{ "key": "service.name", "value": { "stringValue": "opencode" } }"#.to_owned(),
+            r#"{ "key": "repo.name", "value": { "stringValue": "kvasir" } }"#.to_owned(),
+            r#"{ "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }"#.to_owned(),
+        ];
+        if let Some(session_id) = session_id {
+            attributes.push(format!(
+                r#"{{ "key": "session.id", "value": {{ "stringValue": "{session_id}" }} }}"#
+            ));
+        }
+        if let Some(prompt_id) = prompt_id {
+            attributes.push(format!(
+                r#"{{ "key": "prompt.id", "value": {{ "stringValue": "{prompt_id}" }} }}"#
+            ));
+        }
+        format!(
+            r#"{{
+                "resourceSpans": [{{
+                    "resource": {{
+                        "attributes": [{}]
+                    }},
+                    "scopeSpans": [{{
+                        "spans": [
+                            {{
+                                "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "spanId": "1111111111111111",
+                                "name": "opencode.generate",
+                                "startTimeUnixNano": "1781956800000000000",
+                                "endTimeUnixNano": "1781956801800000000",
+                                "attributes": [
+                                    {{ "key": "ai.operationId", "value": {{ "stringValue": "chat" }} }},
+                                    {{ "key": "ai.model.id", "value": {{ "stringValue": "gpt-4.1" }} }},
+                                    {{ "key": "ai.usage.promptTokens", "value": {{ "intValue": "100" }} }}
+                                ]
+                            }},
+                            {{
+                                "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "spanId": "2222222222222222",
+                                "parentSpanId": "1111111111111111",
+                                "name": "opencode.tool",
+                                "startTimeUnixNano": "1781956801800000000",
+                                "endTimeUnixNano": "1781956801900000000",
+                                "attributes": [
+                                    {{ "key": "ai.operationId", "value": {{ "stringValue": "tool" }} }},
+                                    {{ "key": "tool.name", "value": {{ "stringValue": "Read" }} }}
+                                ]
+                            }}
+                        ]
+                    }}]
+                }}]
+            }}"#,
+            attributes.join(",")
+        )
+    }
+
+    fn protobuf_opencode_trace_payload_with_resource_ids(
+        session_id: Option<&str>,
+        prompt_id: Option<&str>,
+    ) -> Vec<u8> {
+        let mut resource_attributes = vec![
+            string_attribute("service.name", "opencode"),
+            string_attribute("repo.name", "kvasir"),
+            string_attribute("repo.path", "/repos/kvasir"),
+        ];
+        if let Some(session_id) = session_id {
+            resource_attributes.push(string_attribute("session.id", session_id));
+        }
+        if let Some(prompt_id) = prompt_id {
+            resource_attributes.push(string_attribute("prompt.id", prompt_id));
+        }
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x11; 8],
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "opencode.generate".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 1_781_956_800_000_000_000,
+                            end_time_unix_nano: 1_781_956_801_800_000_000,
+                            attributes: vec![
+                                string_attribute("ai.operationId", "chat"),
+                                string_attribute("ai.model.id", "gpt-4.1"),
+                                int_attribute("ai.usage.promptTokens", 100),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x22; 8],
+                            trace_state: String::new(),
+                            parent_span_id: vec![0x11; 8],
+                            flags: 0,
+                            name: "opencode.tool".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 1_781_956_801_800_000_000,
+                            end_time_unix_nano: 1_781_956_801_900_000_000,
+                            attributes: vec![
+                                string_attribute("ai.operationId", "tool"),
+                                string_attribute("tool.name", "Read"),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
     }
 }

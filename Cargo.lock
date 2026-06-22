@@ -1263,6 +1263,7 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
