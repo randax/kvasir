@@ -11,6 +11,9 @@ const CODEX_OTEL_BLOCK_START: &str = "# BEGIN KVASIR MANAGED CODEX OTEL";
 const CODEX_OTEL_BLOCK_END: &str = "# END KVASIR MANAGED CODEX OTEL";
 const COPILOT_OTEL_BLOCK_START: &str = "# BEGIN KVASIR MANAGED COPILOT OTEL";
 const COPILOT_OTEL_BLOCK_END: &str = "# END KVASIR MANAGED COPILOT OTEL";
+const OPENCODE_MANAGED_EXPERIMENTAL_KEYS: &[&str] = &["openTelemetry"];
+const OPENCODE_OTEL_ENDPOINT_ENV_KEY: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const OPENCODE_OTEL_HEADERS_ENV_KEY: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 
 const MANAGED_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -30,6 +33,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
 ];
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SetupError {
     #[error("Claude Code settings must be a JSON object")]
     SettingsNotObject,
@@ -41,6 +45,18 @@ pub enum SetupError {
     MalformedManagedBlock,
     #[error("Codex [otel] already contains unmanaged keys managed by kvasir")]
     ConflictingCodexOtelKeys,
+    #[error("OpenCode config must be a JSON object")]
+    OpenCodeConfigNotObject,
+    #[error("OpenCode config experimental field must be a JSON object")]
+    OpenCodeExperimentalNotObject,
+    #[error("OpenCode kvasir managed block must be a JSON object")]
+    OpenCodeManagedBlockNotObject,
+    #[error("OpenCode config JSON is invalid")]
+    InvalidOpenCodeConfigJson(#[source] serde_json::Error),
+    #[error("OpenCode OTLP endpoint env value contains unsupported characters")]
+    InvalidOpenCodeOtlpEndpointEnvValue,
+    #[error("OpenCode OTLP headers env value contains unsupported characters")]
+    InvalidOpenCodeOtlpHeadersEnvValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,15 +220,175 @@ impl CopilotShellProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeEnvironmentVariableKey {
+    OtlpEndpoint,
+    OtlpHeaders,
+}
+
+impl OpenCodeEnvironmentVariableKey {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OtlpEndpoint => OPENCODE_OTEL_ENDPOINT_ENV_KEY,
+            Self::OtlpHeaders => OPENCODE_OTEL_HEADERS_ENV_KEY,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenCodeEnvironmentVariable {
+    key: OpenCodeEnvironmentVariableKey,
+    value: String,
+}
+
+impl std::fmt::Debug for OpenCodeEnvironmentVariable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self.key {
+            OpenCodeEnvironmentVariableKey::OtlpEndpoint => self.value.as_str(),
+            OpenCodeEnvironmentVariableKey::OtlpHeaders => "<redacted>",
+        };
+        formatter
+            .debug_struct("OpenCodeEnvironmentVariable")
+            .field("key", &self.key)
+            .field("value", &value)
+            .finish()
+    }
+}
+
+impl OpenCodeEnvironmentVariable {
+    fn new(key: OpenCodeEnvironmentVariableKey, value: String) -> Self {
+        Self { key, value }
+    }
+
+    pub fn key(&self) -> OpenCodeEnvironmentVariableKey {
+        self.key
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeEnvironment {
+    endpoint: KvasirEndpoint,
+    bearer_token: BearerToken,
+}
+
+impl OpenCodeEnvironment {
+    fn new(config: &SetupConfig) -> Result<Self, SetupError> {
+        if contains_control_character(config.endpoint.as_str()) {
+            return Err(SetupError::InvalidOpenCodeOtlpEndpointEnvValue);
+        }
+
+        let headers = otlp_headers_env_value(&config.bearer_token);
+        if contains_control_character(&headers) || headers.contains(',') {
+            return Err(SetupError::InvalidOpenCodeOtlpHeadersEnvValue);
+        }
+
+        Ok(Self {
+            endpoint: config.endpoint.clone(),
+            bearer_token: config.bearer_token.clone(),
+        })
+    }
+
+    pub fn otlp_endpoint(&self) -> &KvasirEndpoint {
+        &self.endpoint
+    }
+
+    pub fn otlp_headers(&self) -> String {
+        otlp_headers_env_value(&self.bearer_token)
+    }
+
+    pub fn otlp_endpoint_variable(&self) -> OpenCodeEnvironmentVariable {
+        OpenCodeEnvironmentVariable::new(
+            OpenCodeEnvironmentVariableKey::OtlpEndpoint,
+            self.endpoint.as_str().to_owned(),
+        )
+    }
+
+    pub fn otlp_headers_variable(&self) -> OpenCodeEnvironmentVariable {
+        OpenCodeEnvironmentVariable::new(
+            OpenCodeEnvironmentVariableKey::OtlpHeaders,
+            self.otlp_headers(),
+        )
+    }
+
+    pub fn variables(&self) -> [OpenCodeEnvironmentVariable; 2] {
+        [self.otlp_endpoint_variable(), self.otlp_headers_variable()]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeSetup {
+    opencode_json: String,
+    env: OpenCodeEnvironment,
+}
+
+impl OpenCodeSetup {
+    pub fn generate(existing_config: &str, config: &SetupConfig) -> Result<Self, SetupError> {
+        let mut root = parse_opencode_root(existing_config)?;
+        let experimental = opencode_experimental_object(&mut root)?;
+
+        for key in OPENCODE_MANAGED_EXPERIMENTAL_KEYS {
+            experimental.remove(*key);
+        }
+        experimental.insert("openTelemetry".to_owned(), Value::Bool(true));
+        set_managed_block_section(
+            &mut root,
+            "experimental",
+            OPENCODE_MANAGED_EXPERIMENTAL_KEYS,
+        )?;
+
+        let opencode_json = serde_json::to_string_pretty(&Value::Object(root))
+            .map_err(SetupError::InvalidOpenCodeConfigJson)?;
+        let env = OpenCodeEnvironment::new(config)?;
+
+        Ok(Self { opencode_json, env })
+    }
+
+    pub fn env(&self) -> &OpenCodeEnvironment {
+        &self.env
+    }
+
+    pub fn otlp_endpoint_variable(&self) -> OpenCodeEnvironmentVariable {
+        self.env.otlp_endpoint_variable()
+    }
+
+    pub fn otlp_headers_variable(&self) -> OpenCodeEnvironmentVariable {
+        self.env.otlp_headers_variable()
+    }
+
+    pub fn opencode_json(&self) -> &str {
+        &self.opencode_json
+    }
+
+    pub fn managed_experimental_keys(&self) -> &'static [&'static str] {
+        OPENCODE_MANAGED_EXPERIMENTAL_KEYS
+    }
+}
+
 fn managed_env_keys_from_root(root: &Map<String, Value>) -> Vec<String> {
+    managed_keys_from_root_section(root, "env")
+}
+
+fn managed_keys_from_root_section(root: &Map<String, Value>, section: &str) -> Vec<String> {
     root.get(MANAGED_BLOCK_KEY)
-        .and_then(|value| value.get("env"))
+        .and_then(|value| value.get(section))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn otlp_headers_env_value(bearer_token: &BearerToken) -> String {
+    format!("Authorization={}", bearer_token.authorization_header())
+}
+
+fn contains_control_character(value: &str) -> bool {
+    value.chars().any(char::is_control)
 }
 
 fn copilot_otel_block(config: &SetupConfig, line_ending: &str) -> String {
@@ -554,6 +730,17 @@ fn parse_settings_root(existing_settings: &str) -> Result<Map<String, Value>, Se
     }
 }
 
+fn parse_opencode_root(existing_config: &str) -> Result<Map<String, Value>, SetupError> {
+    if existing_config.trim().is_empty() {
+        return Ok(Map::new());
+    }
+
+    match serde_json::from_str(existing_config).map_err(SetupError::InvalidOpenCodeConfigJson)? {
+        Value::Object(root) => Ok(root),
+        _ => Err(SetupError::OpenCodeConfigNotObject),
+    }
+}
+
 fn env_object(root: &mut Map<String, Value>) -> Result<&mut Map<String, Value>, SetupError> {
     if !root.contains_key("env") {
         root.insert("env".to_owned(), Value::Object(Map::new()));
@@ -565,12 +752,57 @@ fn env_object(root: &mut Map<String, Value>) -> Result<&mut Map<String, Value>, 
     }
 }
 
+fn opencode_experimental_object(
+    root: &mut Map<String, Value>,
+) -> Result<&mut Map<String, Value>, SetupError> {
+    if !root.contains_key("experimental") {
+        root.insert("experimental".to_owned(), Value::Object(Map::new()));
+    }
+
+    match root.get_mut("experimental") {
+        Some(Value::Object(experimental)) => Ok(experimental),
+        _ => Err(SetupError::OpenCodeExperimentalNotObject),
+    }
+}
+
 fn managed_block_value(env_keys: &[&str]) -> Value {
-    let env = env_keys
+    managed_block_value_for_section("env", env_keys)
+}
+
+fn managed_block_value_for_section(section: &str, keys: &[&str]) -> Value {
+    Value::Object(Map::from_iter([(
+        section.to_owned(),
+        managed_key_array_value(keys),
+    )]))
+}
+
+fn set_managed_block_section(
+    root: &mut Map<String, Value>,
+    section: &str,
+    keys: &[&str],
+) -> Result<(), SetupError> {
+    match root.get_mut(MANAGED_BLOCK_KEY) {
+        Some(Value::Object(managed_block)) => {
+            managed_block.insert(section.to_owned(), managed_key_array_value(keys));
+        }
+        Some(_) => return Err(SetupError::OpenCodeManagedBlockNotObject),
+        None => {
+            root.insert(
+                MANAGED_BLOCK_KEY.to_owned(),
+                managed_block_value_for_section(section, keys),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn managed_key_array_value(keys: &[&str]) -> Value {
+    let values = keys
         .iter()
         .map(|key| Value::String((*key).to_owned()))
         .collect();
-    Value::Object(Map::from_iter([("env".to_owned(), Value::Array(env))]))
+    Value::Array(values)
 }
 
 fn managed_env_values(config: &SetupConfig) -> Vec<(&'static str, String)> {
