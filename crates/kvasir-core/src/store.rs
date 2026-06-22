@@ -2632,6 +2632,51 @@ mod tests {
     }
 
     #[test]
+    fn late_native_cost_replaces_codex_delta_estimated_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let records = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload(
+            repo.clone(),
+            vec![("input", 1200.0), ("output", 450.0), ("cached_input", 80.0)],
+        ))?;
+
+        store.ingest_usage(&records)?;
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: vec![cost_record_for_repo(
+                repo.clone(),
+                "gpt-5.4",
+                1_781_956_800_000,
+                1_781_956_799_000,
+                "0.02",
+            )],
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: cost_usd("0.02"),
+                source: CostSource::Native,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn codex_metric_rollups_keep_repo_and_model_buckets_distinct()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -3599,6 +3644,7 @@ mod tests {
         TokenUsageRecord::new_delta(
             TokenUsageEventKey::new(event_key),
             TimestampMillis::new_for_test(1_781_956_800_000),
+            TimestampMillis::new_for_test(1_781_956_799_000),
             kvasir_repo("/not/persisted"),
             ModelName::new(model),
             measure,

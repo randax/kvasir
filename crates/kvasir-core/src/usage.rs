@@ -386,6 +386,7 @@ impl TokenUsageRecord {
     pub fn new_delta(
         event_key: TokenUsageEventKey,
         occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
         repo: RepoBucket,
         model: ModelName,
         measure: TokenMeasure,
@@ -393,7 +394,7 @@ impl TokenUsageRecord {
     ) -> Self {
         Self {
             occurred_at,
-            counter_start: occurred_at,
+            counter_start,
             repo,
             model,
             measure,

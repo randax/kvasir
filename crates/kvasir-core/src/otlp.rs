@@ -500,6 +500,8 @@ fn record_from_codex_proto_histogram(
     if data_point.start_time_unix_nano == 0 {
         return Err(OtlpError::MissingCounterStart);
     }
+    let counter_start = TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
+        .ok_or(OtlpError::MissingCounterStart)?;
     let raw_occurred_at_nanos = if data_point.time_unix_nano == 0 {
         data_point.start_time_unix_nano
     } else {
@@ -532,6 +534,7 @@ fn record_from_codex_proto_histogram(
     Ok(Some(TokenUsageRecord::new_delta(
         event_key,
         occurred_at,
+        counter_start,
         repo,
         ModelName::new(model),
         measure,
@@ -634,6 +637,8 @@ fn json_token_record(
         let raw_counter_start_nanos = json_number(data_point, "startTimeUnixNano")
             .filter(|value| *value != 0)
             .ok_or(OtlpError::MissingCounterStart)?;
+        let counter_start = TimestampMillis::try_from_unix_nanos(raw_counter_start_nanos)
+            .ok_or(OtlpError::MissingCounterStart)?;
         let point_ordinal = codex_token_usage_point_ordinal(
             codex_point_ordinals,
             &repo,
@@ -655,6 +660,7 @@ fn json_token_record(
         Ok(Some(TokenUsageRecord::new_delta(
             event_key,
             occurred_at,
+            counter_start,
             repo,
             ModelName::new(model),
             measure,
@@ -1547,6 +1553,7 @@ mod tests {
                         TokenCount::new(1200),
                     ),
                     TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_799_000),
                     repo.clone(),
                     ModelName::new("gpt-5.4"),
                     TokenMeasure::Input,
@@ -1563,6 +1570,7 @@ mod tests {
                         TokenCount::new(450),
                     ),
                     TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_799_000),
                     repo.clone(),
                     ModelName::new("gpt-5.4"),
                     TokenMeasure::Output,
@@ -1579,6 +1587,7 @@ mod tests {
                         TokenCount::new(80),
                     ),
                     TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_799_000),
                     repo,
                     ModelName::new("gpt-5.4"),
                     TokenMeasure::Cache,
@@ -1622,7 +1631,7 @@ mod tests {
                 ))
                 && record.model == ModelName::new("gpt-5.4")
                 && record.occurred_at == TimestampMillis::new_for_test(1_781_956_800_000)
-                && record.counter_start == TimestampMillis::new_for_test(1_781_956_800_000)
+                && record.counter_start == TimestampMillis::new_for_test(1_781_956_799_000)
         }));
     }
 
