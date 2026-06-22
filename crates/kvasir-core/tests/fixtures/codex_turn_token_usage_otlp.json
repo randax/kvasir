@@ -1,0 +1,86 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+          { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "codex.turn.token_usage",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1781956799000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "count": "1",
+                    "sum": 1200,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "token_type", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956799000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "count": "1",
+                    "sum": 450,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "token_type", "value": { "stringValue": "output" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956799000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "count": "1",
+                    "sum": 80,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "token_type", "value": { "stringValue": "cached_input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956799000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "count": "1",
+                    "sum": 1730,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "token_type", "value": { "stringValue": "total" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956799000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "count": "1",
+                    "sum": 120,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "token_type", "value": { "stringValue": "reasoning_output" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956799000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "count": "1",
+                    "sum": 25,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "token_type", "value": { "stringValue": "tool" } }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

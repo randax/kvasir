@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -6,7 +8,7 @@ use opentelemetry_proto::tonic::logs::v1::{
     LogRecord, ResourceLogs as OtlpResourceLogs, ScopeLogs,
 };
 use opentelemetry_proto::tonic::metrics::v1::{
-    Metric, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics, metric, number_data_point,
 };
 use opentelemetry_proto::tonic::trace::v1::{
     ResourceSpans as OtlpResourceSpans, ScopeSpans, Span as OtlpSpan,
@@ -20,8 +22,8 @@ use crate::rpc::{
 };
 use crate::usage::{
     CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageRecord, ToolCallEventKey, ToolCallRecord, TraceSpanRecord,
-    UsageRecords,
+    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, ToolCallEventKey, ToolCallRecord,
+    TraceSpanRecord, UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -100,8 +102,12 @@ pub fn parse_otlp_protobuf_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, O
         return Err(OtlpError::MissingResourceMetrics);
     }
     let mut records = UsageRecords::default();
+    let mut codex_point_ordinals = BTreeMap::new();
     for resource_metrics in request.resource_metrics {
-        records.extend(records_from_resource_metrics(resource_metrics)?);
+        records.extend(records_from_resource_metrics(
+            resource_metrics,
+            &mut codex_point_ordinals,
+        )?);
     }
     if records.is_empty() {
         return Err(OtlpError::NoTokenUsageMetrics);
@@ -116,6 +122,7 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
         .get("resourceMetrics")
         .and_then(Value::as_array)
         .ok_or(OtlpError::MissingResourceMetrics)?;
+    let mut codex_point_ordinals = BTreeMap::new();
     for resource_metrics in resource_metrics {
         let resource_attributes = resource_metrics
             .get("resource")
@@ -133,12 +140,17 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
                 .ok_or(OtlpError::MissingMetrics)?;
             for metric in metrics {
                 match metric.get("name").and_then(Value::as_str) {
-                    Some("token.usage") => {
+                    Some("token.usage") | Some("codex.turn.token_usage") => {
                         let data_points = json_data_points(metric)?;
                         for data_point in data_points {
-                            records
-                                .token_usage
-                                .push(json_token_record(data_point, repo.clone())?);
+                            if let Some(record) = json_token_record(
+                                metric,
+                                data_point,
+                                &mut codex_point_ordinals,
+                                repo.clone(),
+                            )? {
+                                records.token_usage.push(record);
+                            }
                         }
                     }
                     Some("cost.usage") => {
@@ -259,6 +271,7 @@ pub fn parse_otlp_json_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
 
 fn records_from_resource_metrics(
     resource_metrics: ResourceMetrics,
+    codex_point_ordinals: &mut BTreeMap<String, usize>,
 ) -> Result<UsageRecords, OtlpError> {
     let repo = resource_metrics
         .resource
@@ -271,7 +284,11 @@ fn records_from_resource_metrics(
     }
     let mut records = UsageRecords::default();
     for scope_metrics in resource_metrics.scope_metrics {
-        records.extend(records_from_scope_metrics(scope_metrics, repo.clone())?);
+        records.extend(records_from_scope_metrics(
+            scope_metrics,
+            repo.clone(),
+            codex_point_ordinals,
+        )?);
     }
     Ok(records)
 }
@@ -279,29 +296,49 @@ fn records_from_resource_metrics(
 fn records_from_scope_metrics(
     scope_metrics: ScopeMetrics,
     repo: RepoBucket,
+    codex_point_ordinals: &mut BTreeMap<String, usize>,
 ) -> Result<UsageRecords, OtlpError> {
     if scope_metrics.metrics.is_empty() {
         return Err(OtlpError::MissingMetrics);
     }
     let mut records = UsageRecords::default();
     for metric in scope_metrics.metrics {
-        records.extend(records_from_metric(metric, repo.clone())?);
+        records.extend(records_from_metric(
+            metric,
+            repo.clone(),
+            codex_point_ordinals,
+        )?);
     }
     Ok(records)
 }
 
-fn records_from_metric(metric: Metric, repo: RepoBucket) -> Result<UsageRecords, OtlpError> {
+fn records_from_metric(
+    metric: Metric,
+    repo: RepoBucket,
+    codex_point_ordinals: &mut BTreeMap<String, usize>,
+) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
     match metric.name.as_str() {
         "token.usage" => {
-            for data_point in proto_data_points(metric)? {
+            for data_point in proto_sum_data_points(metric)? {
                 records
                     .token_usage
-                    .push(record_from_proto_data_point(data_point, repo.clone())?);
+                    .push(record_from_proto_sum_data_point(data_point, repo.clone())?);
+            }
+        }
+        "codex.turn.token_usage" => {
+            for data_point in proto_codex_delta_histogram_data_points(metric)? {
+                if let Some(record) = record_from_codex_proto_histogram(
+                    data_point,
+                    codex_point_ordinals,
+                    repo.clone(),
+                )? {
+                    records.token_usage.push(record);
+                }
             }
         }
         "cost.usage" => {
-            for data_point in proto_data_points(metric)? {
+            for data_point in proto_sum_data_points(metric)? {
                 records
                     .cost_usage
                     .push(cost_record_from_proto_data_point(data_point, repo.clone())?);
@@ -376,7 +413,7 @@ fn records_from_scope_spans_for_traces(
     Ok(records)
 }
 
-fn proto_data_points(
+fn proto_sum_data_points(
     metric: Metric,
 ) -> Result<Vec<opentelemetry_proto::tonic::metrics::v1::NumberDataPoint>, OtlpError> {
     let sum = match metric.data {
@@ -389,7 +426,23 @@ fn proto_data_points(
     Ok(sum.data_points)
 }
 
-fn record_from_proto_data_point(
+fn proto_codex_delta_histogram_data_points(
+    metric: Metric,
+) -> Result<Vec<HistogramDataPoint>, OtlpError> {
+    let histogram = match metric.data {
+        Some(metric::Data::Histogram(histogram)) => histogram,
+        Some(_) | None => return Err(OtlpError::InvalidMetricKind),
+    };
+    if histogram.aggregation_temporality != 1 {
+        return Err(OtlpError::InvalidMetricKind);
+    }
+    if histogram.data_points.is_empty() {
+        return Err(OtlpError::MissingDataPoints);
+    }
+    Ok(histogram.data_points)
+}
+
+fn record_from_proto_sum_data_point(
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     repo: RepoBucket,
 ) -> Result<TokenUsageRecord, OtlpError> {
@@ -427,6 +480,65 @@ fn record_from_proto_data_point(
     ))
 }
 
+fn record_from_codex_proto_histogram(
+    data_point: HistogramDataPoint,
+    point_ordinals: &mut BTreeMap<String, usize>,
+    repo: RepoBucket,
+) -> Result<Option<TokenUsageRecord>, OtlpError> {
+    let token_type = proto_attribute(&data_point.attributes, "token_type")
+        .or_else(|| proto_attribute(&data_point.attributes, "token.type"))
+        .or_else(|| proto_attribute(&data_point.attributes, "type"))
+        .ok_or(OtlpError::InvalidMeasure)?;
+    let Some(measure) = codex_token_measure(&token_type) else {
+        if is_ignored_codex_token_type(&token_type) {
+            return Ok(None);
+        }
+        return Err(OtlpError::InvalidMeasure);
+    };
+    let model = proto_attribute(&data_point.attributes, "model").ok_or(OtlpError::MissingModel)?;
+    let token_count = token_count_from_f64(data_point.sum.ok_or(OtlpError::MissingTokenCount)?)?;
+    if data_point.start_time_unix_nano == 0 {
+        return Err(OtlpError::MissingCounterStart);
+    }
+    let raw_occurred_at_nanos = if data_point.time_unix_nano == 0 {
+        data_point.start_time_unix_nano
+    } else {
+        data_point.time_unix_nano
+    };
+    let occurred_at = if data_point.time_unix_nano == 0 {
+        TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
+    } else {
+        TimestampMillis::try_from_unix_nanos(data_point.time_unix_nano)
+    }
+    .ok_or(OtlpError::MissingTimestamp)?;
+    let point_ordinal = codex_token_usage_point_ordinal(
+        point_ordinals,
+        &repo,
+        &model,
+        &token_type,
+        data_point.start_time_unix_nano,
+        raw_occurred_at_nanos,
+        token_count,
+    );
+    let event_key = codex_token_usage_event_key(
+        &repo,
+        &model,
+        &token_type,
+        data_point.start_time_unix_nano,
+        raw_occurred_at_nanos,
+        point_ordinal,
+        token_count,
+    );
+    Ok(Some(TokenUsageRecord::new_delta(
+        event_key,
+        occurred_at,
+        repo,
+        ModelName::new(model),
+        measure,
+        token_count,
+    )))
+}
+
 fn cost_record_from_proto_data_point(
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     repo: RepoBucket,
@@ -460,34 +572,130 @@ fn cost_record_from_proto_data_point(
 }
 
 fn json_data_points(metric: &Value) -> Result<&Vec<Value>, OtlpError> {
-    metric
-        .get("sum")
-        .and_then(|sum| sum.get("dataPoints"))
+    metric_data(metric)?
         .and_then(Value::as_array)
         .filter(|data_points| !data_points.is_empty())
         .ok_or(OtlpError::MissingDataPoints)
 }
 
-fn json_token_record(data_point: &Value, repo: RepoBucket) -> Result<TokenUsageRecord, OtlpError> {
+fn metric_data(metric: &Value) -> Result<Option<&Value>, OtlpError> {
+    match metric.get("name").and_then(Value::as_str) {
+        Some("token.usage") | Some("cost.usage") => metric
+            .get("sum")
+            .map(|sum| sum.get("dataPoints"))
+            .ok_or(OtlpError::InvalidMetricKind),
+        Some("codex.turn.token_usage") => {
+            let histogram = metric
+                .get("histogram")
+                .ok_or(OtlpError::InvalidMetricKind)?;
+            if !json_codex_histogram_is_delta(histogram) {
+                return Err(OtlpError::InvalidMetricKind);
+            }
+            Ok(histogram.get("dataPoints"))
+        }
+        _ => Err(OtlpError::InvalidMetricKind),
+    }
+}
+
+fn json_codex_histogram_is_delta(histogram: &Value) -> bool {
+    match histogram.get("aggregationTemporality") {
+        Some(Value::Number(value)) => value.as_u64() == Some(1),
+        Some(Value::String(value)) => value == "1" || value == "AGGREGATION_TEMPORALITY_DELTA",
+        _ => false,
+    }
+}
+
+fn json_token_record(
+    metric: &Value,
+    data_point: &Value,
+    codex_point_ordinals: &mut BTreeMap<String, usize>,
+    repo: RepoBucket,
+) -> Result<Option<TokenUsageRecord>, OtlpError> {
     let attributes = data_point.get("attributes").and_then(Value::as_array);
     let model = json_attribute(attributes, "model").ok_or(OtlpError::MissingModel)?;
-    let measure = json_attribute(attributes, "token.type")
+    let token_type = json_attribute(attributes, "token_type")
+        .or_else(|| json_attribute(attributes, "token.type"))
         .or_else(|| json_attribute(attributes, "type"))
-        .and_then(|value| TokenMeasure::from_attribute(&value))
         .ok_or(OtlpError::InvalidMeasure)?;
+    let Some(measure) = token_measure_for_metric(metric, &token_type) else {
+        if is_codex_token_metric(metric) && is_ignored_codex_token_type(&token_type) {
+            return Ok(None);
+        }
+        return Err(OtlpError::InvalidMeasure);
+    };
     let token_count = json_token_count(data_point)?;
+    let raw_occurred_at_nanos = json_number(data_point, "timeUnixNano")
+        .or_else(|| json_number(data_point, "startTimeUnixNano"))
+        .ok_or(OtlpError::MissingTimestamp)?;
     let occurred_at = json_timestamp(data_point, "timeUnixNano")
         .or_else(|| json_timestamp(data_point, "startTimeUnixNano"))
         .ok_or(OtlpError::MissingTimestamp)?;
-    let counter_start = json_timestamp(data_point, "startTimeUnixNano").unwrap_or(occurred_at);
-    Ok(TokenUsageRecord::new(
-        occurred_at,
-        counter_start,
-        repo,
-        ModelName::new(model),
-        measure,
-        token_count,
-    ))
+    if is_codex_token_metric(metric) {
+        let raw_counter_start_nanos = json_number(data_point, "startTimeUnixNano")
+            .filter(|value| *value != 0)
+            .ok_or(OtlpError::MissingCounterStart)?;
+        let point_ordinal = codex_token_usage_point_ordinal(
+            codex_point_ordinals,
+            &repo,
+            &model,
+            &token_type,
+            raw_counter_start_nanos,
+            raw_occurred_at_nanos,
+            token_count,
+        );
+        let event_key = codex_token_usage_event_key(
+            &repo,
+            &model,
+            &token_type,
+            raw_counter_start_nanos,
+            raw_occurred_at_nanos,
+            point_ordinal,
+            token_count,
+        );
+        Ok(Some(TokenUsageRecord::new_delta(
+            event_key,
+            occurred_at,
+            repo,
+            ModelName::new(model),
+            measure,
+            token_count,
+        )))
+    } else {
+        let counter_start = json_timestamp(data_point, "startTimeUnixNano").unwrap_or(occurred_at);
+        Ok(Some(TokenUsageRecord::new(
+            occurred_at,
+            counter_start,
+            repo,
+            ModelName::new(model),
+            measure,
+            token_count,
+        )))
+    }
+}
+
+fn token_measure_for_metric(metric: &Value, value: &str) -> Option<TokenMeasure> {
+    if is_codex_token_metric(metric) {
+        codex_token_measure(value)
+    } else {
+        TokenMeasure::from_attribute(value)
+    }
+}
+
+fn is_codex_token_metric(metric: &Value) -> bool {
+    metric.get("name").and_then(Value::as_str) == Some("codex.turn.token_usage")
+}
+
+fn codex_token_measure(value: &str) -> Option<TokenMeasure> {
+    match value {
+        "input" => Some(TokenMeasure::Input),
+        "output" => Some(TokenMeasure::Output),
+        "cached_input" => Some(TokenMeasure::Cache),
+        _ => None,
+    }
+}
+
+fn is_ignored_codex_token_type(value: &str) -> bool {
+    matches!(value, "total" | "reasoning_output" | "tool")
 }
 
 fn json_cost_record(data_point: &Value, repo: RepoBucket) -> Result<CostUsageRecord, OtlpError> {
@@ -836,6 +1044,82 @@ fn tool_call_event_key(
     ToolCallEventKey::new(canonical)
 }
 
+fn codex_token_usage_event_key(
+    repo: &RepoBucket,
+    model: &str,
+    token_type: &str,
+    counter_start_nanos: u64,
+    occurred_at_nanos: u64,
+    point_ordinal: usize,
+    token_count: TokenCount,
+) -> TokenUsageEventKey {
+    let mut canonical = codex_token_usage_point_fingerprint(
+        repo,
+        model,
+        token_type,
+        counter_start_nanos,
+        occurred_at_nanos,
+        token_count,
+    );
+    canonical.push_str("point_ordinal=");
+    canonical.push_str(&point_ordinal.to_string());
+    canonical.push('\n');
+    TokenUsageEventKey::new(canonical)
+}
+
+fn codex_token_usage_point_ordinal(
+    point_ordinals: &mut BTreeMap<String, usize>,
+    repo: &RepoBucket,
+    model: &str,
+    token_type: &str,
+    counter_start_nanos: u64,
+    occurred_at_nanos: u64,
+    token_count: TokenCount,
+) -> usize {
+    let fingerprint = codex_token_usage_point_fingerprint(
+        repo,
+        model,
+        token_type,
+        counter_start_nanos,
+        occurred_at_nanos,
+        token_count,
+    );
+    let ordinal = point_ordinals.entry(fingerprint).or_default();
+    let current = *ordinal;
+    *ordinal += 1;
+    current
+}
+
+fn codex_token_usage_point_fingerprint(
+    repo: &RepoBucket,
+    model: &str,
+    token_type: &str,
+    counter_start_nanos: u64,
+    occurred_at_nanos: u64,
+    token_count: TokenCount,
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-metric-codex-turn-token-usage");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("model=");
+    canonical.push_str(model);
+    canonical.push('\n');
+    canonical.push_str("token_type=");
+    canonical.push_str(token_type);
+    canonical.push('\n');
+    canonical.push_str("counter_start_nanos=");
+    canonical.push_str(&counter_start_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("token_count=");
+    canonical.push_str(&token_count.value().to_string());
+    canonical.push('\n');
+    canonical
+}
+
 fn append_repo_key(output: &mut String, repo: &RepoBucket) {
     match repo {
         RepoBucket::NoRepo => output.push_str("repo_bucket=no_repo\nrepo_name=\nrepo_path=\n"),
@@ -955,15 +1239,15 @@ fn json_counter_start(value: &Value, key: &str) -> Option<TimestampMillis> {
 }
 
 fn json_token_count(value: &Value) -> Result<TokenCount, OtlpError> {
-    let raw_value = match (value.get("asInt"), value.get("asDouble")) {
-        (Some(value), _) => json_u64_value(value).ok_or(OtlpError::NumberOutOfRange)?,
-        (None, Some(value)) => {
+    let raw_value = match (value.get("asInt"), value.get("asDouble"), value.get("sum")) {
+        (Some(value), _, _) => json_u64_value(value).ok_or(OtlpError::NumberOutOfRange)?,
+        (None, Some(value), _) | (None, None, Some(value)) => {
             let Some(value) = value.as_f64() else {
                 return Err(OtlpError::NumberOutOfRange);
             };
             return token_count_from_f64(value);
         }
-        (None, None) => return Err(OtlpError::MissingTokenCount),
+        (None, None, None) => return Err(OtlpError::MissingTokenCount),
     };
     TokenCount::try_new(raw_value).ok_or(OtlpError::NumberOutOfRange)
 }
@@ -1018,7 +1302,7 @@ mod tests {
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::metrics::v1::{
-        Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data,
+        Histogram, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data,
         number_data_point::Value,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
@@ -1239,6 +1523,333 @@ mod tests {
     }
 
     #[test]
+    fn json_codex_turn_token_usage_metrics_normalize_to_token_records() {
+        let records = parse_token_usage_json(include_bytes!(
+            "../tests/fixtures/codex_turn_token_usage_otlp.json"
+        ))
+        .expect("valid Codex token usage");
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+
+        assert_eq!(
+            records,
+            vec![
+                TokenUsageRecord::new_delta(
+                    codex_token_usage_event_key(
+                        &repo,
+                        "gpt-5.4",
+                        "input",
+                        1_781_956_799_000_000_000,
+                        1_781_956_800_000_000_000,
+                        0,
+                        TokenCount::new(1200),
+                    ),
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    repo.clone(),
+                    ModelName::new("gpt-5.4"),
+                    TokenMeasure::Input,
+                    TokenCount::new(1200),
+                ),
+                TokenUsageRecord::new_delta(
+                    codex_token_usage_event_key(
+                        &repo,
+                        "gpt-5.4",
+                        "output",
+                        1_781_956_799_000_000_000,
+                        1_781_956_800_000_000_000,
+                        0,
+                        TokenCount::new(450),
+                    ),
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    repo.clone(),
+                    ModelName::new("gpt-5.4"),
+                    TokenMeasure::Output,
+                    TokenCount::new(450),
+                ),
+                TokenUsageRecord::new_delta(
+                    codex_token_usage_event_key(
+                        &repo,
+                        "gpt-5.4",
+                        "cached_input",
+                        1_781_956_799_000_000_000,
+                        1_781_956_800_000_000_000,
+                        0,
+                        TokenCount::new(80),
+                    ),
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    repo,
+                    ModelName::new("gpt-5.4"),
+                    TokenMeasure::Cache,
+                    TokenCount::new(80),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn protobuf_codex_turn_token_usage_metrics_normalize_to_token_records() {
+        let payload = protobuf_codex_histogram_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![
+                codex_histogram_point("gpt-5.4", "input", 1200.0),
+                codex_histogram_point("gpt-5.4", "output", 450.0),
+                codex_histogram_point("gpt-5.4", "cached_input", 80.0),
+                codex_histogram_point("gpt-5.4", "total", 1730.0),
+                codex_histogram_point("gpt-5.4", "reasoning_output", 120.0),
+                codex_histogram_point("gpt-5.4", "tool", 25.0),
+            ],
+        );
+
+        let records = parse_token_usage_protobuf(&payload).expect("valid Codex token usage");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].measure, TokenMeasure::Input);
+        assert_eq!(records[0].token_count, TokenCount::new(1200));
+        assert_eq!(records[1].measure, TokenMeasure::Output);
+        assert_eq!(records[1].token_count, TokenCount::new(450));
+        assert_eq!(records[2].measure, TokenMeasure::Cache);
+        assert_eq!(records[2].token_count, TokenCount::new(80));
+        assert!(records.iter().all(|record| {
+            record.repo
+                == RepoBucket::repo(RepoIdentity::new(
+                    RepoName::new("kvasir"),
+                    RepoPath::new("/repos/kvasir"),
+                ))
+                && record.model == ModelName::new("gpt-5.4")
+                && record.occurred_at == TimestampMillis::new_for_test(1_781_956_800_000)
+                && record.counter_start == TimestampMillis::new_for_test(1_781_956_800_000)
+        }));
+    }
+
+    #[test]
+    fn json_codex_token_usage_rejects_unknown_token_types() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.token_usage",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956799000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 12,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                                    { "key": "token_type", "value": { "stringValue": "new_billable_bucket" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::InvalidMeasure)
+        ));
+    }
+
+    #[test]
+    fn protobuf_codex_token_usage_rejects_unknown_token_types() {
+        let payload = protobuf_codex_histogram_payload_with_resource_attributes(
+            Vec::new(),
+            vec![codex_histogram_point(
+                "gpt-5.4",
+                "new_billable_bucket",
+                12.0,
+            )],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::InvalidMeasure)
+        ));
+    }
+
+    #[test]
+    fn json_codex_token_usage_rejects_fractional_histogram_sum() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.token_usage",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956799000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 12.5,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                                    { "key": "token_type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::NonIntegralTokenCount)
+        ));
+    }
+
+    #[test]
+    fn json_codex_token_usage_rejects_non_delta_histograms() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.token_usage",
+                        "histogram": {
+                            "aggregationTemporality": 2,
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 12,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                                    { "key": "token_type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::InvalidMetricKind)
+        ));
+    }
+
+    #[test]
+    fn json_codex_token_usage_rejects_missing_counter_start() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.token_usage",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 12,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                                    { "key": "token_type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn json_codex_token_usage_rejects_zero_counter_start() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.token_usage",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "0",
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 12,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                                    { "key": "token_type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn protobuf_codex_token_usage_rejects_missing_histogram_sum() {
+        let mut data_point = codex_histogram_point("gpt-5.4", "input", 12.0);
+        data_point.sum = None;
+        let payload =
+            protobuf_codex_histogram_payload_with_resource_attributes(Vec::new(), vec![data_point]);
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingTokenCount)
+        ));
+    }
+
+    #[test]
+    fn protobuf_codex_token_usage_rejects_missing_counter_start() {
+        let mut data_point = codex_histogram_point("gpt-5.4", "input", 12.0);
+        data_point.start_time_unix_nano = 0;
+        let payload =
+            protobuf_codex_histogram_payload_with_resource_attributes(Vec::new(), vec![data_point]);
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn protobuf_codex_token_usage_rejects_non_delta_histograms() {
+        let payload = protobuf_codex_histogram_payload_with_temporality(
+            Vec::new(),
+            vec![codex_histogram_point("gpt-5.4", "input", 12.0)],
+            2,
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::InvalidMetricKind)
+        ));
+    }
+
+    #[test]
+    fn protobuf_codex_token_usage_rejects_fractional_histogram_sum() {
+        let payload = protobuf_codex_histogram_payload_with_resource_attributes(
+            Vec::new(),
+            vec![codex_histogram_point("gpt-5.4", "input", 12.5)],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::NonIntegralTokenCount)
+        ));
+    }
+
+    #[test]
     fn json_rejects_payloads_without_token_usage_metrics() {
         let payload = br#"{
             "resourceMetrics": [{
@@ -1288,6 +1899,35 @@ mod tests {
         assert!(matches!(
             parse_token_usage_json(payload),
             Err(OtlpError::MissingDataPoints)
+        ));
+    }
+
+    #[test]
+    fn json_rejects_legacy_token_usage_with_histogram_metric_kind() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "token.usage",
+                        "histogram": {
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 100,
+                                "attributes": [
+                                    { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } },
+                                    { "key": "token.type", "value": { "stringValue": "input" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::InvalidMetricKind)
         ));
     }
 
@@ -2007,6 +2647,64 @@ mod tests {
             }],
         }
         .encode_to_vec()
+    }
+
+    fn protobuf_codex_histogram_payload_with_resource_attributes(
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<HistogramDataPoint>,
+    ) -> Vec<u8> {
+        protobuf_codex_histogram_payload_with_temporality(resource_attributes, data_points, 1)
+    }
+
+    fn protobuf_codex_histogram_payload_with_temporality(
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<HistogramDataPoint>,
+        aggregation_temporality: i32,
+    ) -> Vec<u8> {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "codex.turn.token_usage".to_owned(),
+                        description: String::new(),
+                        unit: "{token}".to_owned(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Histogram(Histogram {
+                            data_points,
+                            aggregation_temporality,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn codex_histogram_point(model: &str, token_type: &str, sum: f64) -> HistogramDataPoint {
+        HistogramDataPoint {
+            attributes: vec![
+                string_attribute("model", model),
+                string_attribute("token_type", token_type),
+            ],
+            start_time_unix_nano: 1_781_956_799_000_000_000,
+            time_unix_nano: 1_781_956_800_000_000_000,
+            count: 1,
+            sum: Some(sum),
+            bucket_counts: Vec::new(),
+            explicit_bounds: Vec::new(),
+            exemplars: Vec::new(),
+            flags: 0,
+            min: None,
+            max: None,
+        }
     }
 
     fn protobuf_logs_payload_with_resource_attributes(
