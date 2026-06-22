@@ -39,6 +39,8 @@ pub enum SetupError {
     InvalidSettingsJson(#[from] serde_json::Error),
     #[error("kvasir managed block is malformed")]
     MalformedManagedBlock,
+    #[error("Codex [otel] already contains unmanaged keys managed by kvasir")]
+    ConflictingCodexOtelKeys,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +167,7 @@ impl CodexConfigToml {
             CODEX_OTEL_BLOCK_START,
             CODEX_OTEL_BLOCK_END,
         )?;
-        let toml = insert_codex_otel_block(&unmanaged_config, config);
+        let toml = insert_codex_otel_block(&unmanaged_config, config)?;
         Ok(Self { toml })
     }
 
@@ -274,7 +276,7 @@ fn otlp_signal_endpoint(endpoint: &str, signal: &str) -> String {
     format!("{}/v1/{signal}", endpoint.trim_end_matches('/'))
 }
 
-fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> String {
+fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> Result<String, SetupError> {
     let mut output = String::with_capacity(existing.len() + 512);
     let mut inserted = false;
     let mut inside_otel_table = false;
@@ -289,11 +291,12 @@ fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> String {
         }
 
         if inside_otel_table && inserted && is_codex_managed_otel_assignment(line) {
-            continue;
+            return Err(SetupError::ConflictingCodexOtelKeys);
         }
 
         output.push_str(line);
         if !inserted && table_header == Some("otel") {
+            ensure_line_break(&mut output);
             output.push_str(CODEX_OTEL_BLOCK_START);
             output.push('\n');
             output.push_str(&codex_otel_assignments(config));
@@ -304,7 +307,7 @@ fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> String {
     }
 
     if inserted {
-        return output.trim_end().to_owned() + "\n";
+        return Ok(output.trim_end().to_owned() + "\n");
     }
 
     let mut toml = existing.trim_end().to_owned();
@@ -312,7 +315,7 @@ fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> String {
         toml.push_str("\n\n");
     }
     toml.push_str(&codex_otel_block(config));
-    toml
+    Ok(toml)
 }
 
 fn is_codex_managed_otel_assignment(line: &str) -> bool {
@@ -465,6 +468,12 @@ fn managed_marker_identifier(marker: &str) -> Option<&str> {
 fn trim_one_blank_line_at_removal_boundary(output: &mut String) {
     if output.ends_with("\n\n") {
         output.truncate(output.len() - 1);
+    }
+}
+
+fn ensure_line_break(output: &mut String) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
     }
 }
 

@@ -257,7 +257,6 @@ fn codex_config_toml_inserts_managed_values_inside_existing_otel_table()
 
 [otel]
 environment = "dev"
-exporter = "none"
 
 [tools]
 view_image = true
@@ -277,7 +276,47 @@ view_image = true
     );
     assert!(generated.as_str().contains("environment = \"dev\""));
     assert!(generated.as_str().contains("[tools]\nview_image = true"));
-    assert!(!generated.as_str().contains("exporter = \"none\""));
+    Ok(())
+}
+
+#[test]
+fn codex_config_toml_rejects_unmanaged_otel_exporter_assignment() {
+    let err = CodexConfigToml::generate(
+        r#"[otel]
+environment = "dev"
+exporter = "none"
+"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("unmanaged Codex OTEL keys must not be silently removed");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::ConflictingCodexOtelKeys
+    ));
+}
+
+#[test]
+fn codex_config_toml_inserts_after_final_otel_header_without_concatenating_marker()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CodexConfigToml::generate(
+        "[otel]",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert!(
+        generated
+            .as_str()
+            .starts_with("[otel]\n# BEGIN KVASIR MANAGED CODEX OTEL\n")
+    );
     Ok(())
 }
 
