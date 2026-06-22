@@ -22,8 +22,8 @@ use crate::rpc::{
 };
 use crate::usage::{
     CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, ToolCallEventKey, ToolCallRecord,
-    TraceSpanRecord, UsageRecords,
+    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal, ToolCallEventKey,
+    ToolCallRecord, TraceSpanRecord, UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +207,9 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
                 .and_then(Value::as_array)
                 .ok_or(OtlpError::MissingLogRecords)?;
             for log_record in log_records {
+                if let Some(record) = json_token_usage_log_record(log_record, repo.clone())? {
+                    records.token_usage.push(record);
+                }
                 if let Some(record) = json_tool_call_record(log_record, repo.clone())? {
                     records.tool_calls.push(record);
                 }
@@ -369,6 +372,9 @@ fn records_from_scope_logs_for_logs(
 ) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
     for log_record in scope_logs.log_records {
+        if let Some(record) = proto_token_usage_log_record(&log_record, repo.clone())? {
+            records.token_usage.push(record);
+        }
         if let Some(record) = proto_tool_call_record(log_record, repo.clone())? {
             records.tool_calls.push(record);
         }
@@ -750,6 +756,126 @@ fn json_cost_record(data_point: &Value, repo: RepoBucket) -> Result<CostUsageRec
     ))
 }
 
+fn proto_token_usage_log_record(
+    log_record: &LogRecord,
+    repo: RepoBucket,
+) -> Result<Option<TokenUsageRecord>, OtlpError> {
+    if !is_token_usage_event(Some(log_record.event_name.as_str()), || {
+        proto_attribute(&log_record.attributes, "event.name")
+    }) {
+        return Ok(None);
+    }
+    let model = first_meaningful_proto_attribute(
+        &log_record.attributes,
+        &["model", "gen_ai.request.model"],
+    )
+    .ok_or(OtlpError::MissingModel)?;
+    let measure = first_meaningful_proto_attribute(
+        &log_record.attributes,
+        &[
+            "token.type",
+            "type",
+            "direction",
+            "token_type",
+            "gen_ai.token.type",
+        ],
+    )
+    .and_then(|value| TokenMeasure::from_attribute(&value))
+    .ok_or(OtlpError::InvalidMeasure)?;
+    let token_count = proto_log_token_count(log_record)?;
+    let occurred_at_nanos = if log_record.time_unix_nano == 0 {
+        log_record.observed_time_unix_nano
+    } else {
+        log_record.time_unix_nano
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let model = ModelName::new(model);
+    if let Some(counter_start) = proto_log_counter_start(log_record)? {
+        return Ok(Some(TokenUsageRecord::new_from_signal(
+            TokenUsageSignal::Logs,
+            occurred_at,
+            counter_start,
+            repo,
+            model,
+            measure,
+            token_count,
+        )));
+    }
+    let event_key = log_token_usage_event_key(
+        &repo,
+        model.as_str(),
+        measure,
+        occurred_at_nanos,
+        token_count,
+    );
+    Ok(Some(TokenUsageRecord::new_delta_from_signal(
+        TokenUsageSignal::Logs,
+        event_key,
+        occurred_at,
+        repo,
+        model,
+        measure,
+        token_count,
+    )))
+}
+
+fn json_token_usage_log_record(
+    log_record: &Value,
+    repo: RepoBucket,
+) -> Result<Option<TokenUsageRecord>, OtlpError> {
+    let attributes = log_record.get("attributes").and_then(Value::as_array);
+    if !is_token_usage_event(log_record.get("eventName").and_then(Value::as_str), || {
+        json_attribute(attributes, "event.name")
+    }) {
+        return Ok(None);
+    }
+    let model = first_meaningful_json_attribute(attributes, &["model", "gen_ai.request.model"])
+        .ok_or(OtlpError::MissingModel)?;
+    let measure = first_meaningful_json_attribute(
+        attributes,
+        &[
+            "token.type",
+            "type",
+            "direction",
+            "token_type",
+            "gen_ai.token.type",
+        ],
+    )
+    .and_then(|value| TokenMeasure::from_attribute(&value))
+    .ok_or(OtlpError::InvalidMeasure)?;
+    let token_count = json_log_token_count(log_record, attributes)?;
+    let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
+    let model = ModelName::new(model);
+    if let Some(counter_start) = json_log_counter_start(log_record, attributes)? {
+        return Ok(Some(TokenUsageRecord::new_from_signal(
+            TokenUsageSignal::Logs,
+            occurred_at,
+            counter_start,
+            repo,
+            model,
+            measure,
+            token_count,
+        )));
+    }
+    let event_key = log_token_usage_event_key(
+        &repo,
+        model.as_str(),
+        measure,
+        occurred_at_nanos,
+        token_count,
+    );
+    Ok(Some(TokenUsageRecord::new_delta_from_signal(
+        TokenUsageSignal::Logs,
+        event_key,
+        occurred_at,
+        repo,
+        model,
+        measure,
+        token_count,
+    )))
+}
+
 fn proto_tool_call_record(
     log_record: LogRecord,
     repo: RepoBucket,
@@ -823,6 +949,238 @@ fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError
         .or_else(|| json_attribute(attributes, "tool_name"))
         .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
+}
+
+fn proto_log_counter_start(log_record: &LogRecord) -> Result<Option<TimestampMillis>, OtlpError> {
+    let raw_value = proto_u64_attribute(
+        &log_record.attributes,
+        &[
+            "start_time_unix_nano",
+            "counter_start_unix_nano",
+            "startTimeUnixNano",
+        ],
+    )
+    .or_else(|| {
+        log_record
+            .body
+            .as_ref()
+            .and_then(|body| proto_u64_map_value(body, "start_time_unix_nano"))
+    })
+    .or_else(|| {
+        log_record
+            .body
+            .as_ref()
+            .and_then(|body| proto_u64_map_value(body, "counter_start_unix_nano"))
+    })
+    .or_else(|| {
+        log_record
+            .body
+            .as_ref()
+            .and_then(|body| proto_u64_map_value(body, "startTimeUnixNano"))
+    })
+    .transpose()?;
+
+    raw_value
+        .filter(|value| *value != 0)
+        .map(|value| TimestampMillis::try_from_unix_nanos(value).ok_or(OtlpError::MissingTimestamp))
+        .transpose()
+}
+
+fn json_log_counter_start(
+    log_record: &Value,
+    attributes: Option<&Vec<Value>>,
+) -> Result<Option<TimestampMillis>, OtlpError> {
+    let raw_value = json_u64_attribute(
+        attributes,
+        &[
+            "start_time_unix_nano",
+            "counter_start_unix_nano",
+            "startTimeUnixNano",
+        ],
+    )
+    .or_else(|| {
+        log_record
+            .get("body")
+            .and_then(|body| json_u64_map_value(body, "start_time_unix_nano"))
+    })
+    .or_else(|| {
+        log_record
+            .get("body")
+            .and_then(|body| json_u64_map_value(body, "counter_start_unix_nano"))
+    })
+    .or_else(|| {
+        log_record
+            .get("body")
+            .and_then(|body| json_u64_map_value(body, "startTimeUnixNano"))
+    })
+    .transpose()?;
+
+    raw_value
+        .filter(|value| *value != 0)
+        .map(|value| TimestampMillis::try_from_unix_nanos(value).ok_or(OtlpError::MissingTimestamp))
+        .transpose()
+}
+
+fn proto_log_token_count(log_record: &LogRecord) -> Result<TokenCount, OtlpError> {
+    proto_token_count_attribute(&log_record.attributes, &["token.count", "token_count"])
+        .or_else(|| log_record.body.as_ref().map(proto_token_count_value))
+        .ok_or(OtlpError::MissingTokenCount)?
+}
+
+fn proto_token_count_attribute(
+    attributes: &[KeyValue],
+    keys: &[&str],
+) -> Option<Result<TokenCount, OtlpError>> {
+    keys.iter().find_map(|key| {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key == *key)
+            .and_then(|attribute| attribute.value.as_ref())
+            .map(proto_token_count_value)
+    })
+}
+
+fn proto_token_count_value(value: &AnyValue) -> Result<TokenCount, OtlpError> {
+    match value.value.as_ref().ok_or(OtlpError::MissingTokenCount)? {
+        any_value::Value::IntValue(value) => {
+            TokenCount::try_new(u64::try_from(*value).map_err(|_| OtlpError::NumberOutOfRange)?)
+                .ok_or(OtlpError::NumberOutOfRange)
+        }
+        any_value::Value::DoubleValue(value) => token_count_from_f64(*value),
+        any_value::Value::StringValue(value) => {
+            let value = value
+                .parse::<u64>()
+                .map_err(|_| OtlpError::NumberOutOfRange)?;
+            TokenCount::try_new(value).ok_or(OtlpError::NumberOutOfRange)
+        }
+        _ => Err(OtlpError::MissingTokenCount),
+    }
+}
+
+fn proto_u64_attribute(attributes: &[KeyValue], keys: &[&str]) -> Option<Result<u64, OtlpError>> {
+    keys.iter().find_map(|key| {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key == *key)
+            .and_then(|attribute| attribute.value.as_ref())
+            .map(proto_u64_value)
+    })
+}
+
+fn proto_u64_map_value(value: &AnyValue, key: &str) -> Option<Result<u64, OtlpError>> {
+    let any_value::Value::KvlistValue(values) = value.value.as_ref()? else {
+        return None;
+    };
+    values
+        .values
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .map(proto_u64_value)
+}
+
+fn proto_u64_value(value: &AnyValue) -> Result<u64, OtlpError> {
+    match value.value.as_ref().ok_or(OtlpError::NumberOutOfRange)? {
+        any_value::Value::IntValue(value) => {
+            u64::try_from(*value).map_err(|_| OtlpError::NumberOutOfRange)
+        }
+        any_value::Value::DoubleValue(value) => {
+            valid_u64_from_f64(*value).ok_or(OtlpError::NumberOutOfRange)
+        }
+        any_value::Value::StringValue(value) => value
+            .parse::<u64>()
+            .map_err(|_| OtlpError::NumberOutOfRange),
+        _ => Err(OtlpError::NumberOutOfRange),
+    }
+}
+
+fn json_log_token_count(
+    log_record: &Value,
+    attributes: Option<&Vec<Value>>,
+) -> Result<TokenCount, OtlpError> {
+    json_token_count_attribute(attributes, &["token.count", "token_count"])
+        .or_else(|| log_record.get("body").map(json_token_count_any_value))
+        .ok_or(OtlpError::MissingTokenCount)?
+}
+
+fn json_token_count_attribute(
+    attributes: Option<&Vec<Value>>,
+    keys: &[&str],
+) -> Option<Result<TokenCount, OtlpError>> {
+    let attributes = attributes?;
+    keys.iter().find_map(|key| {
+        attributes
+            .iter()
+            .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(*key))
+            .and_then(|attribute| attribute.get("value"))
+            .map(json_token_count_any_value)
+    })
+}
+
+fn json_token_count_any_value(value: &Value) -> Result<TokenCount, OtlpError> {
+    let raw_value = value
+        .get("intValue")
+        .or_else(|| value.get("stringValue"))
+        .and_then(json_u64_value);
+    if let Some(value) = raw_value {
+        return TokenCount::try_new(value).ok_or(OtlpError::NumberOutOfRange);
+    }
+    if let Some(value) = value.get("doubleValue").and_then(Value::as_f64) {
+        return token_count_from_f64(value);
+    }
+    Err(OtlpError::MissingTokenCount)
+}
+
+fn json_u64_attribute(
+    attributes: Option<&Vec<Value>>,
+    keys: &[&str],
+) -> Option<Result<u64, OtlpError>> {
+    let attributes = attributes?;
+    keys.iter().find_map(|key| {
+        attributes
+            .iter()
+            .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(*key))
+            .and_then(|attribute| attribute.get("value"))
+            .map(json_u64_any_value)
+    })
+}
+
+fn json_u64_map_value(value: &Value, key: &str) -> Option<Result<u64, OtlpError>> {
+    value
+        .get("kvlistValue")
+        .and_then(|kvlist| kvlist.get("values"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|attribute| attribute.get("value"))
+        .map(json_u64_any_value)
+}
+
+fn json_u64_any_value(value: &Value) -> Result<u64, OtlpError> {
+    value
+        .get("intValue")
+        .or_else(|| value.get("stringValue"))
+        .and_then(json_u64_value)
+        .or_else(|| {
+            value
+                .get("doubleValue")
+                .and_then(Value::as_f64)
+                .and_then(valid_u64_from_f64)
+        })
+        .ok_or(OtlpError::NumberOutOfRange)
+}
+
+fn is_token_usage_event(
+    event_name: Option<&str>,
+    attribute_event_name: impl FnOnce() -> Option<String>,
+) -> bool {
+    matches!(
+        event_name
+            .and_then(|value| meaningful_attribute(Some(value.to_owned())))
+            .or_else(attribute_event_name)
+            .as_deref(),
+        Some("token_usage" | "token.usage")
+    )
 }
 
 fn proto_trace_span_record(
@@ -1091,6 +1449,32 @@ fn tool_call_event_key(
     ToolCallEventKey::new(canonical)
 }
 
+fn log_token_usage_event_key(
+    repo: &RepoBucket,
+    model: &str,
+    measure: TokenMeasure,
+    occurred_at_nanos: u64,
+    token_count: TokenCount,
+) -> TokenUsageEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-log-token-usage");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("model=");
+    canonical.push_str(model);
+    canonical.push('\n');
+    canonical.push_str("measure=");
+    canonical.push_str(measure.storage_name());
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("token_count=");
+    canonical.push_str(&token_count.value().to_string());
+    canonical.push('\n');
+    TokenUsageEventKey::new(canonical)
+}
+
 fn codex_token_usage_event_key(
     repo: &RepoBucket,
     model: &str,
@@ -1356,6 +1740,7 @@ mod tests {
     use prost::Message;
 
     use super::*;
+    use crate::usage::TokenUsageKind;
 
     #[test]
     fn protobuf_rejects_missing_required_token_datapoint_fields() {
@@ -2237,6 +2622,80 @@ mod tests {
     }
 
     #[test]
+    fn json_usage_logs_normalize_token_usage_records() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+                    ]
+                },
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "token_usage",
+                        "body": { "intValue": "1200" },
+                        "attributes": [
+                            { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                            { "key": "token.type", "value": { "stringValue": "input" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(records.token_usage.len(), 1);
+        assert_eq!(records.token_usage[0].signal, TokenUsageSignal::Logs);
+        assert_eq!(records.token_usage[0].token_count, TokenCount::new(1200));
+        assert!(matches!(
+            records.token_usage[0].kind,
+            TokenUsageKind::Delta { .. }
+        ));
+        assert_eq!(
+            records.token_usage[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir")
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_usage_logs_use_counter_start_when_present() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "token_usage",
+                        "body": { "intValue": "1200" },
+                        "attributes": [
+                            { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                            { "key": "token.type", "value": { "stringValue": "input" } },
+                            { "key": "counter_start_unix_nano", "value": { "stringValue": "1781956799000000000" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(
+            records.token_usage[0].counter_start,
+            TimestampMillis::new_for_test(1_781_956_799_000)
+        );
+        assert_eq!(records.token_usage[0].kind, TokenUsageKind::Cumulative);
+
+        Ok(())
+    }
+
+    #[test]
     fn json_usage_logs_accept_empty_batches_as_noop() -> Result<(), Box<dyn std::error::Error>> {
         let payload = br#"{
             "resourceLogs": []
@@ -2323,6 +2782,47 @@ mod tests {
         let records = parse_otlp_protobuf_usage_logs(&payload)?;
 
         assert!(records.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_usage_logs_normalize_token_usage_records() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = protobuf_logs_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![LogRecord {
+                time_unix_nano: 1_781_956_800_000_000_000,
+                observed_time_unix_nano: 0,
+                severity_number: 0,
+                severity_text: String::new(),
+                body: Some(AnyValue {
+                    value: Some(any_value::Value::IntValue(1200)),
+                }),
+                attributes: vec![
+                    string_attribute("model", "gpt-5.4"),
+                    string_attribute("token.type", "input"),
+                ],
+                dropped_attributes_count: 0,
+                flags: 0,
+                trace_id: Vec::new(),
+                span_id: Vec::new(),
+                event_name: "token_usage".to_owned(),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert_eq!(records.token_usage.len(), 1);
+        assert_eq!(records.token_usage[0].signal, TokenUsageSignal::Logs);
+        assert_eq!(records.token_usage[0].token_count, TokenCount::new(1200));
+        assert!(matches!(
+            records.token_usage[0].kind,
+            TokenUsageKind::Delta { .. }
+        ));
 
         Ok(())
     }
