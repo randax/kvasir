@@ -6,9 +6,13 @@ use serde_json::{Map, Value};
 
 use crate::rpc::BearerToken;
 
+const MANAGED_BLOCK_KEY: &str = "kvasirManaged";
+
 const MANAGED_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_ENABLE_TELEMETRY",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    "CLAUDE_CODE_ENABLE_TRACE_BETA",
+    "CLAUDE_CODE_ENABLE_CONTENT_GATES",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_PROTOCOL",
@@ -113,14 +117,22 @@ pub struct ClaudeCodeSettings {
 impl ClaudeCodeSettings {
     pub fn generate(existing_settings: &str, config: &SetupConfig) -> Result<Self, SetupError> {
         let mut root = parse_settings_root(existing_settings)?;
+        let previously_managed_env_keys = managed_env_keys_from_root(&root);
         let env = env_object(&mut root)?;
 
+        for key in previously_managed_env_keys {
+            env.remove(&key);
+        }
         for key in MANAGED_ENV_KEYS {
             env.remove(*key);
         }
         for (key, value) in managed_env_values(config) {
             env.insert(key.to_owned(), Value::String(value));
         }
+        root.insert(
+            MANAGED_BLOCK_KEY.to_owned(),
+            managed_block_value(MANAGED_ENV_KEYS),
+        );
 
         let json = serde_json::to_string_pretty(&Value::Object(root))?;
         Ok(Self { json })
@@ -133,6 +145,17 @@ impl ClaudeCodeSettings {
     pub fn managed_env_keys(&self) -> &'static [&'static str] {
         MANAGED_ENV_KEYS
     }
+}
+
+fn managed_env_keys_from_root(root: &Map<String, Value>) -> Vec<String> {
+    root.get(MANAGED_BLOCK_KEY)
+        .and_then(|value| value.get("env"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_settings_root(existing_settings: &str) -> Result<Map<String, Value>, SetupError> {
@@ -157,10 +180,20 @@ fn env_object(root: &mut Map<String, Value>) -> Result<&mut Map<String, Value>, 
     }
 }
 
+fn managed_block_value(env_keys: &[&str]) -> Value {
+    let env = env_keys
+        .iter()
+        .map(|key| Value::String((*key).to_owned()))
+        .collect();
+    Value::Object(Map::from_iter([("env".to_owned(), Value::Array(env))]))
+}
+
 fn managed_env_values(config: &SetupConfig) -> Vec<(&'static str, String)> {
     vec![
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1".to_owned()),
         ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1".to_owned()),
+        ("CLAUDE_CODE_ENABLE_TRACE_BETA", "1".to_owned()),
+        ("CLAUDE_CODE_ENABLE_CONTENT_GATES", "1".to_owned()),
         (
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             config.endpoint.as_str().to_owned(),
