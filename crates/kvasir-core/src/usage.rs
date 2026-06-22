@@ -141,11 +141,45 @@ impl TokenCount {
 pub struct TokenUsageRecord {
     pub occurred_at: TimestampMillis,
     pub counter_start: TimestampMillis,
+    pub signal: TokenUsageSignal,
     pub repo: RepoBucket,
     pub model: ModelName,
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
     pub kind: TokenUsageKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenUsageSignal {
+    Metrics,
+    Logs,
+}
+
+impl TokenUsageSignal {
+    pub const fn authoritative_for(measure: TokenMeasure) -> Self {
+        match measure {
+            TokenMeasure::Input | TokenMeasure::Output | TokenMeasure::Cache => Self::Metrics,
+        }
+    }
+
+    pub fn storage_name(self) -> &'static str {
+        match self {
+            Self::Metrics => "metrics",
+            Self::Logs => "logs",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "metrics" => Some(Self::Metrics),
+            "logs" => Some(Self::Logs),
+            _ => None,
+        }
+    }
+
+    pub fn is_authoritative_for(self, measure: TokenMeasure) -> bool {
+        self == Self::authoritative_for(measure)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,9 +406,30 @@ impl TokenUsageRecord {
         measure: TokenMeasure,
         token_count: TokenCount,
     ) -> Self {
+        Self::new_from_signal(
+            TokenUsageSignal::Metrics,
+            occurred_at,
+            counter_start,
+            repo,
+            model,
+            measure,
+            token_count,
+        )
+    }
+
+    pub fn new_from_signal(
+        signal: TokenUsageSignal,
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        repo: RepoBucket,
+        model: ModelName,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
         Self {
             occurred_at,
             counter_start,
+            signal,
             repo,
             model,
             measure,
@@ -395,11 +450,54 @@ impl TokenUsageRecord {
         Self {
             occurred_at,
             counter_start,
+            signal: TokenUsageSignal::Metrics,
             repo,
             model,
             measure,
             token_count,
             kind: TokenUsageKind::Delta { event_key },
         }
+    }
+
+    pub fn new_delta_from_signal(
+        signal: TokenUsageSignal,
+        event_key: TokenUsageEventKey,
+        occurred_at: TimestampMillis,
+        repo: RepoBucket,
+        model: ModelName,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
+        Self {
+            occurred_at,
+            counter_start: occurred_at,
+            signal,
+            repo,
+            model,
+            measure,
+            token_count,
+            kind: TokenUsageKind::Delta { event_key },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TokenMeasure, TokenUsageSignal};
+
+    #[test]
+    fn token_authority_is_defined_per_measure() {
+        assert_eq!(
+            TokenUsageSignal::authoritative_for(TokenMeasure::Input),
+            TokenUsageSignal::Metrics
+        );
+        assert_eq!(
+            TokenUsageSignal::authoritative_for(TokenMeasure::Output),
+            TokenUsageSignal::Metrics
+        );
+        assert_eq!(
+            TokenUsageSignal::authoritative_for(TokenMeasure::Cache),
+            TokenUsageSignal::Metrics
+        );
     }
 }

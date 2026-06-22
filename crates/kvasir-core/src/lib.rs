@@ -15,6 +15,6 @@ pub use setup::{ClaudeCodeSettings, KvasirEndpoint, RawBodyDirectory, SetupConfi
 pub use store::{StoreKey, StoreKeyError, UsageStore};
 pub use usage::{
     CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, ToolCallRecord, TraceSpanRecord,
-    UsageRecords,
+    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal, ToolCallRecord,
+    TraceSpanRecord, UsageRecords,
 };
