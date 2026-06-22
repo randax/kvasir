@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use kvasir_core::{BearerToken, KvasirEndpoint, RawBodyDirectory, SetupConfig};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 #[derive(Debug, Clone)]
 pub struct KeychainSetupSecretSource {
@@ -100,14 +104,18 @@ fn resolve_setup_config(
     raw_body_directory: RawBodyDirectory,
 ) -> anyhow::Result<SetupConfig> {
     let bearer_token = match credential.read()? {
-        Some(encoded) => serde_json::from_str::<StoredSetupSecrets>(&encoded)?.bearer_token,
+        Some(encoded) => {
+            let encoded = Zeroizing::new(encoded);
+            serde_json::from_str::<StoredSetupSecrets>(&encoded)?.bearer_token
+        }
         None => BearerToken::generate()?,
     };
     let secrets = StoredSetupSecrets {
         endpoint,
         bearer_token,
     };
-    credential.write(&serde_json::to_string(&secrets)?)?;
+    let encoded = Zeroizing::new(serde_json::to_string(&secrets)?);
+    credential.write(&encoded)?;
 
     Ok(SetupConfig::new(
         secrets.endpoint,
@@ -145,13 +153,44 @@ fn keychain_path_component(stable_path: &Path) -> String {
         return format!("utf8:{path}");
     }
 
-    format!("lossy:{}", stable_path.display())
+    format!("hex:{}", hex_encode(path_bytes(stable_path)))
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.to_string_lossy().as_bytes()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(hex_nibble(byte >> 4));
+        encoded.push(hex_nibble(byte & 0x0f));
+    }
+    encoded
+}
+
+fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'a' + (nibble - 10)),
+        _ => unreachable!("nibble is masked to four bits"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn setup_secret_resolution_generates_and_persists_endpoint_and_bearer_token()
@@ -188,6 +227,22 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_settings_paths_have_distinct_keychain_users() {
+        let first_path = PathBuf::from(OsStr::from_bytes(b"/tmp/settings-\xff.json"));
+        let second_path = PathBuf::from(OsStr::from_bytes(b"/tmp/settings-\xfe.json"));
+
+        assert_eq!(
+            keychain_path_component(&first_path),
+            "hex:2f746d702f73657474696e67732dff2e6a736f6e"
+        );
+        assert_ne!(
+            keychain_path_component(&first_path),
+            keychain_path_component(&second_path)
+        );
     }
 
     #[derive(Clone, Default)]
