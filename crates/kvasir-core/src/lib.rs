@@ -11,7 +11,10 @@ pub use otlp::{
 };
 pub use pricing::{ModelTokenPrices, PriceTable};
 pub use rpc::BearerToken;
-pub use setup::{ClaudeCodeSettings, KvasirEndpoint, RawBodyDirectory, SetupConfig, SetupError};
+pub use setup::{
+    ClaudeCodeSettings, CodexConfigToml, CopilotShellProfile, KvasirEndpoint, RawBodyDirectory,
+    SetupConfig, SetupError,
+};
 pub use store::{StoreKey, StoreKeyError, UsageStore};
 pub use usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
