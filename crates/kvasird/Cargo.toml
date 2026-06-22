@@ -23,4 +23,5 @@ http.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true

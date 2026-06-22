@@ -71,7 +71,7 @@ impl RepoBucket {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TokenMeasure {
     Input,
     Output,
@@ -153,6 +153,7 @@ pub struct TokenUsageRecord {
 pub enum TokenUsageSignal {
     Metrics,
     Logs,
+    OpenCodeTraces,
 }
 
 impl TokenUsageSignal {
@@ -166,6 +167,7 @@ impl TokenUsageSignal {
         match self {
             Self::Metrics => "metrics",
             Self::Logs => "logs",
+            Self::OpenCodeTraces => "opencode_traces",
         }
     }
 
@@ -173,12 +175,13 @@ impl TokenUsageSignal {
         match value {
             "metrics" => Some(Self::Metrics),
             "logs" => Some(Self::Logs),
+            "opencode_traces" => Some(Self::OpenCodeTraces),
             _ => None,
         }
     }
 
     pub fn is_authoritative_for(self, measure: TokenMeasure) -> bool {
-        self == Self::authoritative_for(measure)
+        self == Self::authoritative_for(measure) || self == Self::OpenCodeTraces
     }
 }
 
@@ -215,6 +218,97 @@ pub struct ToolCallEventKey(String);
 impl ToolCallEventKey {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentRecord {
+    pub event_key: ContentEventKey,
+    pub occurred_at: TimestampMillis,
+    pub repo: RepoBucket,
+    pub harness: HarnessName,
+    pub kind: ContentKind,
+    pub content: ContentText,
+}
+
+impl ContentRecord {
+    pub fn new(
+        event_key: ContentEventKey,
+        occurred_at: TimestampMillis,
+        repo: RepoBucket,
+        harness: HarnessName,
+        kind: ContentKind,
+        content: ContentText,
+    ) -> Self {
+        Self {
+            event_key,
+            occurred_at,
+            repo,
+            harness,
+            kind,
+            content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentEventKey(String);
+
+impl ContentEventKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    UserPrompt,
+    AssistantMessage,
+    ToolInput,
+    ToolOutput,
+}
+
+impl ContentKind {
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "user_prompt" | "user" => Some(Self::UserPrompt),
+            "assistant_message" | "assistant" => Some(Self::AssistantMessage),
+            "tool_input" => Some(Self::ToolInput),
+            "tool_output" | "tool_result" => Some(Self::ToolOutput),
+            _ => None,
+        }
+    }
+
+    pub fn storage_name(self) -> &'static str {
+        match self {
+            Self::UserPrompt => "user_prompt",
+            Self::AssistantMessage => "assistant_message",
+            Self::ToolInput => "tool_input",
+            Self::ToolOutput => "tool_output",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentText(String);
+
+impl ContentText {
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        if value.is_empty() {
+            None
+        } else {
+            Some(Self(value))
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -370,6 +464,7 @@ pub struct UsageRecords {
     pub cost_usage: Vec<CostUsageRecord>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub trace_spans: Vec<TraceSpanRecord>,
+    pub content: Vec<ContentRecord>,
 }
 
 impl UsageRecords {
@@ -379,6 +474,7 @@ impl UsageRecords {
             cost_usage: Vec::new(),
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         }
     }
 
@@ -387,6 +483,7 @@ impl UsageRecords {
             && self.cost_usage.is_empty()
             && self.tool_calls.is_empty()
             && self.trace_spans.is_empty()
+            && self.content.is_empty()
     }
 
     pub fn extend(&mut self, other: Self) {
@@ -394,6 +491,7 @@ impl UsageRecords {
         self.cost_usage.extend(other.cost_usage);
         self.tool_calls.extend(other.tool_calls);
         self.trace_spans.extend(other.trace_spans);
+        self.content.extend(other.content);
     }
 }
 

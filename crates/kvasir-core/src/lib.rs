@@ -14,7 +14,7 @@ pub use rpc::BearerToken;
 pub use setup::{ClaudeCodeSettings, KvasirEndpoint, RawBodyDirectory, SetupConfig, SetupError};
 pub use store::{StoreKey, StoreKeyError, UsageStore};
 pub use usage::{
-    CostUsageRecord, CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal, ToolCallRecord,
-    TraceSpanRecord, UsageRecords,
+    ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
+    RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageEventKey,
+    TokenUsageRecord, TokenUsageSignal, ToolCallRecord, TraceSpanRecord, UsageRecords,
 };

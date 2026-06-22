@@ -11,11 +11,11 @@ use crate::rpc::{
     Trace, TraceDurationMeasures, TraceId, TraceQuery, TraceSpan, TraceSpanKind,
 };
 use crate::usage::{
-    CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure,
-    TokenUsageKind, TokenUsageRecord, TokenUsageSignal, ToolCallRecord, UsageRecords,
+    ContentRecord, CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
+    TokenMeasure, TokenUsageKind, TokenUsageRecord, TokenUsageSignal, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -151,6 +151,7 @@ impl UsageStore {
         Self::ingest_cost_usage_in_transaction(&transaction, &records.cost_usage)?;
         Self::ingest_tool_calls_in_transaction(&transaction, &records.tool_calls)?;
         Self::ingest_trace_spans_in_transaction(&transaction, &records.trace_spans)?;
+        Self::ingest_content_in_transaction(&transaction, &records.content)?;
         transaction.commit()?;
         Ok(())
     }
@@ -164,6 +165,7 @@ impl UsageStore {
         let output_signal =
             TokenUsageSignal::authoritative_for(TokenMeasure::Output).storage_name();
         let cache_signal = TokenUsageSignal::authoritative_for(TokenMeasure::Cache).storage_name();
+        let opencode_trace_signal = TokenUsageSignal::OpenCodeTraces.storage_name();
         let mut statement = self.connection.prepare(
             "SELECT
                 day,
@@ -171,21 +173,27 @@ impl UsageStore {
                 repo_name,
                 repo_path,
                 model,
-                SUM(CASE WHEN measure = 'input' AND token_signal = ?6 THEN token_count ELSE 0 END) AS input_tokens,
-                SUM(CASE WHEN measure = 'output' AND token_signal = ?7 THEN token_count ELSE 0 END) AS output_tokens,
-                SUM(CASE WHEN measure = 'cache' AND token_signal = ?8 THEN token_count ELSE 0 END) AS cache_tokens
+                SUM(CASE WHEN measure = 'input' AND token_signal = ?6 THEN token_count ELSE 0 END)
+                    + SUM(CASE WHEN measure = 'input' AND token_signal = ?9 AND superseded_metric_token_usage_id IS NULL THEN token_count ELSE 0 END)
+                    AS input_tokens,
+                SUM(CASE WHEN measure = 'output' AND token_signal = ?7 THEN token_count ELSE 0 END)
+                    + SUM(CASE WHEN measure = 'output' AND token_signal = ?9 AND superseded_metric_token_usage_id IS NULL THEN token_count ELSE 0 END)
+                    AS output_tokens,
+                SUM(CASE WHEN measure = 'cache' AND token_signal = ?8 THEN token_count ELSE 0 END)
+                    + SUM(CASE WHEN measure = 'cache' AND token_signal = ?9 AND superseded_metric_token_usage_id IS NULL THEN token_count ELSE 0 END)
+                    AS cache_tokens
              FROM canonical_token_usage
              WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
                 AND (
-                    (measure = 'input' AND token_signal = ?6)
-                    OR (measure = 'output' AND token_signal = ?7)
-                    OR (measure = 'cache' AND token_signal = ?8)
+                    (measure = 'input' AND token_signal IN (?6, ?9))
+                    OR (measure = 'output' AND token_signal IN (?7, ?9))
+                    OR (measure = 'cache' AND token_signal IN (?8, ?9))
                 )
              GROUP BY day, repo_bucket, repo_name, repo_path, model
-             ORDER BY day, repo_bucket, repo_name, repo_path, model",
+            ORDER BY day, repo_bucket, repo_name, repo_path, model",
         )?;
         let rows = statement.query_map(
             params![
@@ -197,6 +205,7 @@ impl UsageStore {
                 input_signal,
                 output_signal,
                 cache_signal,
+                opencode_trace_signal,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -519,20 +528,27 @@ impl UsageStore {
         let transaction = self.connection.transaction()?;
         match schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            5 => migrate_v5_to_v6(&transaction)?,
+            6 => migrate_v6_to_v7(&transaction)?,
+            5 => {
+                migrate_v5_to_v6(&transaction)?;
+                migrate_v6_to_v7(&transaction)?;
+            }
             4 => {
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
+                migrate_v6_to_v7(&transaction)?;
             }
             3 => {
                 migrate_v3_to_v4(&transaction)?;
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
+                migrate_v6_to_v7(&transaction)?;
             }
             2 => {
                 migrate_v2_to_v4(&transaction)?;
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
+                migrate_v6_to_v7(&transaction)?;
             }
             _ if schema_version < 2 => drop_incompatible_usage_tables(&transaction)?,
             _ => {}
@@ -549,7 +565,8 @@ impl UsageStore {
                 token_signal TEXT NOT NULL DEFAULT 'metrics',
                 model TEXT NOT NULL,
                 measure TEXT NOT NULL,
-                token_count INTEGER NOT NULL
+                token_count INTEGER NOT NULL,
+                superseded_metric_token_usage_id INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS cumulative_counter_snapshots (
@@ -581,7 +598,8 @@ impl UsageStore {
                 cost_usd_nanos INTEGER NOT NULL,
                 cost_source INTEGER NOT NULL,
                 estimated_token_count INTEGER,
-                estimated_token_price_nanos INTEGER
+                estimated_token_price_nanos INTEGER,
+                estimated_token_usage_id INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS cost_counter_snapshots (
@@ -656,6 +674,19 @@ impl UsageStore {
                 duration_ms INTEGER NOT NULL,
                 tool_name TEXT,
                 UNIQUE(session_id, prompt_id, trace_id, span_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS canonical_content_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                content TEXT NOT NULL
             );",
         )?;
         transaction.execute(
@@ -709,8 +740,47 @@ impl UsageStore {
                     delta,
                 ],
             )?;
+            let token_usage_id = transaction.last_insert_rowid();
 
-            if record.signal.is_authoritative_for(record.measure) {
+            let superseding_existing_metric_token_usage_id =
+                if record.signal == TokenUsageSignal::OpenCodeTraces {
+                    Self::claim_one_matching_metric_token_for_opencode_trace(
+                        transaction,
+                        token_usage_id,
+                        record,
+                        &stored_repo,
+                        day.as_str(),
+                        delta,
+                    )?
+                } else {
+                    None
+                };
+            let superseded_by_existing_metric =
+                superseding_existing_metric_token_usage_id.is_some();
+            if let Some(metric_token_usage_id) = superseding_existing_metric_token_usage_id {
+                transaction.execute(
+                    "UPDATE canonical_token_usage
+                     SET superseded_metric_token_usage_id = ?1
+                     WHERE id = ?2",
+                    params![metric_token_usage_id, token_usage_id],
+                )?;
+            }
+
+            let superseded_opencode_token_usage_id = if record.signal == TokenUsageSignal::Metrics {
+                Self::supersede_one_matching_opencode_trace_token(
+                    transaction,
+                    token_usage_id,
+                    record,
+                    &stored_repo,
+                    day.as_str(),
+                    delta,
+                )?
+            } else {
+                None
+            };
+
+            if record.signal.is_authoritative_for(record.measure) && !superseded_by_existing_metric
+            {
                 let (input_tokens, output_tokens, cache_tokens) = match record.measure {
                     TokenMeasure::Input => (delta, 0, 0),
                     TokenMeasure::Output => (0, delta, 0),
@@ -735,7 +805,35 @@ impl UsageStore {
                         cache_tokens
                     ],
                 )?;
+                if let Some(superseded_token_usage_id) = superseded_opencode_token_usage_id {
+                    transaction.execute(
+                        "UPDATE token_rollups
+                         SET input_tokens = input_tokens - ?1,
+                             output_tokens = output_tokens - ?2,
+                             cache_tokens = cache_tokens - ?3
+                         WHERE day = ?4
+                            AND repo_bucket = ?5
+                            AND repo_name = ?6
+                            AND repo_path = ?7
+                            AND model = ?8",
+                        params![
+                            input_tokens,
+                            output_tokens,
+                            cache_tokens,
+                            day,
+                            stored_repo.bucket,
+                            stored_repo.name,
+                            stored_repo.path,
+                            record.model.as_str(),
+                        ],
+                    )?;
+                    Self::remove_estimated_cost_for_superseded_opencode_trace_token(
+                        transaction,
+                        superseded_token_usage_id,
+                    )?;
+                }
                 token_deltas.push(TokenUsageDelta {
+                    token_usage_id,
                     occurred_at: record.occurred_at,
                     counter_start: record.counter_start,
                     repo: record.repo.clone(),
@@ -746,6 +844,104 @@ impl UsageStore {
             }
         }
         Ok(token_deltas)
+    }
+
+    fn claim_one_matching_metric_token_for_opencode_trace(
+        transaction: &rusqlite::Transaction<'_>,
+        opencode_token_usage_id: i64,
+        record: &TokenUsageRecord,
+        stored_repo: &StoredRepo<'_>,
+        day: &str,
+        token_count: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        let metric_token_usage_id = transaction.query_row(
+            "SELECT metrics.id
+             FROM canonical_token_usage AS metrics
+             WHERE metrics.day = ?1
+                AND metrics.repo_bucket = ?2
+                AND metrics.repo_name = ?3
+                AND metrics.repo_path = ?4
+                AND metrics.token_signal = ?5
+                AND metrics.model = ?6
+                AND metrics.measure = ?7
+                AND metrics.token_count = ?8
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM canonical_token_usage AS opencode
+                    WHERE opencode.superseded_metric_token_usage_id = metrics.id
+                        AND opencode.id != ?9
+                )
+             ORDER BY ABS(metrics.occurred_at_ms - ?10), metrics.id
+             LIMIT 1",
+            params![
+                day,
+                stored_repo.bucket,
+                stored_repo.name,
+                stored_repo.path,
+                TokenUsageSignal::Metrics.storage_name(),
+                record.model.as_str(),
+                record.measure.storage_name(),
+                token_count,
+                opencode_token_usage_id,
+                record.occurred_at.value(),
+            ],
+            |row| row.get::<_, i64>(0),
+        );
+        match metric_token_usage_id {
+            Ok(token_usage_id) => Ok(Some(token_usage_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(StoreError::from(err)),
+        }
+    }
+
+    fn supersede_one_matching_opencode_trace_token(
+        transaction: &rusqlite::Transaction<'_>,
+        metric_token_usage_id: i64,
+        record: &TokenUsageRecord,
+        stored_repo: &StoredRepo<'_>,
+        day: &str,
+        token_count: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        let token_usage_id = transaction.query_row(
+            "SELECT id
+             FROM canonical_token_usage
+             WHERE day = ?1
+                AND repo_bucket = ?2
+                AND repo_name = ?3
+                AND repo_path = ?4
+                AND token_signal = ?5
+                AND model = ?6
+                AND measure = ?7
+                AND token_count = ?8
+                AND superseded_metric_token_usage_id IS NULL
+             ORDER BY ABS(occurred_at_ms - ?9), id
+             LIMIT 1",
+            params![
+                day,
+                stored_repo.bucket,
+                stored_repo.name,
+                stored_repo.path,
+                TokenUsageSignal::OpenCodeTraces.storage_name(),
+                record.model.as_str(),
+                record.measure.storage_name(),
+                token_count,
+                record.occurred_at.value(),
+            ],
+            |row| row.get::<_, i64>(0),
+        );
+        match token_usage_id {
+            Ok(token_usage_id) => {
+                transaction.execute(
+                    "UPDATE canonical_token_usage
+                     SET superseded_metric_token_usage_id = ?1
+                     WHERE id = ?2",
+                    params![metric_token_usage_id, token_usage_id],
+                )?;
+                Ok(Some(token_usage_id))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(StoreError::from(err)),
+        }
     }
 
     fn ingest_cost_usage_in_transaction(
@@ -878,6 +1074,41 @@ impl UsageStore {
         Ok(())
     }
 
+    fn ingest_content_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        records: &[ContentRecord],
+    ) -> Result<(), StoreError> {
+        for record in records {
+            let day = record.occurred_at.day().as_date().to_string();
+            let stored_repo = StoredRepo::from_bucket(&record.repo);
+            transaction.execute(
+                "INSERT OR IGNORE INTO canonical_content_records (
+                    event_key,
+                    occurred_at_ms,
+                    day,
+                    repo_bucket,
+                    repo_name,
+                    repo_path,
+                    harness,
+                    content_kind,
+                    content
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    record.event_key.as_str(),
+                    record.occurred_at.value(),
+                    day,
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    record.harness.as_str(),
+                    record.kind.storage_name(),
+                    record.content.as_str(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn remove_estimated_cost_for_native_record(
         transaction: &rusqlite::Transaction<'_>,
         record: &CostUsageRecord,
@@ -990,8 +1221,9 @@ impl UsageStore {
             transaction.execute(
                 "INSERT INTO canonical_cost_usage (
                     occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, model,
-                    cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos,
+                    estimated_token_usage_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     delta.occurred_at.value(),
                     delta.counter_start.value(),
@@ -1004,6 +1236,7 @@ impl UsageStore {
                     ESTIMATED_COST_SOURCE,
                     delta.token_count.storage_value(),
                     token_price.storage_value(),
+                    delta.token_usage_id,
                 ],
             )?;
 
@@ -1023,6 +1256,65 @@ impl UsageStore {
                 ],
             )?;
         }
+        Ok(())
+    }
+
+    fn remove_estimated_cost_for_superseded_opencode_trace_token(
+        transaction: &rusqlite::Transaction<'_>,
+        token_usage_id: i64,
+    ) -> Result<(), StoreError> {
+        let mut statement = transaction.prepare(
+            "SELECT
+                id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+	                model,
+	                cost_usd_nanos
+	             FROM canonical_cost_usage
+	             WHERE estimated_token_usage_id = ?1
+	                AND cost_source = ?2",
+        )?;
+        let superseded = statement
+            .query_map(params![token_usage_id, ESTIMATED_COST_SOURCE], |row| {
+                Ok(EstimatedCostRow {
+                    id: row.get(0)?,
+                    day: row.get(1)?,
+                    repo_bucket: row.get(2)?,
+                    repo_name: row.get(3)?,
+                    repo_path: row.get(4)?,
+                    model: row.get(5)?,
+                    cost_usd_nanos: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        for row in superseded {
+            transaction.execute(
+                "UPDATE cost_rollups
+                 SET estimated_cost_usd_nanos = estimated_cost_usd_nanos - ?1
+                 WHERE day = ?2
+                    AND repo_bucket = ?3
+                    AND repo_name = ?4
+                    AND repo_path = ?5
+                    AND model = ?6",
+                params![
+                    row.cost_usd_nanos,
+                    row.day,
+                    row.repo_bucket,
+                    row.repo_name,
+                    row.repo_path,
+                    row.model,
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM canonical_cost_usage WHERE id = ?1",
+                params![row.id],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1185,6 +1477,7 @@ fn drop_incompatible_usage_tables(
         DROP TABLE IF EXISTS canonical_cost_usage;
         DROP TABLE IF EXISTS canonical_tool_calls;
         DROP TABLE IF EXISTS canonical_trace_spans;
+        DROP TABLE IF EXISTS canonical_content_records;
         DROP TABLE IF EXISTS cumulative_counter_snapshots;
         DROP TABLE IF EXISTS cost_counter_snapshots;
         DROP TABLE IF EXISTS token_rollups;
@@ -1271,6 +1564,50 @@ fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
         )?;
     }
 
+    Ok(())
+}
+
+fn migrate_v6_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_token_usage")?
+        && !table_column_exists(
+            transaction,
+            "canonical_token_usage",
+            "superseded_metric_token_usage_id",
+        )?
+    {
+        transaction.execute(
+            "ALTER TABLE canonical_token_usage
+             ADD COLUMN superseded_metric_token_usage_id INTEGER",
+            [],
+        )?;
+    }
+    if table_exists(transaction, "canonical_cost_usage")?
+        && !table_column_exists(
+            transaction,
+            "canonical_cost_usage",
+            "estimated_token_usage_id",
+        )?
+    {
+        transaction.execute(
+            "ALTER TABLE canonical_cost_usage
+             ADD COLUMN estimated_token_usage_id INTEGER",
+            [],
+        )?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS canonical_content_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            occurred_at_ms INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            repo_bucket TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            harness TEXT NOT NULL,
+            content_kind TEXT NOT NULL,
+            content TEXT NOT NULL
+        );",
+    )?;
     Ok(())
 }
 
@@ -1404,11 +1741,30 @@ fn cost_source_column_type(
 fn canonical_token_signal_column_exists(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<bool, StoreError> {
-    let mut statement = transaction.prepare("PRAGMA table_info(canonical_token_usage)")?;
+    table_column_exists(transaction, "canonical_token_usage", "token_signal")
+}
+
+fn table_column_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> Result<bool, StoreError> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(columns.iter().any(|name| name == "token_signal"))
+    Ok(columns.iter().any(|name| name == column))
+}
+
+fn table_exists(transaction: &rusqlite::Transaction<'_>, table: &str) -> Result<bool, StoreError> {
+    let count = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM sqlite_master
+         WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count > 0)
 }
 
 fn snapshot_token_signal_column_exists(
@@ -1452,6 +1808,7 @@ struct StoredRepo<'a> {
 }
 
 struct TokenUsageDelta {
+    token_usage_id: i64,
     occurred_at: TimestampMillis,
     counter_start: TimestampMillis,
     repo: RepoBucket,
@@ -1474,6 +1831,16 @@ struct NativeCostCoverage {
 }
 
 struct EstimatedCostRollup {
+    day: String,
+    repo_bucket: String,
+    repo_name: String,
+    repo_path: String,
+    model: String,
+    cost_usd_nanos: i64,
+}
+
+struct EstimatedCostRow {
+    id: i64,
     day: String,
     repo_bucket: String,
     repo_name: String,
@@ -1647,8 +2014,8 @@ mod tests {
     use crate::pricing::ModelTokenPrices;
     use crate::rpc::TimestampMillis;
     use crate::usage::{
-        CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount, TokenUsageEventKey,
-        TokenUsageSignal, ToolCallEventKey,
+        ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsd, RepoIdentity, RepoName,
+        RepoPath, TokenCount, TokenUsageEventKey, TokenUsageSignal, ToolCallEventKey,
     };
 
     #[test]
@@ -2030,6 +2397,7 @@ mod tests {
             ],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         let query = CostRollupQuery::new(
@@ -2117,6 +2485,7 @@ mod tests {
                 1_781_956_800_000,
             )],
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
         store
             .connection
@@ -2161,6 +2530,7 @@ mod tests {
                 tool_call_record_for_repo(repo.clone(), "claude_code", "Write", 1_781_960_400_000),
             ],
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2182,6 +2552,57 @@ mod tests {
                 tool_name: ToolName::new("Write"),
                 call_count: 1,
             }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_usage_persists_content_records() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord::new(
+                ContentEventKey::new("content-event-1"),
+                TimestampMillis::new_for_test(1_781_956_800_000),
+                kvasir_repo("/repos/kvasir"),
+                HarnessName::new("opencode"),
+                ContentKind::AssistantMessage,
+                ContentText::new("stored assistant text").unwrap(),
+            )],
+        })?;
+
+        let row = store.connection.query_row(
+            "SELECT repo_bucket, repo_name, repo_path, harness, content_kind, content
+             FROM canonical_content_records",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+
+        assert_eq!(
+            row,
+            (
+                REPO_BUCKET.to_owned(),
+                "kvasir".to_owned(),
+                "/repos/kvasir".to_owned(),
+                "opencode".to_owned(),
+                "assistant_message".to_owned(),
+                "stored assistant text".to_owned(),
+            )
         );
 
         Ok(())
@@ -2299,6 +2720,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2351,6 +2773,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2410,6 +2833,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2461,6 +2885,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2497,6 +2922,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords {
             token_usage: vec![usage_record(
@@ -2515,6 +2941,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -2775,6 +3202,7 @@ mod tests {
             )],
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
+            content: Vec::new(),
         })?;
 
         assert_eq!(
@@ -3339,6 +3767,303 @@ mod tests {
     }
 
     #[test]
+    fn token_rollups_prefer_metrics_when_later_opencode_trace_metrics_overlap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![
+                token_usage_record_from_signal(
+                    TokenUsageSignal::OpenCodeTraces,
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_800_000,
+                    1_781_956_700_000,
+                    100,
+                ),
+                token_usage_record_from_signal(
+                    TokenUsageSignal::OpenCodeTraces,
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Output,
+                    1_781_956_800_000,
+                    1_781_956_700_000,
+                    50,
+                ),
+            ],
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+        })?;
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record_for_repo(
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Input,
+                1_781_956_900_000,
+                1_781_956_650_000,
+                100,
+            ),
+            usage_record_for_repo(
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Output,
+                1_781_956_900_000,
+                1_781_956_650_000,
+                50,
+            ),
+        ]))?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-4.1"),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-4.1"),
+                cost_usd: CostUsd::from_nanos(600_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_rollups_keep_non_overlapping_opencode_and_metric_usage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![token_usage_record_from_signal(
+                TokenUsageSignal::OpenCodeTraces,
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                100,
+            )],
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+        })?;
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record_for_repo(
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Input,
+                1_781_956_900_000,
+                1_781_956_650_000,
+                200,
+            ),
+        ]))?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-4.1"),
+                input_tokens: 300,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-4.1"),
+                cost_usd: CostUsd::from_nanos(600_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn later_metric_supersedes_only_one_matching_opencode_trace_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![
+                token_usage_record_from_signal(
+                    TokenUsageSignal::OpenCodeTraces,
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_800_000,
+                    1_781_956_700_000,
+                    100,
+                ),
+                token_usage_record_from_signal(
+                    TokenUsageSignal::OpenCodeTraces,
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_810_000,
+                    1_781_956_710_000,
+                    100,
+                ),
+            ],
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+        })?;
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record_for_repo(
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Input,
+                1_781_956_900_000,
+                1_781_956_650_000,
+                100,
+            ),
+        ]))?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-4.1"),
+                input_tokens: 200,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-4.1"),
+                cost_usd: CostUsd::from_nanos(400_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn earlier_metric_supersedes_only_one_later_matching_opencode_trace_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            usage_record_for_repo(
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Input,
+                1_781_956_700_000,
+                1_781_956_650_000,
+                100,
+            ),
+        ]))?;
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![
+                token_usage_record_from_signal(
+                    TokenUsageSignal::OpenCodeTraces,
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_800_000,
+                    1_781_956_700_000,
+                    100,
+                ),
+                token_usage_record_from_signal(
+                    TokenUsageSignal::OpenCodeTraces,
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_810_000,
+                    1_781_956_710_000,
+                    100,
+                ),
+            ],
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+        })?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-4.1"),
+                input_tokens: 200,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-4.1"),
+                cost_usd: CostUsd::from_nanos(400_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn non_authoritative_token_details_are_delta_normalized()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -3879,6 +4604,7 @@ mod tests {
                 duration_ms: 1_000,
                 tool_name: None,
             }],
+            content: Vec::new(),
         })?;
         assert_eq!(store.traces(trace_query)?.len(), 1);
         drop(store);
@@ -4178,9 +4904,9 @@ mod tests {
         let connection = open_raw_test_connection(&database_path)?;
         connection.execute_batch(
             "CREATE TABLE keep_me (value TEXT NOT NULL);
-            INSERT INTO keep_me (value) VALUES ('still here');
-            PRAGMA user_version = 7;",
+            INSERT INTO keep_me (value) VALUES ('still here');",
         )?;
+        connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)?;
         drop(connection);
 
         let result = UsageStore::open(&database_path, &test_store_key());
@@ -4188,9 +4914,9 @@ mod tests {
         assert!(matches!(
             result,
             Err(StoreError::IncompatibleSchema {
-                found: 7,
+                found,
                 supported: CURRENT_SCHEMA_VERSION,
-            })
+            }) if found == CURRENT_SCHEMA_VERSION + 1
         ));
 
         let connection = open_raw_test_connection(&database_path)?;
