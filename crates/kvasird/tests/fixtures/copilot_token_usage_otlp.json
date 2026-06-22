@@ -1,0 +1,64 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "github-copilot" } },
+          { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+          { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "github.copilot.chat.tokens",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "asInt": "1200",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-4.1" } },
+                      { "key": "direction", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781956700000000000",
+                    "timeUnixNano": "1781956800000000000",
+                    "asInt": "450",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-4.1" } },
+                      { "key": "direction", "value": { "stringValue": "output" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781960300000000000",
+                    "timeUnixNano": "1781960400000000000",
+                    "asInt": "100",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "direction", "value": { "stringValue": "input" } }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1781960300000000000",
+                    "timeUnixNano": "1781960400000000000",
+                    "asInt": "20",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "gpt-5.4" } },
+                      { "key": "direction", "value": { "stringValue": "output" } }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -154,6 +154,83 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
 }
 
 #[tokio::test]
+async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!("fixtures/copilot_token_usage_otlp.json"))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let token_query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), token_query).await?,
+        vec![
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("gpt-4.1"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 0,
+            },
+            TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_tokens: 0,
+            }
+        ]
+    );
+
+    let cost_query = CostRollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_cost_rollup(rpc_socket_path, cost_query).await?,
+        vec![
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("gpt-4.1"),
+                cost_usd: CostUsd::from_nanos(6_000_000).unwrap(),
+                source: CostSource::Estimated,
+            },
+            CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(550_000).unwrap(),
+                source: CostSource::Estimated,
+            }
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
