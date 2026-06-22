@@ -167,7 +167,8 @@ impl CodexConfigToml {
             CODEX_OTEL_BLOCK_START,
             CODEX_OTEL_BLOCK_END,
         )?;
-        let toml = insert_codex_otel_block(&unmanaged_config, config)?;
+        let line_ending = preferred_line_ending(&unmanaged_config, existing_config);
+        let toml = insert_codex_otel_block(&unmanaged_config, config, line_ending)?;
         Ok(Self { toml })
     }
 
@@ -188,11 +189,13 @@ impl CopilotShellProfile {
             COPILOT_OTEL_BLOCK_START,
             COPILOT_OTEL_BLOCK_END,
         )?;
+        let line_ending = preferred_line_ending(&unmanaged_profile, existing_profile);
         let mut shell = unmanaged_profile.trim_end().to_owned();
         if !shell.is_empty() {
-            shell.push_str("\n\n");
+            shell.push_str(line_ending);
+            shell.push_str(line_ending);
         }
-        shell.push_str(&copilot_otel_block(config));
+        shell.push_str(&copilot_otel_block(config, line_ending));
         Ok(Self { shell })
     }
 
@@ -212,16 +215,16 @@ fn managed_env_keys_from_root(root: &Map<String, Value>) -> Vec<String> {
         .collect()
 }
 
-fn copilot_otel_block(config: &SetupConfig) -> String {
+fn copilot_otel_block(config: &SetupConfig, line_ending: &str) -> String {
     format!(
-        "{COPILOT_OTEL_BLOCK_START}\n\
-         export OTEL_EXPORTER_OTLP_ENDPOINT={}\n\
-         export OTEL_EXPORTER_OTLP_HEADERS={}\n\
-         export OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'\n\
-         export OTEL_LOGS_EXPORTER='otlp'\n\
-         export OTEL_METRICS_EXPORTER='otlp'\n\
-         export OTEL_TRACES_EXPORTER='otlp'\n\
-         {COPILOT_OTEL_BLOCK_END}\n",
+        "{COPILOT_OTEL_BLOCK_START}{line_ending}\
+         export OTEL_EXPORTER_OTLP_ENDPOINT={}\
+         {line_ending}export OTEL_EXPORTER_OTLP_HEADERS={}\
+         {line_ending}export OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'\
+         {line_ending}export OTEL_LOGS_EXPORTER='otlp'\
+         {line_ending}export OTEL_METRICS_EXPORTER='otlp'\
+         {line_ending}export OTEL_TRACES_EXPORTER='otlp'\
+         {line_ending}{COPILOT_OTEL_BLOCK_END}{line_ending}",
         shell_single_quote(config.endpoint.as_str()),
         shell_single_quote(&format!(
             "Authorization={}",
@@ -243,22 +246,22 @@ fn shell_single_quote(value: &str) -> String {
     quoted
 }
 
-fn codex_otel_block(config: &SetupConfig) -> String {
+fn codex_otel_block(config: &SetupConfig, line_ending: &str) -> String {
     format!(
-        "{CODEX_OTEL_BLOCK_START}\n\
-         [otel]\n\
+        "{CODEX_OTEL_BLOCK_START}{line_ending}\
+         [otel]{line_ending}\
          {}\
-         {CODEX_OTEL_BLOCK_END}\n",
-        codex_otel_assignments(config),
+         {CODEX_OTEL_BLOCK_END}{line_ending}",
+        codex_otel_assignments(config, line_ending),
     )
 }
 
-fn codex_otel_assignments(config: &SetupConfig) -> String {
+fn codex_otel_assignments(config: &SetupConfig, line_ending: &str) -> String {
     format!(
-        "log_user_prompt = true\n\
-         exporter = {{ otlp-http = {{ endpoint = \"{}\", protocol = \"binary\", headers = {{ \"Authorization\" = \"{}\" }} }} }}\n\
-         trace_exporter = {{ otlp-http = {{ endpoint = \"{}\", protocol = \"binary\", headers = {{ \"Authorization\" = \"{}\" }} }} }}\n\
-         metrics_exporter = {{ otlp-http = {{ endpoint = \"{}\", protocol = \"binary\", headers = {{ \"Authorization\" = \"{}\" }} }} }}\n",
+        "log_user_prompt = true{line_ending}\
+         exporter = {{ otlp-http = {{ endpoint = \"{}\", protocol = \"binary\", headers = {{ \"Authorization\" = \"{}\" }} }} }}{line_ending}\
+         trace_exporter = {{ otlp-http = {{ endpoint = \"{}\", protocol = \"binary\", headers = {{ \"Authorization\" = \"{}\" }} }} }}{line_ending}\
+         metrics_exporter = {{ otlp-http = {{ endpoint = \"{}\", protocol = \"binary\", headers = {{ \"Authorization\" = \"{}\" }} }} }}{line_ending}",
         toml_basic_string_content(&otlp_logs_endpoint(config.endpoint.as_str())),
         toml_basic_string_content(&config.bearer_token.authorization_header()),
         toml_basic_string_content(&otlp_signal_endpoint(config.endpoint.as_str(), "traces")),
@@ -276,7 +279,11 @@ fn otlp_signal_endpoint(endpoint: &str, signal: &str) -> String {
     format!("{}/v1/{signal}", endpoint.trim_end_matches('/'))
 }
 
-fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> Result<String, SetupError> {
+fn insert_codex_otel_block(
+    existing: &str,
+    config: &SetupConfig,
+    line_ending: &str,
+) -> Result<String, SetupError> {
     let mut output = String::with_capacity(existing.len() + 512);
     let mut inserted = false;
     let mut inside_otel_table = false;
@@ -294,27 +301,30 @@ fn insert_codex_otel_block(existing: &str, config: &SetupConfig) -> Result<Strin
             return Err(SetupError::ConflictingCodexOtelKeys);
         }
 
-        output.push_str(line);
+        push_line_with_ending(&mut output, line, line_ending);
         if !inserted && table_header == Some("otel") {
-            ensure_line_break(&mut output);
+            ensure_line_break(&mut output, line_ending);
             output.push_str(CODEX_OTEL_BLOCK_START);
-            output.push('\n');
-            output.push_str(&codex_otel_assignments(config));
+            output.push_str(line_ending);
+            output.push_str(&codex_otel_assignments(config, line_ending));
             output.push_str(CODEX_OTEL_BLOCK_END);
-            output.push('\n');
+            output.push_str(line_ending);
             inserted = true;
         }
     }
 
     if inserted {
-        return Ok(output.trim_end().to_owned() + "\n");
+        let mut toml = output.trim_end().to_owned();
+        toml.push_str(line_ending);
+        return Ok(toml);
     }
 
     let mut toml = existing.trim_end().to_owned();
     if !toml.is_empty() {
-        toml.push_str("\n\n");
+        toml.push_str(line_ending);
+        toml.push_str(line_ending);
     }
-    toml.push_str(&codex_otel_block(config));
+    toml.push_str(&codex_otel_block(config, line_ending));
     Ok(toml)
 }
 
@@ -381,7 +391,7 @@ fn remove_managed_block(
 
         if skip_one_boundary_blank_line {
             skip_one_boundary_blank_line = false;
-            if marker_candidate.trim().is_empty() && output.ends_with("\n\n") {
+            if marker_candidate.trim().is_empty() && ends_with_blank_line_pair(&output) {
                 continue;
             }
         }
@@ -465,15 +475,71 @@ fn managed_marker_identifier(marker: &str) -> Option<&str> {
         .find(|word| matches!(*word, "CODEX" | "COPILOT"))
 }
 
-fn trim_one_blank_line_at_removal_boundary(output: &mut String) {
-    if output.ends_with("\n\n") {
-        output.truncate(output.len() - 1);
+fn dominant_line_ending(text: &str) -> &'static str {
+    let crlf_count = text
+        .as_bytes()
+        .windows(2)
+        .filter(|bytes| *bytes == b"\r\n")
+        .count();
+    let lf_count = text
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let lone_lf_count = lf_count.saturating_sub(crlf_count);
+
+    if crlf_count > lone_lf_count {
+        "\r\n"
+    } else {
+        "\n"
     }
 }
 
-fn ensure_line_break(output: &mut String) {
+fn preferred_line_ending(unmanaged: &str, original: &str) -> &'static str {
+    if unmanaged.contains('\n') {
+        dominant_line_ending(unmanaged)
+    } else {
+        dominant_line_ending(original)
+    }
+}
+
+fn ends_with_blank_line_pair(output: &str) -> bool {
+    let Some(last_line_ending_len) = trailing_line_ending_len(output) else {
+        return false;
+    };
+    trailing_line_ending_len(&output[..output.len() - last_line_ending_len]).is_some()
+}
+
+fn push_line_with_ending(output: &mut String, line: &str, line_ending: &str) {
+    let Some(without_lf) = line.strip_suffix('\n') else {
+        output.push_str(line);
+        return;
+    };
+
+    output.push_str(without_lf.strip_suffix('\r').unwrap_or(without_lf));
+    output.push_str(line_ending);
+}
+
+fn trim_one_blank_line_at_removal_boundary(output: &mut String) {
+    if ends_with_blank_line_pair(output) {
+        let line_ending_len = trailing_line_ending_len(output).expect("line ending checked");
+        output.truncate(output.len() - line_ending_len);
+    }
+}
+
+fn trailing_line_ending_len(text: &str) -> Option<usize> {
+    if text.ends_with("\r\n") {
+        Some(2)
+    } else if text.ends_with('\n') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn ensure_line_break(output: &mut String, line_ending: &str) {
     if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
+        output.push_str(line_ending);
     }
 }
 

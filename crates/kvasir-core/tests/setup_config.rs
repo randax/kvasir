@@ -321,6 +321,80 @@ fn codex_config_toml_inserts_after_final_otel_header_without_concatenating_marke
 }
 
 #[test]
+fn codex_config_toml_preserves_crlf_when_inserting_managed_otel_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CodexConfigToml::generate(
+        "model = \"gpt-5.4\"\r\n\r\n[otel]\r\nenvironment = \"dev\"\r\n",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_no_lone_lf(generated.as_str());
+    assert!(
+        generated
+            .as_str()
+            .contains("[otel]\r\n# BEGIN KVASIR MANAGED CODEX OTEL\r\n")
+    );
+    assert!(generated.as_str().contains("environment = \"dev\"\r\n"));
+    Ok(())
+}
+
+#[test]
+fn codex_config_toml_normalizes_mixed_line_endings_to_dominant_crlf()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CodexConfigToml::generate(
+        "model = \"gpt-5.4\"\r\n\r\n[otel]\nenvironment = \"dev\"\r\n",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_no_lone_lf(generated.as_str());
+    assert!(
+        generated
+            .as_str()
+            .contains("model = \"gpt-5.4\"\r\n\r\n[otel]\r\n# BEGIN")
+    );
+    assert!(
+        generated
+            .as_str()
+            .contains("# END KVASIR MANAGED CODEX OTEL\r\nenvironment = \"dev\"\r\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_config_toml_prefers_unmanaged_lf_over_removed_crlf_managed_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CodexConfigToml::generate(
+        "model = \"gpt-5.4\"\n\n# BEGIN KVASIR MANAGED CODEX OTEL\r\n[otel]\r\nlog_user_prompt = false\r\nexporter = \"none\"\r\ntrace_exporter = \"none\"\r\nmetrics_exporter = \"none\"\r\n# END KVASIR MANAGED CODEX OTEL\r\n\n[tools]\nview_image = true\n",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_no_cr(generated.as_str());
+    assert!(
+        generated
+            .as_str()
+            .contains("model = \"gpt-5.4\"\n\n[tools]")
+    );
+    assert!(
+        generated
+            .as_str()
+            .contains("[tools]\nview_image = true\n\n# BEGIN KVASIR MANAGED CODEX OTEL\n")
+    );
+    Ok(())
+}
+
+#[test]
 fn codex_config_toml_recognizes_existing_otel_table_with_inline_comment()
 -> Result<(), Box<dyn std::error::Error>> {
     let generated = CodexConfigToml::generate(
@@ -545,6 +619,74 @@ export OTEL_TRACES_EXPORTER='otlp'
     );
     assert!(!second.as_str().contains("first-token"));
     assert!(!second.as_str().contains("http://old.example"));
+    Ok(())
+}
+
+#[test]
+fn copilot_shell_profile_preserves_crlf_when_replacing_managed_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CopilotShellProfile::generate(
+        "alias ll='ls -la'\r\n\r\n# BEGIN KVASIR MANAGED COPILOT OTEL\r\nexport OTEL_EXPORTER_OTLP_ENDPOINT='http://old.example'\r\n# END KVASIR MANAGED COPILOT OTEL\r\n\r\nexport EDITOR='vim'\r\n",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_no_lone_lf(generated.as_str());
+    assert_eq!(
+        generated.as_str(),
+        "alias ll='ls -la'\r\n\r\nexport EDITOR='vim'\r\n\r\n# BEGIN KVASIR MANAGED COPILOT OTEL\r\nexport OTEL_EXPORTER_OTLP_ENDPOINT='http://127.0.0.1:4318'\r\nexport OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer test-token'\r\nexport OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'\r\nexport OTEL_LOGS_EXPORTER='otlp'\r\nexport OTEL_METRICS_EXPORTER='otlp'\r\nexport OTEL_TRACES_EXPORTER='otlp'\r\n# END KVASIR MANAGED COPILOT OTEL\r\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn copilot_shell_profile_normalizes_mixed_line_endings_at_replacement_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CopilotShellProfile::generate(
+        "alias ll='ls -la'\r\n\r\n# BEGIN KVASIR MANAGED COPILOT OTEL\nexport OTEL_EXPORTER_OTLP_ENDPOINT='http://old.example'\r\n# END KVASIR MANAGED COPILOT OTEL\r\n\nexport EDITOR='vim'\r\n",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_no_lone_lf(generated.as_str());
+    assert!(
+        generated
+            .as_str()
+            .contains("alias ll='ls -la'\r\n\r\nexport EDITOR='vim'\r\n\r\n# BEGIN")
+    );
+    assert!(!generated.as_str().contains("\r\n\r\n\r\nexport EDITOR"));
+    Ok(())
+}
+
+#[test]
+fn copilot_shell_profile_prefers_unmanaged_lf_over_removed_crlf_managed_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = CopilotShellProfile::generate(
+        "alias ll='ls -la'\n\n# BEGIN KVASIR MANAGED COPILOT OTEL\r\nexport OTEL_EXPORTER_OTLP_ENDPOINT='http://old.example'\r\nexport OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer old-token'\r\nexport OTEL_LOGS_EXPORTER='otlp'\r\nexport OTEL_TRACES_EXPORTER='otlp'\r\n# END KVASIR MANAGED COPILOT OTEL\r\n\nexport EDITOR='vim'\n",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_no_cr(generated.as_str());
+    assert!(
+        generated
+            .as_str()
+            .contains("alias ll='ls -la'\n\nexport EDITOR='vim'")
+    );
+    assert!(
+        generated
+            .as_str()
+            .contains("export EDITOR='vim'\n\n# BEGIN KVASIR MANAGED COPILOT OTEL\n")
+    );
     Ok(())
 }
 
@@ -796,4 +938,19 @@ fn kvasir_endpoint_is_generated_from_otlp_socket_address() {
     let endpoint = KvasirEndpoint::from_otlp_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 4318)));
 
     assert_eq!(endpoint.as_str(), "http://127.0.0.1:4318");
+}
+
+fn assert_no_lone_lf(value: &str) {
+    for (index, byte) in value.as_bytes().iter().enumerate() {
+        if *byte == b'\n' {
+            assert!(
+                index > 0 && value.as_bytes()[index - 1] == b'\r',
+                "found LF without preceding CR in {value:?}"
+            );
+        }
+    }
+}
+
+fn assert_no_cr(value: &str) {
+    assert!(!value.as_bytes().contains(&b'\r'), "found CR in {value:?}");
 }
