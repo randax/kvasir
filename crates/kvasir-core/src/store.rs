@@ -12,7 +12,7 @@ use crate::rpc::{
 };
 use crate::usage::{
     CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure,
-    TokenUsageRecord, ToolCallRecord, UsageRecords,
+    TokenUsageKind, TokenUsageRecord, ToolCallRecord, UsageRecords,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 5;
@@ -539,6 +539,10 @@ impl UsageStore {
                 PRIMARY KEY(repo_bucket, repo_name, repo_path, model, measure, counter_start_ms)
             );
 
+            CREATE TABLE IF NOT EXISTS token_delta_events (
+                event_key TEXT PRIMARY KEY
+            );
+
             CREATE TABLE IF NOT EXISTS canonical_cost_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_at_ms INTEGER NOT NULL,
@@ -657,7 +661,7 @@ impl UsageStore {
     ) -> Result<Vec<TokenUsageDelta>, StoreError> {
         let mut token_deltas = Vec::new();
         for record in records {
-            let Some(delta) = Self::counter_delta(transaction, record)? else {
+            let Some(delta) = Self::token_delta(transaction, record)? else {
                 continue;
             };
             let day = record.occurred_at.day().as_date().to_string();
@@ -1051,6 +1055,26 @@ impl UsageStore {
             Ok(None)
         } else {
             Ok(Some(delta))
+        }
+    }
+
+    fn token_delta(
+        transaction: &rusqlite::Transaction<'_>,
+        record: &TokenUsageRecord,
+    ) -> Result<Option<i64>, StoreError> {
+        match &record.kind {
+            TokenUsageKind::Cumulative => Self::counter_delta(transaction, record),
+            TokenUsageKind::Delta { event_key } => {
+                let inserted = transaction.execute(
+                    "INSERT OR IGNORE INTO token_delta_events (event_key) VALUES (?1)",
+                    params![event_key.as_str()],
+                )?;
+                if inserted == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(record.token_count.storage_value()))
+                }
+            }
         }
     }
 
@@ -1502,9 +1526,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::otlp::{parse_otlp_json_usage_metrics, parse_otlp_protobuf_usage_metrics};
     use crate::pricing::ModelTokenPrices;
     use crate::rpc::TimestampMillis;
-    use crate::usage::{CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount, ToolCallEventKey};
+    use crate::usage::{
+        CostUsd, RepoIdentity, RepoName, RepoPath, TokenCount, TokenUsageEventKey, ToolCallEventKey,
+    };
 
     #[test]
     fn reopens_encrypted_store_with_the_same_key() -> Result<(), Box<dyn std::error::Error>> {
@@ -2447,6 +2474,597 @@ mod tests {
     }
 
     #[test]
+    fn codex_metric_fixture_rolls_up_tokens_and_estimated_cost_by_repo_and_model()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        let records = parse_otlp_json_usage_metrics(include_bytes!(
+            "../tests/fixtures/codex_turn_token_usage_otlp.json"
+        ))?;
+        store.ingest_usage(&records)?;
+
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        );
+
+        assert_eq!(
+            store.token_rollups(query.clone())?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 80,
+            }]
+        );
+        assert_eq!(
+            store.token_rollups(query.with_repo(repo.clone()))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 80,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(9_770_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_codex_metric_replays_do_not_double_count_tokens_or_estimated_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        let records = parse_otlp_json_usage_metrics(include_bytes!(
+            "../tests/fixtures/codex_turn_token_usage_otlp.json"
+        ))?;
+        store.ingest_usage(&records)?;
+        store.ingest_usage(&records)?;
+
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 80,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(9_770_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_protobuf_metric_records_roll_up_tokens_and_estimated_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let records = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload(
+            repo.clone(),
+            vec![
+                ("input", 1200.0),
+                ("output", 450.0),
+                ("cached_input", 80.0),
+                ("total", 1730.0),
+            ],
+        ))?;
+
+        store.ingest_usage(&records)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 80,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(9_770_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn late_native_cost_replaces_codex_delta_estimated_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let records = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload(
+            repo.clone(),
+            vec![("input", 1200.0), ("output", 450.0), ("cached_input", 80.0)],
+        ))?;
+
+        store.ingest_usage(&records)?;
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: vec![cost_record_for_repo(
+                repo.clone(),
+                "gpt-5.4",
+                1_781_956_800_000,
+                1_781_956_799_000,
+                "0.02",
+            )],
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+        })?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: cost_usd("0.02"),
+                source: CostSource::Native,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_metric_rollups_keep_repo_and_model_buckets_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let kvasir_repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let other_repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("other"),
+            RepoPath::new("/repos/other"),
+        ));
+        let kvasir_gpt = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload_with_points(
+            kvasir_repo.clone(),
+            vec![codex_histogram_point(
+                "gpt-5.4",
+                "input",
+                100.0,
+                1_781_956_800_000_000_000,
+            )],
+        ))?;
+        let kvasir_mini = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload_with_points(
+            kvasir_repo.clone(),
+            vec![codex_histogram_point(
+                "gpt-5.4-mini",
+                "output",
+                50.0,
+                1_781_956_801_000_000_000,
+            )],
+        ))?;
+        let other_gpt = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload_with_points(
+            other_repo.clone(),
+            vec![codex_histogram_point(
+                "gpt-5.4",
+                "input",
+                75.0,
+                1_781_956_802_000_000_000,
+            )],
+        ))?;
+
+        store.ingest_usage(&kvasir_gpt)?;
+        store.ingest_usage(&kvasir_mini)?;
+        store.ingest_usage(&other_gpt)?;
+
+        let query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        );
+        assert_eq!(
+            store.token_rollups(query.clone())?,
+            vec![
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: kvasir_repo.clone(),
+                    model: ModelName::new("gpt-5.4"),
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: kvasir_repo.clone(),
+                    model: ModelName::new("gpt-5.4-mini"),
+                    input_tokens: 0,
+                    output_tokens: 50,
+                    cache_tokens: 0,
+                },
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: other_repo,
+                    model: ModelName::new("gpt-5.4"),
+                    input_tokens: 75,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            store.token_rollups(query.with_repo(kvasir_repo.clone()))?,
+            vec![
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: kvasir_repo.clone(),
+                    model: ModelName::new("gpt-5.4"),
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
+                TokenRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: kvasir_repo,
+                    model: ModelName::new("gpt-5.4-mini"),
+                    input_tokens: 0,
+                    output_tokens: 50,
+                    cache_tokens: 0,
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_estimated_cost_uses_configured_price_table() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let price_table = PriceTable::from_prices(vec![ModelTokenPrices::new(
+            ModelName::new("gpt-5.4"),
+            CostUsd::from_nanos(10).unwrap(),
+            CostUsd::from_nanos(20).unwrap(),
+            CostUsd::from_nanos(5).unwrap(),
+        )]);
+        let mut store = UsageStore::open_with_price_table(
+            temp.path().join("usage.sqlite3"),
+            &test_store_key(),
+            price_table,
+        )?;
+        let records = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload(
+            repo.clone(),
+            vec![("input", 1200.0), ("output", 450.0), ("cached_input", 80.0)],
+        ))?;
+
+        store.ingest_usage(&records)?;
+
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(21_400).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_delta_records_do_not_collapse_same_millisecond_turns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords::from_token_usage(vec![
+            codex_delta_record("codex-turn-1-input", "gpt-5.4", TokenMeasure::Input, 100),
+            codex_delta_record("codex-turn-2-input", "gpt-5.4", TokenMeasure::Input, 125),
+        ]))?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 225,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(562_500).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_codex_same_millisecond_points_with_matching_counts_remain_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let records = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload_with_points(
+            repo.clone(),
+            vec![
+                codex_histogram_point("gpt-5.4", "input", 100.0, 1_781_956_800_000_000_001),
+                codex_histogram_point("gpt-5.4", "input", 100.0, 1_781_956_800_000_000_002),
+            ],
+        ))?;
+
+        store.ingest_usage(&records)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 200,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(500_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_codex_identical_points_split_across_metrics_remain_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let records = parse_otlp_protobuf_usage_metrics(&codex_split_metric_histogram_payload(
+            repo.clone(),
+            codex_histogram_point("gpt-5.4", "input", 100.0, 1_781_956_800_000_000_000),
+            codex_histogram_point("gpt-5.4", "input", 100.0, 1_781_956_800_000_000_000),
+        ))?;
+
+        store.ingest_usage(&records)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 200,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(500_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_metric_replays_do_not_double_count_tokens_or_estimated_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let records = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload(
+            repo.clone(),
+            vec![("input", 1200.0), ("output", 450.0), ("cached_input", 80.0)],
+        ))?;
+
+        store.ingest_usage(&records)?;
+        store.ingest_usage(&records)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 80,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(9_770_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_metric_replays_dedupe_when_point_order_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ));
+        let input = codex_histogram_point("gpt-5.4", "input", 1200.0, 1_781_956_800_000_000_000);
+        let output = codex_histogram_point("gpt-5.4", "output", 450.0, 1_781_956_800_000_000_000);
+        let first = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload_with_points(
+            repo.clone(),
+            vec![input.clone(), output.clone()],
+        ))?;
+        let replay = parse_otlp_protobuf_usage_metrics(&codex_histogram_payload_with_points(
+            repo.clone(),
+            vec![output, input],
+        ))?;
+
+        store.ingest_usage(&first)?;
+        store.ingest_usage(&replay)?;
+
+        assert_eq!(
+            store.token_rollups(RollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-5.4"),
+                input_tokens: 1200,
+                output_tokens: 450,
+                cache_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            store.cost_rollups(CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![CostRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                model: ModelName::new("gpt-5.4"),
+                cost_usd: CostUsd::from_nanos(9_750_000).unwrap(),
+                source: CostSource::Estimated,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn opening_v2_schema_preserves_usage_and_adds_cost_columns()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -3015,6 +3633,183 @@ mod tests {
             measure,
             TokenCount::new(token_count),
         )
+    }
+
+    fn codex_delta_record(
+        event_key: &str,
+        model: &str,
+        measure: TokenMeasure,
+        token_count: u64,
+    ) -> TokenUsageRecord {
+        TokenUsageRecord::new_delta(
+            TokenUsageEventKey::new(event_key),
+            TimestampMillis::new_for_test(1_781_956_800_000),
+            TimestampMillis::new_for_test(1_781_956_799_000),
+            kvasir_repo("/not/persisted"),
+            ModelName::new(model),
+            measure,
+            TokenCount::new(token_count),
+        )
+    }
+
+    fn codex_histogram_payload(repo: RepoBucket, points: Vec<(&str, f64)>) -> Vec<u8> {
+        codex_histogram_payload_with_points(
+            repo,
+            points
+                .into_iter()
+                .map(|(token_type, sum)| {
+                    codex_histogram_point("gpt-5.4", token_type, sum, 1_781_956_800_000_000_000)
+                })
+                .collect(),
+        )
+    }
+
+    fn codex_histogram_payload_with_points(
+        repo: RepoBucket,
+        points: Vec<opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint>,
+    ) -> Vec<u8> {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Histogram, Metric, ResourceMetrics, ScopeMetrics, metric::Data,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use prost::Message;
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: repo_resource_attributes(repo),
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "codex.turn.token_usage".to_owned(),
+                        description: String::new(),
+                        unit: "{token}".to_owned(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Histogram(Histogram {
+                            data_points: points,
+                            aggregation_temporality: 1,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn codex_split_metric_histogram_payload(
+        repo: RepoBucket,
+        first: opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint,
+        second: opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint,
+    ) -> Vec<u8> {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Histogram, Metric, ResourceMetrics, ScopeMetrics, metric::Data,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use prost::Message;
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: repo_resource_attributes(repo),
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![
+                        Metric {
+                            name: "codex.turn.token_usage".to_owned(),
+                            description: String::new(),
+                            unit: "{token}".to_owned(),
+                            metadata: Vec::new(),
+                            data: Some(Data::Histogram(Histogram {
+                                data_points: vec![first],
+                                aggregation_temporality: 1,
+                            })),
+                        },
+                        Metric {
+                            name: "codex.turn.token_usage".to_owned(),
+                            description: String::new(),
+                            unit: "{token}".to_owned(),
+                            metadata: Vec::new(),
+                            data: Some(Data::Histogram(Histogram {
+                                data_points: vec![second],
+                                aggregation_temporality: 1,
+                            })),
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn codex_histogram_point(
+        model: &str,
+        token_type: &str,
+        sum: f64,
+        time_unix_nano: u64,
+    ) -> opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint {
+        opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint {
+            attributes: vec![
+                string_proto_attribute("model", model),
+                string_proto_attribute("token_type", token_type),
+            ],
+            start_time_unix_nano: time_unix_nano.saturating_sub(1_000_000_000),
+            time_unix_nano,
+            count: 1,
+            sum: Some(sum),
+            bucket_counts: Vec::new(),
+            explicit_bounds: Vec::new(),
+            exemplars: Vec::new(),
+            flags: 0,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn repo_resource_attributes(
+        repo: RepoBucket,
+    ) -> Vec<opentelemetry_proto::tonic::common::v1::KeyValue> {
+        match repo {
+            RepoBucket::NoRepo => Vec::new(),
+            RepoBucket::Repo(identity) => {
+                let mut attributes = Vec::new();
+                if let Some(name) = identity.name {
+                    attributes.push(string_proto_attribute("repo.name", name.as_str()));
+                }
+                if let Some(path) = identity.path {
+                    attributes.push(string_proto_attribute("repo.path", path.as_str()));
+                }
+                attributes
+            }
+        }
+    }
+
+    fn string_proto_attribute(
+        key: &str,
+        value: &str,
+    ) -> opentelemetry_proto::tonic::common::v1::KeyValue {
+        opentelemetry_proto::tonic::common::v1::KeyValue {
+            key: key.to_owned(),
+            key_strindex: 0,
+            value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                value: Some(
+                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                        value.to_owned(),
+                    ),
+                ),
+            }),
+        }
     }
 
     fn cost_record_for_repo(

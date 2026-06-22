@@ -97,6 +97,25 @@ impl TokenMeasure {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenUsageKind {
+    Cumulative,
+    Delta { event_key: TokenUsageEventKey },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsageEventKey(String);
+
+impl TokenUsageEventKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCount(u64);
 
@@ -126,6 +145,7 @@ pub struct TokenUsageRecord {
     pub model: ModelName,
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
+    pub kind: TokenUsageKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +379,27 @@ impl TokenUsageRecord {
             model,
             measure,
             token_count,
+            kind: TokenUsageKind::Cumulative,
+        }
+    }
+
+    pub fn new_delta(
+        event_key: TokenUsageEventKey,
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        repo: RepoBucket,
+        model: ModelName,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
+        Self {
+            occurred_at,
+            counter_start,
+            repo,
+            model,
+            measure,
+            token_count,
+            kind: TokenUsageKind::Delta { event_key },
         }
     }
 }

@@ -21,6 +21,8 @@ fn claude_code_settings_enable_kvasir_telemetry() -> Result<(), Box<dyn std::err
         json!({
             "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
             "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+            "CLAUDE_CODE_ENABLE_TRACE_BETA": "1",
+            "CLAUDE_CODE_ENABLE_CONTENT_GATES": "1",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer test-token",
             "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
@@ -39,6 +41,8 @@ fn claude_code_settings_enable_kvasir_telemetry() -> Result<(), Box<dyn std::err
         [
             "CLAUDE_CODE_ENABLE_TELEMETRY",
             "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+            "CLAUDE_CODE_ENABLE_TRACE_BETA",
+            "CLAUDE_CODE_ENABLE_CONTENT_GATES",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_EXPORTER_OTLP_HEADERS",
             "OTEL_EXPORTER_OTLP_PROTOCOL",
@@ -51,6 +55,25 @@ fn claude_code_settings_enable_kvasir_telemetry() -> Result<(), Box<dyn std::err
             "OTEL_TRACES_EXPORTER"
         ]
     );
+    assert_eq!(
+        generated["kvasirManaged"]["env"],
+        json!([
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+            "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+            "CLAUDE_CODE_ENABLE_TRACE_BETA",
+            "CLAUDE_CODE_ENABLE_CONTENT_GATES",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_LOGS_EXPORTER",
+            "OTEL_LOG_RAW_API_BODIES",
+            "OTEL_LOG_TOOL_CONTENT",
+            "OTEL_LOG_TOOL_DETAILS",
+            "OTEL_LOG_USER_PROMPTS",
+            "OTEL_METRICS_EXPORTER",
+            "OTEL_TRACES_EXPORTER"
+        ])
+    );
 
     Ok(())
 }
@@ -61,8 +84,13 @@ fn claude_code_settings_replace_only_kvasir_managed_env() -> Result<(), Box<dyn 
     let first = ClaudeCodeSettings::generate(
         r#"{
           "theme": "dark",
+          "kvasirManaged": {
+            "env": ["STALE_KEY"]
+          },
           "env": {
             "PATH": "/usr/bin",
+            "STALE_KEY": "remove-me",
+            "CLAUDE_CODE_ENABLE_TRACE_BETA": "0",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "http://old.example"
           }
         }"#,
@@ -94,6 +122,9 @@ fn claude_code_settings_replace_only_kvasir_managed_env() -> Result<(), Box<dyn 
     let generated: serde_json::Value = serde_json::from_str(second.as_str())?;
     assert_eq!(generated["theme"], "dark");
     assert_eq!(generated["env"]["PATH"], "/usr/bin");
+    assert!(generated["env"].get("STALE_KEY").is_none());
+    assert_eq!(generated["env"]["CLAUDE_CODE_ENABLE_TRACE_BETA"], "1");
+    assert_eq!(generated["env"]["CLAUDE_CODE_ENABLE_CONTENT_GATES"], "1");
     assert_eq!(
         generated["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"],
         "http://127.0.0.1:4319"
@@ -105,6 +136,10 @@ fn claude_code_settings_replace_only_kvasir_managed_env() -> Result<(), Box<dyn 
     assert_eq!(
         generated["env"]["OTEL_LOG_RAW_API_BODIES"],
         "file:/tmp/kvasir/new-raw-bodies"
+    );
+    assert_eq!(
+        generated["kvasirManaged"]["env"],
+        json!(second.managed_env_keys())
     );
 
     Ok(())
