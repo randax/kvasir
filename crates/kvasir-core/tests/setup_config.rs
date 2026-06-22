@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use kvasir_core::{
     BearerToken, ClaudeCodeSettings, CodexConfigToml, CopilotShellProfile, KvasirEndpoint,
-    RawBodyDirectory, SetupConfig,
+    OpenCodeSetup, RawBodyDirectory, SetupConfig,
 };
 use serde_json::json;
 
@@ -146,6 +146,56 @@ fn claude_code_settings_replace_only_kvasir_managed_env() -> Result<(), Box<dyn 
     );
 
     Ok(())
+}
+
+#[test]
+fn claude_code_settings_reject_non_object_settings() {
+    let err = ClaudeCodeSettings::generate(
+        "[]",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("Claude Code settings root must be an object");
+
+    assert!(matches!(err, kvasir_core::SetupError::SettingsNotObject));
+}
+
+#[test]
+fn claude_code_settings_reject_invalid_json() {
+    let err = ClaudeCodeSettings::generate(
+        "{",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("invalid Claude Code settings JSON must be rejected");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::InvalidSettingsJson(_)
+    ));
+}
+
+#[test]
+fn claude_code_settings_reject_non_object_env() {
+    let err = ClaudeCodeSettings::generate(
+        r#"{
+  "env": []
+}"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("Claude Code settings env field must be an object");
+
+    assert!(matches!(err, kvasir_core::SetupError::EnvNotObject));
 }
 
 #[test]
@@ -509,6 +559,236 @@ exporter = { otlp-http = { endpoint = "http://old.example/v1/logs", protocol = "
     assert!(matches!(
         err,
         kvasir_core::SetupError::MalformedManagedBlock
+    ));
+}
+
+#[test]
+fn opencode_setup_generates_otlp_env_and_enables_open_telemetry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let generated = OpenCodeSetup::generate(
+        r#"{
+  "theme": "system"
+}"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_eq!(
+        generated.env().otlp_endpoint().as_str(),
+        "http://127.0.0.1:4318"
+    );
+    assert_eq!(
+        generated.env().otlp_headers(),
+        "Authorization=Bearer test-token"
+    );
+
+    let opencode_json: serde_json::Value = serde_json::from_str(generated.opencode_json())?;
+    assert_eq!(opencode_json["theme"], "system");
+    assert_eq!(opencode_json["experimental"]["openTelemetry"], true);
+    assert_eq!(
+        opencode_json["kvasirManaged"]["experimental"],
+        json!(generated.managed_experimental_keys())
+    );
+
+    Ok(())
+}
+
+#[test]
+fn opencode_setup_replaces_only_kvasir_managed_experimental_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first = OpenCodeSetup::generate(
+        r#"{
+  "theme": "system",
+  "experimental": {
+    "localFeature": false,
+    "openTelemetry": false
+  },
+  "kvasirManaged": {
+    "experimental": ["localFeature"],
+    "futureSection": ["futureKey"]
+  }
+}"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("first-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+    let second = OpenCodeSetup::generate(
+        first.opencode_json(),
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4319"),
+            BearerToken::new("second-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+    let third = OpenCodeSetup::generate(
+        second.opencode_json(),
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4319"),
+            BearerToken::new("second-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert_eq!(second.opencode_json(), third.opencode_json());
+    assert_eq!(
+        second.env().otlp_endpoint().as_str(),
+        "http://127.0.0.1:4319"
+    );
+    assert_eq!(
+        second.env().otlp_headers(),
+        "Authorization=Bearer second-token"
+    );
+
+    let opencode_json: serde_json::Value = serde_json::from_str(second.opencode_json())?;
+    assert_eq!(opencode_json["theme"], "system");
+    assert_eq!(opencode_json["experimental"]["localFeature"], false);
+    assert_eq!(opencode_json["experimental"]["openTelemetry"], true);
+    assert_eq!(
+        opencode_json["kvasirManaged"]["experimental"],
+        json!(second.managed_experimental_keys())
+    );
+    assert_eq!(
+        opencode_json["kvasirManaged"]["futureSection"],
+        json!(["futureKey"])
+    );
+    assert!(!second.opencode_json().contains("first-token"));
+    assert!(!second.opencode_json().contains("second-token"));
+
+    Ok(())
+}
+
+#[test]
+fn opencode_setup_rejects_invalid_json() {
+    let err = OpenCodeSetup::generate(
+        "{",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("invalid OpenCode JSON must be rejected");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::InvalidOpenCodeConfigJson(_)
+    ));
+}
+
+#[test]
+fn opencode_setup_rejects_non_object_config() {
+    let err = OpenCodeSetup::generate(
+        "[]",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("OpenCode config root must be an object");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::OpenCodeConfigNotObject
+    ));
+}
+
+#[test]
+fn opencode_setup_rejects_non_object_experimental_config() {
+    let err = OpenCodeSetup::generate(
+        r#"{
+  "experimental": []
+}"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("OpenCode experimental config must be an object");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::OpenCodeExperimentalNotObject
+    ));
+}
+
+#[test]
+fn opencode_setup_rejects_non_object_kvasir_managed_block() {
+    let err = OpenCodeSetup::generate(
+        r#"{
+  "kvasirManaged": "user-data"
+}"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("OpenCode kvasir managed block must be an object");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::OpenCodeManagedBlockNotObject
+    ));
+}
+
+#[test]
+fn opencode_setup_rejects_control_characters_in_endpoint_env() {
+    let err = OpenCodeSetup::generate(
+        "{}",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318\nnext"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("OpenCode endpoint env must reject control characters");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::InvalidOpenCodeOtlpEndpointEnvValue
+    ));
+}
+
+#[test]
+fn opencode_setup_rejects_header_delimiters_in_bearer_token_env() {
+    let err = OpenCodeSetup::generate(
+        "{}",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token,Other=header"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("OpenCode OTLP headers env must reject extra header delimiters");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::InvalidOpenCodeOtlpHeadersEnvValue
+    ));
+}
+
+#[test]
+fn opencode_setup_rejects_control_characters_in_bearer_token_env() {
+    let err = OpenCodeSetup::generate(
+        "{}",
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token\nOther=header"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )
+    .expect_err("OpenCode OTLP headers env must reject control characters");
+
+    assert!(matches!(
+        err,
+        kvasir_core::SetupError::InvalidOpenCodeOtlpHeadersEnvValue
     ));
 }
 
