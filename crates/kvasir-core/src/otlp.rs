@@ -2038,6 +2038,9 @@ fn content_event_key(
     canonical.push_str("occurred_at_nanos=");
     canonical.push_str(&occurred_at_nanos.to_string());
     canonical.push('\n');
+    canonical.push_str("content_len=");
+    canonical.push_str(&content.len().to_string());
+    canonical.push('\n');
     canonical.push_str("content_fingerprint=");
     canonical.push_str(&content_fingerprint(content));
     canonical.push('\n');
@@ -2045,12 +2048,17 @@ fn content_event_key(
 }
 
 fn content_fingerprint(content: &str) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut forward_hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in content.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        forward_hash ^= u64::from(*byte);
+        forward_hash = forward_hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{hash:016x}")
+    let mut reverse_hash = 0xaf63_dc4c_8601_ec8c_u64;
+    for byte in content.as_bytes().iter().rev() {
+        reverse_hash ^= u64::from(*byte);
+        reverse_hash = reverse_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{forward_hash:016x}{reverse_hash:016x}")
 }
 
 fn trace_token_usage_event_key(
@@ -2226,7 +2234,7 @@ fn is_opencode_content_event(
     matches!(
         event_name
             .and_then(|value| meaningful_attribute(Some(value.to_owned())))
-            .or_else(attribute_event_name)
+            .or_else(|| meaningful_attribute(attribute_event_name()))
             .as_deref(),
         Some("opencode.content")
     )
@@ -3416,9 +3424,9 @@ mod tests {
                     "logRecords": [
                         {
                             "timeUnixNano": "1781956800000000000",
-                            "eventName": "opencode.content",
                             "body": { "stringValue": "stored assistant text" },
                             "attributes": [
+                                { "key": "event.name", "value": { "stringValue": " opencode.content " } },
                                 { "key": "content.opt_in", "value": { "boolValue": true } },
                                 { "key": "content.type", "value": { "stringValue": "assistant_message" } }
                             ]
@@ -3693,6 +3701,7 @@ mod tests {
                         )),
                     }),
                     attributes: vec![
+                        string_attribute("event.name", " opencode.content "),
                         bool_attribute("content.opt_in", true),
                         string_attribute("content.type", "assistant_message"),
                     ],
@@ -3700,7 +3709,7 @@ mod tests {
                     flags: 0,
                     trace_id: Vec::new(),
                     span_id: Vec::new(),
-                    event_name: "opencode.content".to_owned(),
+                    event_name: String::new(),
                 },
                 LogRecord {
                     time_unix_nano: 1_781_956_801_000_000_000,

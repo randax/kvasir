@@ -275,7 +275,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         query_token_rollup(rpc_socket_path.clone(), token_query).await?,
         vec![TokenRollup {
             day: RollupDay::parse("2026-06-20")?,
-            repo: opencode_kvasir_repo(),
+            repo: kvasir_repo(),
             model: ModelName::new("gpt-4.1"),
             input_tokens: 1200,
             output_tokens: 450,
@@ -291,7 +291,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         query_cost_rollup(rpc_socket_path.clone(), cost_query).await?,
         vec![CostRollup {
             day: RollupDay::parse("2026-06-20")?,
-            repo: opencode_kvasir_repo(),
+            repo: kvasir_repo(),
             model: ModelName::new("gpt-4.1"),
             cost_usd: CostUsd::from_nanos(6_040_000).unwrap(),
             source: CostSource::Estimated,
@@ -306,7 +306,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         query_tool_call_rollup(rpc_socket_path.clone(), tool_query).await?,
         vec![ToolCallRollup {
             day: RollupDay::parse("2026-06-20")?,
-            repo: opencode_kvasir_repo(),
+            repo: kvasir_repo(),
             harness: HarnessName::new("opencode"),
             tool_name: ToolName::new("Read"),
             call_count: 1,
@@ -370,7 +370,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
         query_token_rollup(rpc_socket_path.clone(), query).await?,
         vec![TokenRollup {
             day: RollupDay::parse("2026-06-20")?,
-            repo: opencode_kvasir_repo(),
+            repo: kvasir_repo(),
             model: ModelName::new("gpt-4.1"),
             input_tokens: 1200,
             output_tokens: 450,
@@ -389,7 +389,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
         .await?,
         vec![ToolCallRollup {
             day: RollupDay::parse("2026-06-20")?,
-            repo: opencode_kvasir_repo(),
+            repo: kvasir_repo(),
             harness: HarnessName::new("opencode"),
             tool_name: ToolName::new("Read"),
             call_count: 1,
@@ -407,7 +407,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
         .await?,
         vec![CostRollup {
             day: RollupDay::parse("2026-06-20")?,
-            repo: opencode_kvasir_repo(),
+            repo: kvasir_repo(),
             model: ModelName::new("gpt-4.1"),
             cost_usd: CostUsd::from_nanos(6_040_000).unwrap(),
             source: CostSource::Estimated,
@@ -1404,13 +1404,6 @@ async fn start_test_daemon(config: DaemonConfig) -> anyhow::Result<RunningDaemon
 }
 
 fn kvasir_repo() -> RepoBucket {
-    RepoBucket::repo(RepoIdentity::new(
-        RepoName::new("kvasir"),
-        RepoPath::new("/Users/oyr/projects/kvasir"),
-    ))
-}
-
-fn opencode_kvasir_repo() -> RepoBucket {
     RepoBucket::repo(RepoIdentity::new(
         RepoName::new("kvasir"),
         RepoPath::new("/Users/oyr/projects/kvasir"),
