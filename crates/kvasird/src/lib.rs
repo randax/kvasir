@@ -31,6 +31,8 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+mod setup;
+
 const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_RPC_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -39,6 +41,8 @@ const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
+
+pub use setup::{KeychainSetupSecretSource, SetupSecretSource};
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
