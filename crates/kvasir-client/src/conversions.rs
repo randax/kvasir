@@ -69,6 +69,7 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
 impl From<KvasirTraceQuery> for TraceQuery {
     fn from(query: KvasirTraceQuery) -> Self {
         Self {
+            harness: query.harness.into_core(),
             session_id: query.session_id.into_core(),
             prompt_id: query.prompt_id.into_core(),
         }

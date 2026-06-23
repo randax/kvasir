@@ -386,6 +386,7 @@ impl ContentText {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceSpanRecord {
+    pub harness: HarnessName,
     pub session_id: SessionId,
     pub prompt_id: PromptId,
     pub trace_id: TraceId,

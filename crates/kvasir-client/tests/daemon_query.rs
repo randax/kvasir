@@ -136,6 +136,7 @@ async fn client_queries_claude_trace_by_session_and_prompt() -> anyhow::Result<(
     let traces = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
         client.trace(KvasirTraceQuery {
+            harness: harness("claude"),
             session_id: session("session-12"),
             prompt_id: prompt("prompt-7"),
         })
@@ -266,6 +267,7 @@ async fn client_retrieves_trace_response_above_previous_rpc_response_cap() -> an
     let traces = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
         client.trace(KvasirTraceQuery {
+            harness: harness("claude"),
             session_id: session("session-large"),
             prompt_id: prompt("prompt-large"),
         })
@@ -310,6 +312,7 @@ async fn client_keeps_distinct_trace_ids_for_the_same_session_prompt() -> anyhow
     let traces = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
         client.trace(KvasirTraceQuery {
+            harness: harness("claude"),
             session_id: session("session-12"),
             prompt_id: prompt("prompt-7"),
         })
@@ -329,6 +332,75 @@ async fn client_keeps_distinct_trace_ids_for_the_same_session_prompt() -> anyhow
     );
     assert_eq!(traces[0].durations.request_ms, Some(2_000));
     assert_eq!(traces[1].durations.request_ms, Some(1_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_scopes_trace_replay_by_harness() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(codex_trace_reusing_claude_identity_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let claude_socket_path = rpc_socket_path.clone();
+    let claude_traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(claude_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            harness: harness("claude"),
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+        })
+    })
+    .await??;
+    let codex_traces = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.trace(KvasirTraceQuery {
+            harness: harness("codex"),
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+        })
+    })
+    .await??;
+
+    assert_eq!(claude_traces.len(), 1);
+    assert_eq!(claude_traces[0].spans.len(), 5);
+    assert_eq!(
+        claude_traces[0].spans[0].name,
+        span_name("claude.interaction")
+    );
+    assert_eq!(codex_traces.len(), 1);
+    assert_eq!(codex_traces[0].spans.len(), 1);
+    assert_eq!(
+        codex_traces[0].spans[0].name,
+        span_name("codex.interaction")
+    );
 
     Ok(())
 }
@@ -361,6 +433,7 @@ async fn client_queries_protobuf_claude_trace_by_session_and_prompt() -> anyhow:
     let traces = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
         client.trace(KvasirTraceQuery {
+            harness: harness("claude"),
             session_id: session("session-12"),
             prompt_id: prompt("prompt-7"),
         })
@@ -454,6 +527,216 @@ async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn client_queries_claude_content_replay_from_opted_in_logs() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("claude"),
+            session_id: session("claude-session-1"),
+            prompt_id: prompt("claude-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("claude-session-1"),
+            prompt_id: prompt("claude-turn-1"),
+            items: vec![
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_802_180,
+                    },
+                    harness: harness("claude"),
+                    kind: KvasirContentKind::UserPrompt,
+                    content: content_text("explain this repository"),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_802_220,
+                    },
+                    harness: harness("claude"),
+                    kind: KvasirContentKind::ToolOutput,
+                    content: content_text("README.md contains the project overview"),
+                },
+            ],
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("claude"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::UserPrompt,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::ToolOutput,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::AssistantMessage,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolInput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_queries_codex_content_replay_from_opted_in_logs() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(codex_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("codex"),
+            session_id: session("codex-session-1"),
+            prompt_id: prompt("codex-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("codex-session-1"),
+            prompt_id: prompt("codex-turn-1"),
+            items: vec![KvasirContentReplayItem {
+                occurred_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_180,
+                },
+                harness: harness("codex"),
+                kind: KvasirContentKind::AssistantMessage,
+                content: content_text("codex response text"),
+            }],
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("codex"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::AssistantMessage,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::UserPrompt,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolInput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolOutput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_ignores_content_logs_from_unknown_harnesses() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(unknown_harness_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("random_service"),
+            session_id: session("unknown-session-1"),
+            prompt_id: prompt("unknown-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("unknown-session-1"),
+            prompt_id: prompt("unknown-turn-1"),
+            items: Vec::new(),
+            availability: KvasirContentAvailability::Unavailable {
+                reason: KvasirContentUnavailableReason::PromptNotFound,
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn client_reports_prompt_not_found_for_empty_content_replay() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
@@ -485,6 +768,128 @@ async fn client_reports_prompt_not_found_for_empty_content_replay() -> anyhow::R
         KvasirContentReplay {
             session_id: session("missing-session"),
             prompt_id: prompt("missing-prompt"),
+            items: Vec::new(),
+            availability: KvasirContentAvailability::Unavailable {
+                reason: KvasirContentUnavailableReason::PromptNotFound,
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_reports_known_harness_content_kinds_when_prompt_has_no_content()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("claude"),
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+            items: Vec::new(),
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("claude"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::UserPrompt,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::AssistantMessage,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolInput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolOutput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_does_not_report_content_capability_for_another_harness_prompt() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("codex"),
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("session-12"),
+            prompt_id: prompt("prompt-7"),
             items: Vec::new(),
             availability: KvasirContentAvailability::Unavailable {
                 reason: KvasirContentUnavailableReason::PromptNotFound,
@@ -1067,6 +1472,7 @@ fn claude_trace_fixture() -> &'static str {
         "resourceSpans": [{
             "resource": {
                 "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "claude" } },
                     { "key": "repo.name", "value": { "stringValue": "kvasir" } },
                     { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
                     { "key": "session.id", "value": { "stringValue": "session-12" } },
@@ -1142,6 +1548,7 @@ fn two_trace_ids_for_same_prompt_fixture() -> &'static str {
         "resourceSpans": [{
             "resource": {
                 "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "claude" } },
                     { "key": "session.id", "value": { "stringValue": "session-12" } },
                     { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
                 ]
@@ -1169,6 +1576,32 @@ fn two_trace_ids_for_same_prompt_fixture() -> &'static str {
                         ]
                     }
                 ]
+            }]
+        }]
+    }"#
+}
+
+fn codex_trace_reusing_claude_identity_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "codex" } },
+                    { "key": "session.id", "value": { "stringValue": "session-12" } },
+                    { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [{
+                    "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "spanId": "9999999999999999",
+                    "name": "codex.interaction",
+                    "startTimeUnixNano": "1781956805000000000",
+                    "endTimeUnixNano": "1781956806000000000",
+                    "attributes": [
+                        { "key": "span.kind", "value": { "stringValue": "interaction" } }
+                    ]
+                }]
             }]
         }]
     }"#
@@ -1204,6 +1637,7 @@ fn large_claude_trace_fixture(span_count: usize) -> String {
         "resourceSpans": [{{
             "resource": {{
                 "attributes": [
+                    {{ "key": "service.name", "value": {{ "stringValue": "claude" }} }},
                     {{ "key": "session.id", "value": {{ "stringValue": "session-large" }} }},
                     {{ "key": "prompt.id", "value": {{ "stringValue": "prompt-large" }} }}
                 ]
@@ -1221,6 +1655,7 @@ fn claude_trace_protobuf_fixture() -> Vec<u8> {
         resource_spans: vec![ResourceSpans {
             resource: Some(Resource {
                 attributes: vec![
+                    string_attribute("service.name", "claude"),
                     string_attribute("session.id", "session-12"),
                     string_attribute("prompt.id", "prompt-7"),
                 ],
@@ -1303,6 +1738,107 @@ fn opencode_content_logs_fixture() -> &'static str {
                     "timeUnixNano": "1781956802180000000",
                     "eventName": "opencode.content",
                     "body": { "stringValue": "stored assistant text" },
+                    "attributes": [
+                        { "key": "content.opt_in", "value": { "boolValue": true } },
+                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
+}
+
+fn claude_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "claude" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "claude-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "claude-turn-1" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [
+                    {
+                        "timeUnixNano": "1781956802180000000",
+                        "eventName": "claude.content",
+                        "body": { "stringValue": "explain this repository" },
+                        "attributes": [
+                            { "key": "content.opt_in", "value": { "boolValue": true } },
+                            { "key": "content.type", "value": { "stringValue": "user_prompt" } }
+                        ]
+                    },
+                    {
+                        "timeUnixNano": "1781956802200000000",
+                        "eventName": "claude.content",
+                        "body": { "stringValue": "authorization: bearer secret" },
+                        "attributes": [
+                            { "key": "content.opt_in", "value": { "boolValue": true } },
+                            { "key": "content.type", "value": { "stringValue": "raw_api_request" } }
+                        ]
+                    },
+                    {
+                        "timeUnixNano": "1781956802220000000",
+                        "eventName": "claude.content",
+                        "body": { "stringValue": "README.md contains the project overview" },
+                        "attributes": [
+                            { "key": "content.opt_in", "value": { "boolValue": true } },
+                            { "key": "content.type", "value": { "stringValue": "tool_output" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn codex_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "codex" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "codex-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "codex-turn-1" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "codex.content",
+                    "body": { "stringValue": "codex response text" },
+                    "attributes": [
+                        { "key": "content.opt_in", "value": { "boolValue": true } },
+                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
+}
+
+fn unknown_harness_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "random-service" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "unknown-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "unknown-turn-1" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "random-service.content",
+                    "body": { "stringValue": "do not store this content" },
                     "attributes": [
                         { "key": "content.opt_in", "value": { "boolValue": true } },
                         { "key": "content.type", "value": { "stringValue": "assistant_message" } }

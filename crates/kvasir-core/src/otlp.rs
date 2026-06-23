@@ -243,7 +243,7 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
                 if let Some(record) = json_tool_call_record(log_record, repo.clone())? {
                     records.tool_calls.push(record);
                 }
-                if let Some(record) = json_opencode_content_record(
+                if let Some(record) = json_content_record(
                     log_record,
                     repo.clone(),
                     harness.as_deref(),
@@ -480,7 +480,7 @@ fn records_from_scope_logs_for_logs(
         if let Some(record) = proto_tool_call_record(log_record.clone(), repo.clone())? {
             records.tool_calls.push(record);
         }
-        if let Some(record) = proto_opencode_content_record(
+        if let Some(record) = proto_content_record(
             &log_record,
             repo.clone(),
             resource_harness,
@@ -1326,18 +1326,19 @@ fn json_tool_call_record(
     )))
 }
 
-fn proto_opencode_content_record(
+fn proto_content_record(
     log_record: &LogRecord,
     repo: RepoBucket,
     resource_harness: Option<&str>,
     resource_session_id: Option<SessionId>,
     resource_prompt_id: Option<PromptId>,
 ) -> Result<Option<ContentRecord>, OtlpError> {
-    if !is_opencode_context(resource_harness)
-        || !is_opencode_content_event(Some(log_record.event_name.as_str()), || {
-            proto_attribute(&log_record.attributes, "event.name")
-        })
-        || !proto_bool_attribute(&log_record.attributes, "content.opt_in")
+    let Some(harness) = content_record_harness(resource_harness) else {
+        return Ok(None);
+    };
+    if !is_content_event(Some(log_record.event_name.as_str()), || {
+        proto_attribute(&log_record.attributes, "event.name")
+    }) || !proto_bool_attribute(&log_record.attributes, "content.opt_in")
     {
         return Ok(None);
     }
@@ -1371,7 +1372,7 @@ fn proto_opencode_content_record(
         .ok_or(OtlpError::MissingTimestamp)?;
     let event_key = content_event_key(
         &repo,
-        "opencode",
+        harness.as_str(),
         &session_id,
         &prompt_id,
         kind,
@@ -1384,13 +1385,13 @@ fn proto_opencode_content_record(
         session_id,
         prompt_id,
         repo,
-        harness: HarnessName::new("opencode"),
+        harness: HarnessName::new(harness),
         kind,
         content,
     }))
 }
 
-fn json_opencode_content_record(
+fn json_content_record(
     log_record: &Value,
     repo: RepoBucket,
     resource_harness: Option<&str>,
@@ -1398,11 +1399,12 @@ fn json_opencode_content_record(
     resource_prompt_id: Option<PromptId>,
 ) -> Result<Option<ContentRecord>, OtlpError> {
     let attributes = log_record.get("attributes").and_then(Value::as_array);
-    if !is_opencode_context(resource_harness)
-        || !is_opencode_content_event(log_record.get("eventName").and_then(Value::as_str), || {
-            json_attribute(attributes, "event.name")
-        })
-        || !json_bool_attribute(attributes, "content.opt_in")
+    let Some(harness) = content_record_harness(resource_harness) else {
+        return Ok(None);
+    };
+    if !is_content_event(log_record.get("eventName").and_then(Value::as_str), || {
+        json_attribute(attributes, "event.name")
+    }) || !json_bool_attribute(attributes, "content.opt_in")
     {
         return Ok(None);
     }
@@ -1427,7 +1429,7 @@ fn json_opencode_content_record(
     let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
     let event_key = content_event_key(
         &repo,
-        "opencode",
+        harness.as_str(),
         &session_id,
         &prompt_id,
         kind,
@@ -1440,7 +1442,7 @@ fn json_opencode_content_record(
         session_id,
         prompt_id,
         repo,
-        harness: HarnessName::new("opencode"),
+        harness: HarnessName::new(harness),
         kind,
         content,
     }))
@@ -1793,6 +1795,9 @@ fn proto_trace_span_record(
         None
     };
     Ok(Some(TraceSpanRecord {
+        harness: HarnessName::new(
+            canonical_harness(resource_harness).unwrap_or("unknown".to_owned()),
+        ),
         session_id,
         prompt_id,
         trace_id: TraceId::new(trace_id),
@@ -2036,6 +2041,9 @@ fn json_trace_span_record(
         None
     };
     Ok(Some(TraceSpanRecord {
+        harness: HarnessName::new(
+            canonical_harness(resource_harness).unwrap_or("unknown".to_owned()),
+        ),
         session_id,
         prompt_id,
         trace_id: TraceId::new(trace_id),
@@ -2722,17 +2730,31 @@ fn matches_tool_result(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn is_opencode_content_event(
+fn canonical_harness(resource_harness: Option<&str>) -> Option<String> {
+    resource_harness
+        .and_then(|value| meaningful_attribute(Some(value.to_owned())))
+        .map(|value| value.replace('-', "_"))
+}
+
+fn content_record_harness(resource_harness: Option<&str>) -> Option<String> {
+    canonical_harness(resource_harness).filter(|harness| content_harness_provides_logs(harness))
+}
+
+fn content_harness_provides_logs(harness: &str) -> bool {
+    matches!(
+        harness,
+        "claude" | "claude_code" | "codex" | "github_copilot" | "opencode"
+    )
+}
+
+fn is_content_event(
     event_name: Option<&str>,
     attribute_event_name: impl FnOnce() -> Option<String>,
 ) -> bool {
-    matches!(
-        event_name
-            .and_then(|value| meaningful_attribute(Some(value.to_owned())))
-            .or_else(|| meaningful_attribute(attribute_event_name()))
-            .as_deref(),
-        Some("opencode.content")
-    )
+    event_name
+        .and_then(|value| meaningful_attribute(Some(value.to_owned())))
+        .or_else(|| meaningful_attribute(attribute_event_name()))
+        .is_some_and(|value| value == "content" || value.ends_with(".content"))
 }
 
 fn repo_from_proto_attributes(attributes: &[KeyValue]) -> RepoBucket {
