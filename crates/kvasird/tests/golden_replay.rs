@@ -8,16 +8,18 @@ use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
-    BearerToken, CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName, RollupDay,
-    RollupQuery, RpcRequest, RpcStreamEvent, TimestampMillis, TokenRollup, ToolCallRollup,
-    ToolCallRollupQuery, ToolName, TraceSpanKind,
+    BearerToken, ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay,
+    ContentReplayItem, ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource,
+    HarnessName, ModelName, RollupDay, RollupQuery, RpcRequest, RpcStreamEvent, TimestampMillis,
+    TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName, TraceSpanKind,
 };
 use kvasir_core::{
-    CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity, RepoName, RepoPath,
+    ContentKind, ContentText, CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity,
+    RepoName, RepoPath,
 };
 use kvasird::{
-    DaemonConfig, RunningDaemon, StoreKeySource, query_cost_rollup, query_token_rollup,
-    query_tool_call_rollup, query_trace, start_with_store_key_source,
+    DaemonConfig, RunningDaemon, StoreKeySource, query_content, query_cost_rollup,
+    query_token_rollup, query_tool_call_rollup, query_trace, start_with_store_key_source,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -439,6 +441,15 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         .await?
         .error_for_status()?;
 
+    client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
     let token_query = RollupQuery::new(
         TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
         TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
@@ -486,7 +497,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
     );
 
     let traces = query_trace(
-        rpc_socket_path,
+        rpc_socket_path.clone(),
         kvasir_core::rpc::TraceQuery {
             session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
@@ -498,6 +509,65 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
     assert_eq!(traces[0].durations.ttft_ms, Some(120));
     assert_eq!(traces[0].durations.request_ms, Some(1800));
     assert_eq!(traces[0].durations.tool_ms, Some(250));
+
+    let unauthorized = query_content(
+        rpc_socket_path.clone(),
+        ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+        },
+        BearerToken::new("wrong-token"),
+    )
+    .await
+    .expect_err("content replay should require the daemon bearer token");
+    assert!(unauthorized.to_string().contains("Unauthorized"));
+
+    assert_eq!(
+        query_content(
+            rpc_socket_path,
+            ContentQuery {
+                harness: HarnessName::new("opencode"),
+                session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+                prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+            },
+            BearerToken::new("test-token"),
+        )
+        .await?,
+        ContentReplay {
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+            items: vec![ContentReplayItem {
+                occurred_at: TimestampMillis::from_millis(1_781_956_802_180),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new(
+                    "content capture is opt-in and intentionally ignored by this rollup fixture",
+                )
+                .unwrap(),
+            }],
+            availability: ContentAvailability::Captured {
+                harness: HarnessName::new("opencode"),
+                kinds: vec![
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::AssistantMessage,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::UserPrompt,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::ToolInput,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::ToolOutput,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                ],
+            },
+        }
+    );
 
     drop(daemon);
     assert_eq!(
@@ -1864,6 +1934,8 @@ fn opencode_content_logs_fixture() -> &'static str {
                     "eventName": "opencode.content",
                     "body": { "stringValue": "content capture is opt-in and intentionally ignored by this rollup fixture" },
                     "attributes": [
+                        { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
+                        { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } },
                         { "key": "content.opt_in", "value": { "boolValue": true } },
                         { "key": "content.type", "value": { "stringValue": "assistant_message" } }
                     ]

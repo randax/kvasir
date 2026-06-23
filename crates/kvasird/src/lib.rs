@@ -15,9 +15,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use kvasir_core::rpc::{
-    BearerToken, CostRollup, CostRollupQuery, OverviewRollup, RollupQuery, RpcError, RpcRequest,
-    RpcResponse, RpcStreamEvent, TokenRollup, ToolCallRollup, ToolCallRollupQuery, Trace,
-    TraceQuery,
+    BearerToken, ContentQuery, ContentReplay, CostRollup, CostRollupQuery, OverviewRollup,
+    RollupQuery, RpcError, RpcRequest, RpcResponse, RpcStreamEvent, TokenRollup, ToolCallRollup,
+    ToolCallRollupQuery, Trace, TraceQuery,
 };
 use kvasir_core::{
     PriceTable, StoreKey, UsageStore, parse_otlp_json_traces, parse_otlp_json_usage_logs,
@@ -525,6 +525,34 @@ pub async fn query_trace(
     }
 }
 
+pub async fn query_content(
+    socket_path: impl Into<PathBuf>,
+    query: ContentQuery,
+    bearer_token: BearerToken,
+) -> anyhow::Result<ContentReplay> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::Content {
+        query,
+        bearer_token,
+    };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::Content { replay } => Ok(replay),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
 async fn ingest_metrics(
     State(state): State<DaemonState>,
     request: Request,
@@ -708,6 +736,23 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                 error: RpcError::Internal,
             },
         },
+        Ok(RpcRequest::Content {
+            query,
+            bearer_token,
+        }) => {
+            if bearer_token != state.bearer_token {
+                RpcResponse::Error {
+                    error: RpcError::Unauthorized,
+                }
+            } else {
+                match state.store.lock().await.content_replay(query) {
+                    Ok(replay) => RpcResponse::Content { replay },
+                    Err(_err) => RpcResponse::Error {
+                        error: RpcError::Internal,
+                    },
+                }
+            }
+        }
         Ok(RpcRequest::SubscribeTokenRollup { query }) => {
             let mut updates = state.usage_updates.subscribe();
             let mut shutdown = state.shutdown.subscribe();

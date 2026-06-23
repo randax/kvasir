@@ -1,7 +1,7 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::usage::{CostUsd, RepoBucket};
+use crate::usage::{ContentKind, ContentText, CostUsd, RepoBucket};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BearerToken(String);
@@ -299,6 +299,13 @@ pub struct TraceQuery {
     pub prompt_id: PromptId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentQuery {
+    pub harness: HarnessName,
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
+}
+
 impl ToolCallRollupQuery {
     pub fn new(start: TimestampMillis, end: TimestampMillis) -> Self {
         Self {
@@ -378,6 +385,54 @@ pub struct Trace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentReplay {
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
+    pub items: Vec<ContentReplayItem>,
+    pub availability: ContentAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentReplayItem {
+    pub occurred_at: TimestampMillis,
+    pub harness: HarnessName,
+    pub kind: ContentKind,
+    pub content: ContentText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ContentAvailability {
+    Captured {
+        harness: HarnessName,
+        kinds: Vec<ContentKindAvailability>,
+    },
+    Unavailable {
+        reason: ContentUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ContentKindAvailability {
+    Captured {
+        kind: ContentKind,
+    },
+    Unavailable {
+        kind: ContentKind,
+        reason: ContentUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentUnavailableReason {
+    NotProvidedByHarness,
+    NotCapturedForPrompt,
+    PromptNotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceSpan {
     pub span_id: SpanId,
     pub parent_span_id: Option<SpanId>,
@@ -443,12 +498,28 @@ pub enum CostSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcRequest {
-    TokenRollup { query: RollupQuery },
-    OverviewRollup { query: RollupQuery },
-    CostRollup { query: CostRollupQuery },
-    ToolCallRollup { query: ToolCallRollupQuery },
-    Trace { query: TraceQuery },
-    SubscribeTokenRollup { query: RollupQuery },
+    TokenRollup {
+        query: RollupQuery,
+    },
+    OverviewRollup {
+        query: RollupQuery,
+    },
+    CostRollup {
+        query: CostRollupQuery,
+    },
+    ToolCallRollup {
+        query: ToolCallRollupQuery,
+    },
+    Trace {
+        query: TraceQuery,
+    },
+    Content {
+        query: ContentQuery,
+        bearer_token: BearerToken,
+    },
+    SubscribeTokenRollup {
+        query: RollupQuery,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +530,7 @@ pub enum RpcResponse {
     CostRollup { rollups: Vec<CostRollup> },
     ToolCallRollup { rollups: Vec<ToolCallRollup> },
     Trace { traces: Vec<Trace> },
+    Content { replay: ContentReplay },
     Error { error: RpcError },
 }
 
@@ -475,6 +547,7 @@ pub enum RpcError {
     InvalidRequest,
     Internal,
     ResponseTooLarge,
+    Unauthorized,
 }
 
 #[cfg(test)]

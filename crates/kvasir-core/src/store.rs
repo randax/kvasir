@@ -6,17 +6,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::pricing::PriceTable;
 use crate::rpc::{
-    CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName, RollupDay, RollupQuery,
-    SpanId, SpanName, TimestampMillis, TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName,
-    Trace, TraceDurationMeasures, TraceId, TraceQuery, TraceSpan, TraceSpanKind,
+    ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay, ContentReplayItem,
+    ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName,
+    RollupDay, RollupQuery, SpanId, SpanName, TimestampMillis, TokenRollup, ToolCallRollup,
+    ToolCallRollupQuery, ToolName, Trace, TraceDurationMeasures, TraceId, TraceQuery, TraceSpan,
+    TraceSpanKind,
 };
 use crate::usage::{
-    ContentRecord, CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageKind, TokenUsageRecord, TokenUsageSignal, ToolCallKind, ToolCallRecord,
-    UsageRecords,
+    ContentKind, ContentRecord, ContentText, CostUsageRecord, RepoBucket, RepoIdentity, RepoName,
+    RepoPath, TokenCount, TokenMeasure, TokenUsageKind, TokenUsageRecord, TokenUsageSignal,
+    ToolCallKind, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -522,6 +524,53 @@ impl UsageStore {
             .collect())
     }
 
+    pub fn content_replay(&self, query: ContentQuery) -> Result<ContentReplay, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                occurred_at_ms,
+                harness,
+                content_kind,
+                content
+             FROM canonical_content_records
+             WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
+             ORDER BY occurred_at_ms, id",
+        )?;
+        let items = statement
+            .query_map(
+                params![
+                    query.harness.as_str(),
+                    query.session_id.as_str(),
+                    query.prompt_id.as_str()
+                ],
+                |row| {
+                    let content_kind: String = row.get(2)?;
+                    let content: String = row.get(3)?;
+                    Ok(ContentReplayItem {
+                        occurred_at: TimestampMillis::from_millis(row.get(0)?),
+                        harness: HarnessName::new(row.get::<_, String>(1)?),
+                        kind: content_kind_from_storage(&content_kind)?,
+                        content: ContentText::new(content).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::<dyn std::error::Error + Send + Sync>::from(
+                                    "content replay row has empty content",
+                                ),
+                            )
+                        })?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let availability = content_availability(&query.harness, &items);
+        Ok(ContentReplay {
+            session_id: query.session_id,
+            prompt_id: query.prompt_id,
+            items,
+            availability,
+        })
+    }
+
     fn migrate(&mut self) -> Result<(), StoreError> {
         let schema_version = self
             .connection
@@ -537,21 +586,28 @@ impl UsageStore {
         let transaction = self.connection.transaction()?;
         match schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            7 => migrate_v7_to_v8(&transaction)?,
+            8 => migrate_v8_to_v9(&transaction)?,
+            7 => {
+                migrate_v7_to_v8(&transaction)?;
+                migrate_v8_to_v9(&transaction)?;
+            }
             6 => {
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
+                migrate_v8_to_v9(&transaction)?;
             }
             5 => {
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
+                migrate_v8_to_v9(&transaction)?;
             }
             4 => {
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
+                migrate_v8_to_v9(&transaction)?;
             }
             3 => {
                 migrate_v3_to_v4(&transaction)?;
@@ -559,6 +615,7 @@ impl UsageStore {
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
+                migrate_v8_to_v9(&transaction)?;
             }
             2 => {
                 migrate_v2_to_v4(&transaction)?;
@@ -566,6 +623,7 @@ impl UsageStore {
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
+                migrate_v8_to_v9(&transaction)?;
             }
             _ if schema_version < 2 => drop_incompatible_usage_tables(&transaction)?,
             _ => {}
@@ -709,6 +767,8 @@ impl UsageStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
                 day TEXT NOT NULL,
                 repo_bucket TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
@@ -721,6 +781,11 @@ impl UsageStore {
         transaction.execute(
             "CREATE INDEX IF NOT EXISTS canonical_trace_spans_session_prompt
              ON canonical_trace_spans (session_id, prompt_id, started_at_ms, span_id)",
+            [],
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_content_records_session_prompt
+             ON canonical_content_records (session_id, prompt_id, occurred_at_ms, id)",
             [],
         )?;
         transaction.execute(
@@ -1198,6 +1263,8 @@ impl UsageStore {
                 "INSERT OR IGNORE INTO canonical_content_records (
                     event_key,
                     occurred_at_ms,
+                    session_id,
+                    prompt_id,
                     day,
                     repo_bucket,
                     repo_name,
@@ -1205,10 +1272,12 @@ impl UsageStore {
                     harness,
                     content_kind,
                     content
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
+                    record.session_id.as_str(),
+                    record.prompt_id.as_str(),
                     day,
                     stored_repo.bucket,
                     stored_repo.name,
@@ -1713,6 +1782,8 @@ fn migrate_v6_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_key TEXT NOT NULL UNIQUE,
             occurred_at_ms INTEGER NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            prompt_id TEXT NOT NULL DEFAULT '',
             day TEXT NOT NULL,
             repo_bucket TEXT NOT NULL,
             repo_name TEXT NOT NULL,
@@ -1752,6 +1823,29 @@ fn migrate_v7_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
     Ok(())
 }
 
+fn migrate_v8_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_content_records")?
+        && !table_column_exists(transaction, "canonical_content_records", "session_id")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE canonical_content_records
+             ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+             ALTER TABLE canonical_content_records
+             ADD COLUMN prompt_id TEXT NOT NULL DEFAULT '';
+             DELETE FROM canonical_content_records
+             WHERE session_id = '' OR prompt_id = '';",
+        )?;
+    }
+    if table_exists(transaction, "canonical_content_records")? {
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_content_records_session_prompt
+             ON canonical_content_records (session_id, prompt_id, occurred_at_ms, id)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_v2_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     transaction.execute_batch(
         "ALTER TABLE canonical_cost_usage ADD COLUMN counter_start_ms INTEGER;
@@ -1775,6 +1869,60 @@ fn trace_span_kind_from_storage(value: &str) -> rusqlite::Result<TraceSpanKind> 
             )),
         )
     })
+}
+
+fn content_kind_from_storage(value: &str) -> rusqlite::Result<ContentKind> {
+    ContentKind::from_storage(value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "invalid content kind {value}"
+            )),
+        )
+    })
+}
+
+fn content_availability(harness: &HarnessName, items: &[ContentReplayItem]) -> ContentAvailability {
+    if items.is_empty() {
+        return ContentAvailability::Unavailable {
+            reason: ContentUnavailableReason::PromptNotFound,
+        };
+    }
+    let mut captured = Vec::new();
+    for item in items {
+        if !captured.contains(&item.kind) {
+            captured.push(item.kind);
+        }
+    }
+    let provided = content_kinds_provided_by(harness);
+    let mut kinds = Vec::new();
+    for kind in &captured {
+        kinds.push(ContentKindAvailability::Captured { kind: *kind });
+    }
+    for kind in ContentKind::ALL {
+        if !captured.contains(&kind) {
+            kinds.push(ContentKindAvailability::Unavailable {
+                kind,
+                reason: if provided.contains(&kind) {
+                    ContentUnavailableReason::NotCapturedForPrompt
+                } else {
+                    ContentUnavailableReason::NotProvidedByHarness
+                },
+            });
+        }
+    }
+    ContentAvailability::Captured {
+        harness: harness.clone(),
+        kinds,
+    }
+}
+
+fn content_kinds_provided_by(harness: &HarnessName) -> Vec<ContentKind> {
+    match harness.as_str() {
+        "opencode" => ContentKind::ALL.to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 fn trace_duration_measures(spans: &[TraceSpan]) -> TraceDurationMeasures {
@@ -3042,18 +3190,20 @@ mod tests {
             cost_usage: Vec::new(),
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
-            content: vec![ContentRecord::new(
-                ContentEventKey::new("content-event-1"),
-                TimestampMillis::new_for_test(1_781_956_800_000),
-                kvasir_repo("/repos/kvasir"),
-                HarnessName::new("opencode"),
-                ContentKind::AssistantMessage,
-                ContentText::new("stored assistant text").unwrap(),
-            )],
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("content-event-1"),
+                occurred_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                session_id: crate::rpc::SessionId::new("session-1"),
+                prompt_id: crate::rpc::PromptId::new("prompt-1"),
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("stored assistant text").unwrap(),
+            }],
         })?;
 
         let row = store.connection.query_row(
-            "SELECT repo_bucket, repo_name, repo_path, harness, content_kind, content
+            "SELECT session_id, prompt_id, repo_bucket, repo_name, repo_path, harness, content_kind, content
              FROM canonical_content_records",
             [],
             |row| {
@@ -3064,6 +3214,8 @@ mod tests {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )?;
@@ -3071,6 +3223,8 @@ mod tests {
         assert_eq!(
             row,
             (
+                "session-1".to_owned(),
+                "prompt-1".to_owned(),
                 REPO_BUCKET.to_owned(),
                 "kvasir".to_owned(),
                 "/repos/kvasir".to_owned(),
@@ -3079,6 +3233,55 @@ mod tests {
                 "stored assistant text".to_owned(),
             )
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn content_replay_is_scoped_by_harness() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let session_id = crate::rpc::SessionId::new("shared-session");
+        let prompt_id = crate::rpc::PromptId::new("shared-prompt");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![
+                ContentRecord {
+                    event_key: ContentEventKey::new("opencode-content"),
+                    occurred_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                    session_id: session_id.clone(),
+                    prompt_id: prompt_id.clone(),
+                    repo: kvasir_repo("/repos/kvasir"),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new("opencode text").unwrap(),
+                },
+                ContentRecord {
+                    event_key: ContentEventKey::new("codex-content"),
+                    occurred_at: TimestampMillis::new_for_test(1_781_956_800_001),
+                    session_id: session_id.clone(),
+                    prompt_id: prompt_id.clone(),
+                    repo: kvasir_repo("/repos/kvasir"),
+                    harness: HarnessName::new("codex"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new("codex text").unwrap(),
+                },
+            ],
+        })?;
+
+        let replay = store.content_replay(ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id,
+            prompt_id,
+        })?;
+
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(replay.items[0].harness, HarnessName::new("opencode"));
+        assert_eq!(replay.items[0].content.as_str(), "opencode text");
 
         Ok(())
     }
@@ -5259,6 +5462,81 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(snapshot_table_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_v8_schema_discards_unlinked_content_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE canonical_content_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+
+            INSERT INTO canonical_content_records (
+                event_key,
+                occurred_at_ms,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                content
+            ) VALUES (
+                'legacy-content',
+                1781956800000,
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/not/persisted',
+                'opencode',
+                'assistant_message',
+                'legacy unlinked text'
+            );
+
+            PRAGMA user_version = 8;",
+        )?;
+        drop(connection);
+
+        let store = open_test_store(&database_path)?;
+        assert_eq!(
+            store.content_replay(ContentQuery {
+                harness: HarnessName::new("opencode"),
+                session_id: crate::rpc::SessionId::new("session-12"),
+                prompt_id: crate::rpc::PromptId::new("prompt-7"),
+            })?,
+            ContentReplay {
+                session_id: crate::rpc::SessionId::new("session-12"),
+                prompt_id: crate::rpc::PromptId::new("prompt-7"),
+                items: Vec::new(),
+                availability: ContentAvailability::Unavailable {
+                    reason: ContentUnavailableReason::PromptNotFound,
+                },
+            }
+        );
+        drop(store);
+
+        let connection = open_raw_test_connection(database_path)?;
+        let content_row_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM canonical_content_records",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(content_row_count, 0);
 
         Ok(())
     }

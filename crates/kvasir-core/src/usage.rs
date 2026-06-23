@@ -298,30 +298,12 @@ impl ToolCallEventKey {
 pub struct ContentRecord {
     pub event_key: ContentEventKey,
     pub occurred_at: TimestampMillis,
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
     pub repo: RepoBucket,
     pub harness: HarnessName,
     pub kind: ContentKind,
     pub content: ContentText,
-}
-
-impl ContentRecord {
-    pub fn new(
-        event_key: ContentEventKey,
-        occurred_at: TimestampMillis,
-        repo: RepoBucket,
-        harness: HarnessName,
-        kind: ContentKind,
-        content: ContentText,
-    ) -> Self {
-        Self {
-            event_key,
-            occurred_at,
-            repo,
-            harness,
-            kind,
-            content,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +329,13 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
+    pub const ALL: [Self; 4] = [
+        Self::UserPrompt,
+        Self::AssistantMessage,
+        Self::ToolInput,
+        Self::ToolOutput,
+    ];
+
     pub fn from_attribute(value: &str) -> Option<Self> {
         match value {
             "user_prompt" | "user" => Some(Self::UserPrompt),
@@ -363,6 +352,16 @@ impl ContentKind {
             Self::AssistantMessage => "assistant_message",
             Self::ToolInput => "tool_input",
             Self::ToolOutput => "tool_output",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "user_prompt" => Some(Self::UserPrompt),
+            "assistant_message" => Some(Self::AssistantMessage),
+            "tool_input" => Some(Self::ToolInput),
+            "tool_output" => Some(Self::ToolOutput),
+            _ => None,
         }
     }
 }

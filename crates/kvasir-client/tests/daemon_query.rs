@@ -5,12 +5,15 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
-    KvasirClient, KvasirClientError, KvasirCostRollup, KvasirCostUsd, KvasirHarnessName,
-    KvasirModelName, KvasirOverviewRollup, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind,
-    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId,
-    KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures,
-    KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
+    KvasirContentKind, KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
+    KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
+    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewRollup, KvasirPromptId,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
+    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
+    KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
+    KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::BearerToken;
@@ -371,6 +374,123 @@ async fn client_queries_protobuf_claude_trace_by_session_and_prompt() -> anyhow:
     );
     assert_eq!(traces[0].spans[0].span_id, span("1111111111111111"));
     assert_eq!(traces[0].durations.request_ms, Some(2_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_content_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("opencode"),
+            session_id: session("opencode-session-1"),
+            prompt_id: prompt("opencode-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("opencode-session-1"),
+            prompt_id: prompt("opencode-turn-1"),
+            items: vec![KvasirContentReplayItem {
+                occurred_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_180,
+                },
+                harness: harness("opencode"),
+                kind: KvasirContentKind::AssistantMessage,
+                content: content_text("stored assistant text"),
+            }],
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("opencode"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::AssistantMessage,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::UserPrompt,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolInput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolOutput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_reports_prompt_not_found_for_empty_content_replay() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("opencode"),
+            session_id: session("missing-session"),
+            prompt_id: prompt("missing-prompt"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("missing-session"),
+            prompt_id: prompt("missing-prompt"),
+            items: Vec::new(),
+            availability: KvasirContentAvailability::Unavailable {
+                reason: KvasirContentUnavailableReason::PromptNotFound,
+            },
+        }
+    );
 
     Ok(())
 }
@@ -922,6 +1042,14 @@ fn prompt(value: &str) -> KvasirPromptId {
     KvasirPromptId::try_from(value.to_owned()).unwrap()
 }
 
+fn content_text(value: &str) -> KvasirContentText {
+    KvasirContentText::try_from(value.to_owned()).unwrap()
+}
+
+fn bearer_token(value: &str) -> KvasirBearerToken {
+    KvasirBearerToken::try_from(value.to_owned()).unwrap()
+}
+
 fn trace_id(value: &str) -> KvasirTraceId {
     KvasirTraceId::try_from(value.to_owned()).unwrap()
 }
@@ -1156,6 +1284,33 @@ fn hex_nibble(value: u8) -> u8 {
         b'A'..=b'F' => value - b'A' + 10,
         _ => panic!("test fixture contains non-hex digit"),
     }
+}
+
+fn opencode_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "opencode.content",
+                    "body": { "stringValue": "stored assistant text" },
+                    "attributes": [
+                        { "key": "content.opt_in", "value": { "boolValue": true } },
+                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
 }
 
 fn claude_tool_result_logs_fixture() -> &'static str {

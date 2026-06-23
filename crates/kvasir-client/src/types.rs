@@ -33,6 +33,12 @@ pub struct KvasirRepoName(String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirRepoPath(String);
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct KvasirContentText(String);
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct KvasirBearerToken(String);
+
 uniffi::custom_type!(KvasirSocketPath, String);
 uniffi::custom_type!(KvasirModelName, String);
 uniffi::custom_type!(KvasirHarnessName, String);
@@ -44,6 +50,8 @@ uniffi::custom_type!(KvasirSpanId, String);
 uniffi::custom_type!(KvasirSpanName, String);
 uniffi::custom_type!(KvasirRepoName, String);
 uniffi::custom_type!(KvasirRepoPath, String);
+uniffi::custom_type!(KvasirContentText, String);
+uniffi::custom_type!(KvasirBearerToken, String);
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum KvasirRepoBucketKind {
@@ -81,6 +89,14 @@ pub struct KvasirRollupQuery {
 pub struct KvasirTraceQuery {
     pub session_id: KvasirSessionId,
     pub prompt_id: KvasirPromptId,
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirContentQuery {
+    pub harness: KvasirHarnessName,
+    pub session_id: KvasirSessionId,
+    pub prompt_id: KvasirPromptId,
+    pub bearer_token: KvasirBearerToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -136,6 +152,59 @@ pub struct KvasirTrace {
     pub durations: KvasirTraceDurationMeasures,
 }
 
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirContentReplay {
+    pub session_id: KvasirSessionId,
+    pub prompt_id: KvasirPromptId,
+    pub items: Vec<KvasirContentReplayItem>,
+    pub availability: KvasirContentAvailability,
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirContentReplayItem {
+    pub occurred_at: KvasirTimestampMillis,
+    pub harness: KvasirHarnessName,
+    pub kind: KvasirContentKind,
+    pub content: KvasirContentText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirContentAvailability {
+    Captured {
+        harness: KvasirHarnessName,
+        kinds: Vec<KvasirContentKindAvailability>,
+    },
+    Unavailable {
+        reason: KvasirContentUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirContentKindAvailability {
+    Captured {
+        kind: KvasirContentKind,
+    },
+    Unavailable {
+        kind: KvasirContentKind,
+        reason: KvasirContentUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirContentUnavailableReason {
+    NotProvidedByHarness,
+    NotCapturedForPrompt,
+    PromptNotFound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirContentKind {
+    UserPrompt,
+    AssistantMessage,
+    ToolInput,
+    ToolOutput,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirTraceSpan {
     pub span_id: KvasirSpanId,
@@ -177,6 +246,10 @@ impl KvasirModelName {
 impl KvasirHarnessName {
     pub(crate) fn from_core(value: kvasir_core::rpc::HarnessName) -> Self {
         Self(value.as_str().to_owned())
+    }
+
+    pub(crate) fn into_core(self) -> kvasir_core::rpc::HarnessName {
+        kvasir_core::rpc::HarnessName::new(self.0)
     }
 }
 
@@ -244,6 +317,66 @@ impl KvasirRepoPath {
     }
 }
 
+impl KvasirContentText {
+    pub(crate) fn from_core(value: kvasir_core::ContentText) -> Self {
+        Self(value.as_str().to_owned())
+    }
+}
+
+impl KvasirBearerToken {
+    pub(crate) fn into_core(self) -> kvasir_core::rpc::BearerToken {
+        kvasir_core::rpc::BearerToken::new(self.0)
+    }
+}
+
+impl std::fmt::Debug for KvasirContentText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("KvasirContentText(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for KvasirBearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("KvasirBearerToken(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for KvasirContentQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KvasirContentQuery")
+            .field("harness", &self.harness)
+            .field("session_id", &self.session_id)
+            .field("prompt_id", &self.prompt_id)
+            .field("bearer_token", &self.bearer_token)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for KvasirContentReplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KvasirContentReplay")
+            .field("session_id", &self.session_id)
+            .field("prompt_id", &self.prompt_id)
+            .field("items", &self.items)
+            .field("availability", &self.availability)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for KvasirContentReplayItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KvasirContentReplayItem")
+            .field("occurred_at", &self.occurred_at)
+            .field("harness", &self.harness)
+            .field("kind", &self.kind)
+            .field("content", &self.content)
+            .finish()
+    }
+}
+
 impl From<KvasirSocketPath> for String {
     fn from(value: KvasirSocketPath) -> Self {
         value.0
@@ -306,6 +439,18 @@ impl From<KvasirRepoName> for String {
 
 impl From<KvasirRepoPath> for String {
     fn from(value: KvasirRepoPath) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirContentText> for String {
+    fn from(value: KvasirContentText) -> Self {
+        value.0
+    }
+}
+
+impl From<KvasirBearerToken> for String {
+    fn from(value: KvasirBearerToken) -> Self {
         value.0
     }
 }
@@ -402,10 +547,62 @@ impl TryFrom<String> for KvasirRepoPath {
     }
 }
 
+impl TryFrom<String> for KvasirContentText {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirBearerToken {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
 fn nonempty_text(value: String) -> Result<String, KvasirClientError> {
     if value.trim().is_empty() {
         Err(KvasirClientError::InvalidQuery)
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_debug_output_redacts_sensitive_values() -> Result<(), KvasirClientError> {
+        let query = KvasirContentQuery {
+            harness: KvasirHarnessName::try_from("opencode".to_owned())?,
+            session_id: KvasirSessionId::try_from("session-12".to_owned())?,
+            prompt_id: KvasirPromptId::try_from("prompt-7".to_owned())?,
+            bearer_token: KvasirBearerToken::try_from("secret-token".to_owned())?,
+        };
+        let replay = KvasirContentReplay {
+            session_id: KvasirSessionId::try_from("session-12".to_owned())?,
+            prompt_id: KvasirPromptId::try_from("prompt-7".to_owned())?,
+            items: vec![KvasirContentReplayItem {
+                occurred_at: KvasirTimestampMillis { value: 1 },
+                harness: KvasirHarnessName::try_from("opencode".to_owned())?,
+                kind: KvasirContentKind::AssistantMessage,
+                content: KvasirContentText::try_from("private prompt text".to_owned())?,
+            }],
+            availability: KvasirContentAvailability::Unavailable {
+                reason: KvasirContentUnavailableReason::PromptNotFound,
+            },
+        };
+
+        let debug_output = format!("{query:?}\n{replay:?}");
+
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("secret-token"));
+        assert!(!debug_output.contains("private prompt text"));
+
+        Ok(())
     }
 }
