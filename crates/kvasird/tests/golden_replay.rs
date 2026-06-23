@@ -10,7 +10,7 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_core::rpc::{
     BearerToken, CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName, RollupDay,
     RollupQuery, RpcRequest, RpcStreamEvent, TimestampMillis, TokenRollup, ToolCallRollup,
-    ToolCallRollupQuery, ToolName,
+    ToolCallRollupQuery, ToolName, TraceSpanKind,
 };
 use kvasir_core::{
     CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity, RepoName, RepoPath,
@@ -229,6 +229,178 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
             }
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn golden_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(codex_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("codex-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("codex-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(150));
+    assert_eq!(traces[0].durations.request_ms, Some(1600));
+    assert_eq!(traces[0].durations.tool_ms, Some(300));
+    assert_eq!(traces[0].spans[0].kind, TraceSpanKind::Interaction);
+    assert_eq!(traces[0].spans[1].kind, TraceSpanKind::LlmRequest);
+    assert_eq!(traces[0].spans[2].kind, TraceSpanKind::ToolCall);
+    assert_eq!(traces[0].spans[2].tool_name, Some(ToolName::new("Read")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn golden_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(copilot_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("copilot-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("copilot-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(200));
+    assert_eq!(traces[0].durations.request_ms, Some(1400));
+    assert_eq!(traces[0].durations.tool_ms, Some(400));
+    assert_eq!(traces[0].spans[0].kind, TraceSpanKind::Interaction);
+    assert_eq!(traces[0].spans[1].kind, TraceSpanKind::LlmRequest);
+    assert_eq!(traces[0].spans[2].kind, TraceSpanKind::ToolCall);
+    assert_eq!(traces[0].spans[2].tool_name, Some(ToolName::new("Read")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn protobuf_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(codex_trace_protobuf_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("codex-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("codex-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(150));
+    assert_eq!(traces[0].durations.request_ms, Some(1600));
+    assert_eq!(traces[0].durations.tool_ms, Some(300));
+    assert_eq!(traces[0].spans[0].kind, TraceSpanKind::Interaction);
+    assert_eq!(traces[0].spans[1].kind, TraceSpanKind::LlmRequest);
+    assert_eq!(traces[0].spans[2].kind, TraceSpanKind::ToolCall);
+    assert_eq!(traces[0].spans[2].tool_name, Some(ToolName::new("Read")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn protobuf_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(copilot_trace_protobuf_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            session_id: kvasir_core::rpc::SessionId::new("copilot-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("copilot-turn-1"),
+        },
+    )
+    .await?;
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(200));
+    assert_eq!(traces[0].durations.request_ms, Some(1400));
+    assert_eq!(traces[0].durations.tool_ms, Some(400));
+    assert_eq!(traces[0].spans[0].kind, TraceSpanKind::Interaction);
+    assert_eq!(traces[0].spans[1].kind, TraceSpanKind::LlmRequest);
+    assert_eq!(traces[0].spans[2].kind, TraceSpanKind::ToolCall);
+    assert_eq!(traces[0].spans[2].tool_name, Some(ToolName::new("Read")));
 
     Ok(())
 }
@@ -1510,6 +1682,115 @@ fn cost_usd(value: &str) -> CostUsd {
     CostUsd::from_decimal_str(value).expect("test cost must be valid")
 }
 
+fn codex_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "codex" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "codex-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "codex-turn-1" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        "spanId": "1111111111111111",
+                        "name": "codex.session",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802050000000",
+                        "attributes": [
+                            { "key": "codex.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "codex.llm_request",
+                        "startTimeUnixNano": "1781956800150000000",
+                        "endTimeUnixNano": "1781956801750000000",
+                        "attributes": [
+                            { "key": "codex.span.kind", "value": { "stringValue": "llm_request" } },
+                            { "key": "model", "value": { "stringValue": "gpt-5.4" } }
+                        ]
+                    },
+                    {
+                        "traceId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "codex.tool",
+                        "startTimeUnixNano": "1781956801750000000",
+                        "endTimeUnixNano": "1781956802050000000",
+                        "attributes": [
+                            { "key": "codex.span.kind", "value": { "stringValue": "tool" } },
+                            { "key": "tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn copilot_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "github-copilot" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } },
+                    { "key": "conversation.id", "value": { "stringValue": "copilot-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "copilot-turn-1" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "ffffffffffffffffffffffffffffffff",
+                        "spanId": "1111111111111111",
+                        "name": "github.copilot.chat",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956801800000000",
+                        "attributes": [
+                            { "key": "gen_ai.operation.name", "value": { "stringValue": "chat" } },
+                            { "key": "github.copilot.span.kind", "value": { "stringValue": "interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "ffffffffffffffffffffffffffffffff",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "gen_ai.chat",
+                        "startTimeUnixNano": "1781956800200000000",
+                        "endTimeUnixNano": "1781956801600000000",
+                        "attributes": [
+                            { "key": "github.copilot.span.kind", "value": { "stringValue": "llm_request" } },
+                            { "key": "model", "value": { "stringValue": "gpt-4.1" } }
+                        ]
+                    },
+                    {
+                        "traceId": "ffffffffffffffffffffffffffffffff",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "gen_ai.tool.call",
+                        "startTimeUnixNano": "1781956801600000000",
+                        "endTimeUnixNano": "1781956802000000000",
+                        "attributes": [
+                            { "key": "github.copilot.span.kind", "value": { "stringValue": "tool_call" } },
+                            { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
 fn opencode_trace_fixture() -> &'static str {
     r#"{
         "resourceSpans": [{
@@ -1652,6 +1933,181 @@ fn opencode_degraded_trace_fixture() -> &'static str {
             }]
         }]
     }"#
+}
+
+fn codex_trace_protobuf_fixture() -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "codex"),
+                    string_attribute("repo.name", "kvasir"),
+                    string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
+                    string_attribute("session.id", "codex-session-1"),
+                    string_attribute("prompt.id", "codex-turn-1"),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![
+                    Span {
+                        trace_id: hex_bytes("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                        span_id: hex_bytes("1111111111111111"),
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "codex.session".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_802_050_000_000,
+                        attributes: vec![string_attribute("codex.span.kind", "interaction")],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                        span_id: hex_bytes("2222222222222222"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "codex.llm_request".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_150_000_000,
+                        end_time_unix_nano: 1_781_956_801_750_000_000,
+                        attributes: vec![
+                            string_attribute("codex.span.kind", "llm_request"),
+                            string_attribute("model", "gpt-5.4"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                        span_id: hex_bytes("3333333333333333"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "codex.tool".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_801_750_000_000,
+                        end_time_unix_nano: 1_781_956_802_050_000_000,
+                        attributes: vec![
+                            string_attribute("codex.span.kind", "tool"),
+                            string_attribute("tool.name", "Read"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn copilot_trace_protobuf_fixture() -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "github-copilot"),
+                    string_attribute("repo.name", "kvasir"),
+                    string_attribute("repo.path", "/repos/kvasir"),
+                    string_attribute("conversation.id", "copilot-session-1"),
+                    string_attribute("prompt.id", "copilot-turn-1"),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![
+                    Span {
+                        trace_id: hex_bytes("ffffffffffffffffffffffffffffffff"),
+                        span_id: hex_bytes("1111111111111111"),
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "github.copilot.chat".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_801_800_000_000,
+                        attributes: vec![
+                            string_attribute("gen_ai.operation.name", "chat"),
+                            string_attribute("github.copilot.span.kind", "interaction"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("ffffffffffffffffffffffffffffffff"),
+                        span_id: hex_bytes("2222222222222222"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "gen_ai.chat".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_200_000_000,
+                        end_time_unix_nano: 1_781_956_801_600_000_000,
+                        attributes: vec![
+                            string_attribute("github.copilot.span.kind", "llm_request"),
+                            string_attribute("model", "gpt-4.1"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("ffffffffffffffffffffffffffffffff"),
+                        span_id: hex_bytes("3333333333333333"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "gen_ai.tool.call".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_801_600_000_000,
+                        end_time_unix_nano: 1_781_956_802_000_000_000,
+                        attributes: vec![
+                            string_attribute("github.copilot.span.kind", "tool_call"),
+                            string_attribute("gen_ai.tool.name", "Read"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
 }
 
 fn opencode_trace_protobuf_fixture() -> Vec<u8> {
