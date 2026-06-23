@@ -820,7 +820,7 @@ fn repo_injection_zsh_profile_sources_managed_hook() -> Result<(), Box<dyn std::
         r#"export PATH='/usr/local/bin:$PATH'
 
 # BEGIN KVASIR MANAGED REPO OTEL
-. '/Users/oyr/.kvasir/repo-hook.zsh'
+if [ -f '/Users/oyr/.kvasir/repo-hook.zsh' ] && [ -r '/Users/oyr/.kvasir/repo-hook.zsh' ]; then . '/Users/oyr/.kvasir/repo-hook.zsh'; fi
 # END KVASIR MANAGED REPO OTEL
 "#
     );
@@ -861,7 +861,7 @@ fn repo_injection_bash_profile_sources_managed_hook() -> Result<(), Box<dyn std:
         r#"alias gs='git status'
 
 # BEGIN KVASIR MANAGED REPO OTEL
-. '/Users/oyr/.kvasir/repo-hook.bash'
+if [ -f '/Users/oyr/.kvasir/repo-hook.bash' ] && [ -r '/Users/oyr/.kvasir/repo-hook.bash' ]; then . '/Users/oyr/.kvasir/repo-hook.bash'; fi
 # END KVASIR MANAGED REPO OTEL
 "#
     );
@@ -876,6 +876,75 @@ fn repo_injection_bash_profile_sources_managed_hook() -> Result<(), Box<dyn std:
         hook.as_str()
             .contains("PROMPT_COMMAND='_kvasir_update_otel_repo_resource'")
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_injection_shell_profile_skips_missing_hook_under_errexit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let temp = tempfile::tempdir()?;
+    let profile_path = temp.path().join("profile.sh");
+    let missing_hook_path = temp.path().join("missing-repo-hook.bash");
+    let generated = RepoInjectionShellProfile::generate("", &missing_hook_path)?;
+    std::fs::write(&profile_path, generated.as_str())?;
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"set -euo pipefail
+. "$1"
+printf 'profile-ok\n'
+"#,
+        )
+        .arg("kvasir-profile-test")
+        .arg(&profile_path)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "profile source failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout)?, "profile-ok\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_injection_shell_profile_skips_directory_hook_path_under_errexit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let temp = tempfile::tempdir()?;
+    let profile_path = temp.path().join("profile.sh");
+    let directory_hook_path = temp.path().join("repo-hook.d");
+    std::fs::create_dir(&directory_hook_path)?;
+    let generated = RepoInjectionShellProfile::generate("", &directory_hook_path)?;
+    std::fs::write(&profile_path, generated.as_str())?;
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"set -euo pipefail
+. "$1"
+printf 'profile-ok\n'
+"#,
+        )
+        .arg("kvasir-profile-test")
+        .arg(&profile_path)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "profile source failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout)?, "profile-ok\n");
     Ok(())
 }
 
@@ -1063,6 +1132,51 @@ printf 'repo=%s\n' "$OTEL_RESOURCE_ATTRIBUTES"
 
 #[cfg(unix)]
 #[test]
+fn repo_injection_bash_hook_preserves_newline_inside_existing_resource_attribute()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let fixture = RepoHookShellFixture::new("repo")?;
+    let hook_path = fixture.write_hook(RepoInjectionShell::Bash, "repo-hook.bash")?;
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"set -euo pipefail
+export OTEL_RESOURCE_ATTRIBUTES=$'service.name=kvasir\n,repo.name=stale,tenant.id=abc'
+. "$1"
+cd "$2"
+eval "$PROMPT_COMMAND"
+printf '%s' "$OTEL_RESOURCE_ATTRIBUTES"
+"#,
+        )
+        .arg("kvasir-repo-hook-test")
+        .arg(&hook_path)
+        .arg(&fixture.repo_dir)
+        .current_dir(&fixture.no_repo_dir)
+        .env("PATH", &fixture.path)
+        .env("KVASIR_TEST_REPO_PATH", &fixture.repo_dir)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "bash hook failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!(
+            "service.name=kvasir\n,tenant.id=abc,repo.name=repo,repo.path={}",
+            fixture.repo_dir.display()
+        )
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn repo_injection_bash_hook_sanitizes_control_characters_in_repo_values()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
@@ -1152,6 +1266,43 @@ declare -p PROMPT_COMMAND
 
 #[cfg(unix)]
 #[test]
+fn repo_injection_bash_hook_uses_local_preserved_attribute_accumulator()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let fixture = RepoHookShellFixture::new("repo")?;
+    let hook_path = fixture.write_hook(RepoInjectionShell::Bash, "repo-hook.bash")?;
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"set -euo pipefail
+. "$1"
+_kvasir_preserved_otel_resource_attributes='user-state'
+_kvasir_without_repo_resource_attributes 'service.name=kvasir' >/dev/null
+printf 'scratch=%s\n' "${_kvasir_preserved_otel_resource_attributes-unset}"
+"#,
+        )
+        .arg("kvasir-repo-hook-test")
+        .arg(&hook_path)
+        .current_dir(&fixture.no_repo_dir)
+        .env("PATH", &fixture.path)
+        .env("KVASIR_TEST_REPO_PATH", &fixture.repo_dir)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "bash hook failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(String::from_utf8(output.stdout)?, "scratch=user-state\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn repo_injection_zsh_hook_updates_resource_attributes_for_repo_and_no_repo()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
@@ -1230,7 +1381,7 @@ export EDITOR='vim'
 export EDITOR='vim'
 
 # BEGIN KVASIR MANAGED REPO OTEL
-. '/Users/oyr/.kvasir/repo-hook.zsh'
+if [ -f '/Users/oyr/.kvasir/repo-hook.zsh' ] && [ -r '/Users/oyr/.kvasir/repo-hook.zsh' ]; then . '/Users/oyr/.kvasir/repo-hook.zsh'; fi
 # END KVASIR MANAGED REPO OTEL
 "#
     );

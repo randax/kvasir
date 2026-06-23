@@ -445,11 +445,11 @@ fn contains_control_character(value: &str) -> bool {
 
 fn repo_injection_shell_profile_block(hook_path: &Path, line_ending: &str) -> String {
     let hook_path = hook_path.display().to_string();
+    let quoted_hook_path = shell_single_quote(&hook_path);
     format!(
         "{REPO_INJECTION_BLOCK_START}{line_ending}\
-         . {}\
+         if [ -f {quoted_hook_path} ] && [ -r {quoted_hook_path} ]; then . {quoted_hook_path}; fi\
          {line_ending}{REPO_INJECTION_BLOCK_END}{line_ending}",
-        shell_single_quote(&hook_path),
     )
 }
 
@@ -484,7 +484,7 @@ _kvasir_without_repo_resource_attributes() {
     local pair=''
     local char=''
     local escaped=''
-    _kvasir_preserved_otel_resource_attributes=''
+    local _kvasir_preserved_otel_resource_attributes=''
 
     while [ -n "$input" ]; do
         char="${input%"${input#?}"}"
@@ -512,7 +512,6 @@ _kvasir_without_repo_resource_attributes() {
 
     _kvasir_append_preserved_otel_resource_attribute "$pair"
     printf '%s' "$_kvasir_preserved_otel_resource_attributes"
-    unset _kvasir_preserved_otel_resource_attributes
 }
 
 _kvasir_update_otel_repo_resource() {
