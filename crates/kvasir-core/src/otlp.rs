@@ -1396,6 +1396,15 @@ const TOOL_NAME_ATTRIBUTE_KEYS: &[&str] = &[
     "gen_ai.client.tool_name",
 ];
 
+const TRACE_SPAN_KIND_ATTRIBUTE_KEYS: &[&str] = &[
+    "claude.span.kind",
+    "codex.span.kind",
+    "github.copilot.span.kind",
+    "opencode.span.kind",
+    "span.kind",
+    "kvasir.span.kind",
+];
+
 fn proto_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
     let value = first_proto_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
         .ok_or(OtlpError::MissingToolName)?;
@@ -1406,6 +1415,22 @@ fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError
     let value = first_json_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
         .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
+}
+
+fn proto_trace_tool_name(attributes: &[KeyValue]) -> Option<ToolName> {
+    TOOL_NAME_ATTRIBUTE_KEYS
+        .iter()
+        .filter_map(|key| proto_attribute(attributes, key))
+        .filter_map(|value| meaningful_attribute(Some(value)))
+        .find_map(ToolName::try_new)
+}
+
+fn json_trace_tool_name(attributes: Option<&Vec<Value>>) -> Option<ToolName> {
+    TOOL_NAME_ATTRIBUTE_KEYS
+        .iter()
+        .filter_map(|key| json_attribute(attributes, key))
+        .filter_map(|value| meaningful_attribute(Some(value)))
+        .find_map(ToolName::try_new)
 }
 
 fn proto_codex_metric_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
@@ -1703,13 +1728,7 @@ fn proto_trace_span_record(
     let ended_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
         .ok_or(OtlpError::MissingTimestamp)?;
     let tool_name = if kind == TraceSpanKind::ToolCall {
-        proto_tool_name(&span.attributes).map(Some).or_else(|err| {
-            if is_opencode_context(resource_harness) {
-                Ok(None)
-            } else {
-                Err(err)
-            }
-        })?
+        proto_trace_tool_name(&span.attributes)
     } else {
         None
     };
@@ -1952,13 +1971,7 @@ fn json_trace_span_record(
         json_timestamp(span, "startTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
     let ended_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
     let tool_name = if kind == TraceSpanKind::ToolCall {
-        json_tool_name(attributes).map(Some).or_else(|err| {
-            if is_opencode_context(resource_harness) {
-                Ok(None)
-            } else {
-                Err(err)
-            }
-        })?
+        json_trace_tool_name(attributes)
     } else {
         None
     };
@@ -2174,31 +2187,19 @@ fn json_prompt_id(attributes: Option<&Vec<Value>>) -> Option<PromptId> {
 }
 
 fn proto_trace_span_kind(attributes: &[KeyValue]) -> Option<TraceSpanKind> {
-    first_proto_attribute(
-        attributes,
-        &[
-            "claude.span.kind",
-            "opencode.span.kind",
-            "span.kind",
-            "kvasir.span.kind",
-        ],
-    )
-    .as_deref()
-    .and_then(TraceSpanKind::from_attribute)
+    TRACE_SPAN_KIND_ATTRIBUTE_KEYS
+        .iter()
+        .filter_map(|key| proto_attribute(attributes, key))
+        .filter_map(|value| meaningful_attribute(Some(value)))
+        .find_map(|value| TraceSpanKind::from_attribute(&value))
 }
 
 fn json_trace_span_kind(attributes: Option<&Vec<Value>>) -> Option<TraceSpanKind> {
-    first_json_attribute(
-        attributes,
-        &[
-            "claude.span.kind",
-            "opencode.span.kind",
-            "span.kind",
-            "kvasir.span.kind",
-        ],
-    )
-    .as_deref()
-    .and_then(TraceSpanKind::from_attribute)
+    TRACE_SPAN_KIND_ATTRIBUTE_KEYS
+        .iter()
+        .filter_map(|key| json_attribute(attributes, key))
+        .filter_map(|value| meaningful_attribute(Some(value)))
+        .find_map(|value| TraceSpanKind::from_attribute(&value))
 }
 
 fn first_proto_attribute(attributes: &[KeyValue], keys: &[&str]) -> Option<String> {
@@ -3034,6 +3035,232 @@ mod tests {
         assert_eq!(records.token_usage.len(), 1);
         assert_eq!(records.tool_calls.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_span_kind_normalizes_to_canonical_trace_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_trace_payload_with_span_kind_key(
+            "codex",
+            "codex.span.kind",
+            "tool",
+            "tool.name",
+        );
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_copilot_span_kind_normalizes_to_canonical_trace_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_trace_payload_with_span_kind_key(
+            "github-copilot",
+            "github.copilot.span.kind",
+            "tool_call",
+            "gen_ai.tool.name",
+        );
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_codex_span_kind_alias_normalizes_to_canonical_trace_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload =
+            trace_json_payload_with_span_kind_key("codex.span.kind", "llm-request", "tool.name");
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::LlmRequest);
+        assert_eq!(records.trace_spans[0].tool_name, None);
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_copilot_span_kind_alias_normalizes_to_canonical_trace_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_trace_payload_with_span_kind_key(
+            "github-copilot",
+            "github.copilot.span.kind",
+            "tool-call",
+            "gen_ai.tool.name",
+        );
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_codex_span_kind_rejects_unknown_value() {
+        let payload =
+            trace_json_payload_with_span_kind_key("codex.span.kind", "invented", "tool.name");
+
+        assert!(matches!(
+            parse_otlp_json_traces(payload.as_bytes()),
+            Err(OtlpError::InvalidTraceSpanKind)
+        ));
+    }
+
+    #[test]
+    fn json_trace_span_kind_uses_later_valid_alias_when_first_alias_is_invalid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = trace_json_payload_with_extra_attributes(
+            r#"
+                { "key": "codex.span.kind", "value": { "stringValue": "invented" } },
+                { "key": "span.kind", "value": { "stringValue": "tool-call" } },
+                { "key": "tool.name", "value": { "stringValue": "Read" } }
+            "#,
+        );
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_trace_tool_name_uses_later_valid_alias_when_first_alias_is_invalid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = trace_json_payload_with_extra_attributes(
+            r#"
+                { "key": "codex.span.kind", "value": { "stringValue": "tool" } },
+                { "key": "tool.name", "value": { "stringValue": "Unknown" } },
+                { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+            "#,
+        );
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_trace_tool_span_with_no_valid_tool_name_keeps_span_without_tool_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = trace_json_payload_with_span_kind_key("codex.span.kind", "tool", "tool.name")
+            .replace(r#""Read""#, r#""Unknown""#);
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(records.trace_spans[0].tool_name, None);
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_trace_span_kind_uses_later_valid_alias_when_first_alias_is_invalid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_trace_payload_with_attributes(
+            "github-copilot",
+            vec![
+                string_attribute("github.copilot.span.kind", "invented"),
+                string_attribute("span.kind", "tool-call"),
+                string_attribute("gen_ai.tool.name", "Read"),
+            ],
+        );
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_trace_tool_name_uses_later_valid_alias_when_first_alias_is_invalid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_trace_payload_with_attributes(
+            "github-copilot",
+            vec![
+                string_attribute("github.copilot.span.kind", "tool-call"),
+                string_attribute("tool.name", "Unknown"),
+                string_attribute("gen_ai.tool.name", "Read"),
+            ],
+        );
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(
+            records.trace_spans[0].tool_name,
+            Some(ToolName::new("Read"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_trace_tool_span_with_no_valid_tool_name_keeps_span_without_tool_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_trace_payload_with_attributes(
+            "github-copilot",
+            vec![
+                string_attribute("github.copilot.span.kind", "tool-call"),
+                string_attribute("tool.name", "Unknown"),
+            ],
+        );
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].kind, TraceSpanKind::ToolCall);
+        assert_eq!(records.trace_spans[0].tool_name, None);
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_copilot_span_kind_rejects_unknown_value() {
+        let payload = protobuf_trace_payload_with_span_kind_key(
+            "github-copilot",
+            "github.copilot.span.kind",
+            "invented",
+            "gen_ai.tool.name",
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_traces(&payload),
+            Err(OtlpError::InvalidTraceSpanKind)
+        ));
     }
 
     #[test]
@@ -5760,6 +5987,67 @@ mod tests {
         )
     }
 
+    fn trace_json_payload_with_span_kind_key(
+        span_kind_key: &str,
+        span_kind: &str,
+        tool_name_key: &str,
+    ) -> String {
+        format!(
+            r#"{{
+                "resourceSpans": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "codex" }} }},
+                            {{ "key": "session.id", "value": {{ "stringValue": "session-12" }} }},
+                            {{ "key": "prompt.id", "value": {{ "stringValue": "prompt-7" }} }}
+                        ]
+                    }},
+                    "scopeSpans": [{{
+                        "spans": [{{
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "1111111111111111",
+                            "name": "codex.span",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956800100000000",
+                            "attributes": [
+                                {{ "key": "{span_kind_key}", "value": {{ "stringValue": "{span_kind}" }} }},
+                                {{ "key": "{tool_name_key}", "value": {{ "stringValue": "Read" }} }}
+                            ]
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
+    fn trace_json_payload_with_extra_attributes(attributes: &str) -> String {
+        format!(
+            r#"{{
+                "resourceSpans": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "codex" }} }},
+                            {{ "key": "session.id", "value": {{ "stringValue": "session-12" }} }},
+                            {{ "key": "prompt.id", "value": {{ "stringValue": "prompt-7" }} }}
+                        ]
+                    }},
+                    "scopeSpans": [{{
+                        "spans": [{{
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "1111111111111111",
+                            "name": "codex.span",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956800100000000",
+                            "attributes": [
+                                {attributes}
+                            ]
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
     fn json_opencode_trace_payload_with_resource_ids(
         session_id: Option<&str>,
         prompt_id: Option<&str>,
@@ -5817,6 +6105,61 @@ mod tests {
             }}"#,
             attributes.join(",")
         )
+    }
+
+    fn protobuf_trace_payload_with_span_kind_key(
+        harness: &str,
+        span_kind_key: &str,
+        span_kind: &str,
+        tool_name_key: &str,
+    ) -> Vec<u8> {
+        protobuf_trace_payload_with_attributes(
+            harness,
+            vec![
+                string_attribute(span_kind_key, span_kind),
+                string_attribute(tool_name_key, "Read"),
+            ],
+        )
+    }
+
+    fn protobuf_trace_payload_with_attributes(harness: &str, attributes: Vec<KeyValue>) -> Vec<u8> {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", harness),
+                        string_attribute("session.id", "session-12"),
+                        string_attribute("prompt.id", "prompt-7"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: format!("{harness}.span"),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_800_100_000_000,
+                        attributes,
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
     }
 
     fn protobuf_opencode_trace_payload_with_resource_ids(
