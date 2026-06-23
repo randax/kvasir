@@ -78,6 +78,10 @@ impl ToolName {
         Self::try_new(value).expect("tool name must be a valid tool identifier")
     }
 
+    pub fn unknown() -> Self {
+        Self("Unknown".to_owned())
+    }
+
     pub fn try_new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         if is_known_claude_tool_name(&value) || is_valid_mcp_tool_name(&value) {
@@ -174,7 +178,6 @@ fn is_known_claude_tool_name(value: &str) -> bool {
             | "Read"
             | "Task"
             | "TodoWrite"
-            | "Unknown"
             | "WebFetch"
             | "WebSearch"
             | "Write"

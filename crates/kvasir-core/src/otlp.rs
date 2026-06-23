@@ -163,13 +163,24 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
                                 .push(json_cost_record(data_point, repo.clone())?);
                         }
                     }
-                    Some(name) if is_tool_call_metric_name(name) => {
+                    Some(name) if is_codex_tool_call_metric_name(name) => {
                         let data_points = json_tool_call_data_points(metric)?;
                         for data_point in data_points {
-                            if let Some(record) = json_tool_call_metric_record(
-                                name,
+                            if let Some(record) = json_codex_tool_call_metric_record(
                                 data_point,
                                 &mut codex_point_ordinals,
+                                repo.clone(),
+                            )? {
+                                records.tool_calls.push(record);
+                            }
+                        }
+                    }
+                    Some(name) if is_tool_call_sum_metric_name(name) => {
+                        let data_points = json_tool_call_data_points(metric)?;
+                        for data_point in data_points {
+                            if let Some(record) = json_cumulative_tool_call_metric_record(
+                                name,
+                                data_point,
                                 repo.clone(),
                                 resource_harness.as_deref(),
                             )? {
@@ -678,11 +689,8 @@ fn record_from_codex_proto_tool_call_histogram(
     if call_count.value() == 0 {
         return Ok(None);
     }
-    let raw_occurred_at_nanos = if data_point.time_unix_nano == 0 {
-        data_point.start_time_unix_nano
-    } else {
-        data_point.time_unix_nano
-    };
+    let raw_occurred_at_nanos =
+        proto_metric_occurred_at_nanos(data_point.time_unix_nano, data_point.start_time_unix_nano)?;
     let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
         .ok_or(OtlpError::MissingTimestamp)?;
     let harness = HarnessName::new("codex");
@@ -721,11 +729,8 @@ fn record_from_proto_tool_call_sum_data_point(
     if call_count.value() == 0 {
         return Ok(None);
     }
-    let raw_occurred_at_nanos = if data_point.time_unix_nano == 0 {
-        data_point.start_time_unix_nano
-    } else {
-        data_point.time_unix_nano
-    };
+    let raw_occurred_at_nanos =
+        proto_metric_occurred_at_nanos(data_point.time_unix_nano, data_point.start_time_unix_nano)?;
     let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
         .ok_or(OtlpError::MissingTimestamp)?;
     let counter_start = TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
@@ -941,53 +946,60 @@ fn json_token_record(
     }
 }
 
-fn json_tool_call_metric_record(
-    metric_name: &str,
+fn json_codex_tool_call_metric_record(
     data_point: &Value,
     point_ordinals: &mut BTreeMap<String, usize>,
     repo: RepoBucket,
-    resource_harness: Option<&str>,
 ) -> Result<Option<ToolCallRecord>, OtlpError> {
     let attributes = data_point.get("attributes").and_then(Value::as_array);
-    let tool_name = if is_codex_tool_call_metric_name(metric_name) {
-        json_codex_metric_tool_name(attributes)?
-    } else {
-        json_tool_name(attributes)?
-    };
+    let tool_name = json_codex_metric_tool_name(attributes)?;
     let call_count = json_tool_call_count(data_point)?;
     if call_count.value() == 0 {
         return Ok(None);
     }
-    let raw_occurred_at_nanos = json_number(data_point, "timeUnixNano")
-        .or_else(|| json_number(data_point, "startTimeUnixNano"))
+    let raw_occurred_at_nanos = json_metric_occurred_at_nanos(data_point)?;
+    let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
         .ok_or(OtlpError::MissingTimestamp)?;
+    let point_ordinal = codex_tool_call_point_ordinal(
+        point_ordinals,
+        &repo,
+        tool_name.as_str(),
+        raw_occurred_at_nanos,
+        call_count,
+    );
+    let event_key = codex_tool_call_event_key(
+        &repo,
+        tool_name.as_str(),
+        raw_occurred_at_nanos,
+        point_ordinal,
+        call_count,
+    );
+    Ok(Some(ToolCallRecord::new_counted(
+        event_key,
+        occurred_at,
+        repo,
+        HarnessName::new("codex"),
+        tool_name,
+        call_count,
+    )))
+}
+
+fn json_cumulative_tool_call_metric_record(
+    metric_name: &str,
+    data_point: &Value,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    let attributes = data_point.get("attributes").and_then(Value::as_array);
+    let tool_name = json_tool_name(attributes)?;
+    let call_count = json_tool_call_count(data_point)?;
+    if call_count.value() == 0 {
+        return Ok(None);
+    }
+    let raw_occurred_at_nanos = json_metric_occurred_at_nanos(data_point)?;
     let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
         .ok_or(OtlpError::MissingTimestamp)?;
     let harness = tool_call_metric_harness(metric_name, resource_harness);
-    if is_codex_tool_call_metric_name(metric_name) {
-        let point_ordinal = codex_tool_call_point_ordinal(
-            point_ordinals,
-            &repo,
-            tool_name.as_str(),
-            raw_occurred_at_nanos,
-            call_count,
-        );
-        let event_key = codex_tool_call_event_key(
-            &repo,
-            tool_name.as_str(),
-            raw_occurred_at_nanos,
-            point_ordinal,
-            call_count,
-        );
-        return Ok(Some(ToolCallRecord::new_counted(
-            event_key,
-            occurred_at,
-            repo,
-            harness,
-            tool_name,
-            call_count,
-        )));
-    }
 
     let counter_start = json_counter_start(data_point, "startTimeUnixNano")
         .ok_or(OtlpError::MissingCounterStart)?;
@@ -1013,6 +1025,23 @@ fn json_tool_call_metric_record(
     )))
 }
 
+fn json_metric_occurred_at_nanos(data_point: &Value) -> Result<u64, OtlpError> {
+    json_number(data_point, "timeUnixNano")
+        .filter(|value| *value != 0)
+        .or_else(|| json_number(data_point, "startTimeUnixNano").filter(|value| *value != 0))
+        .ok_or(OtlpError::MissingTimestamp)
+}
+
+fn proto_metric_occurred_at_nanos(
+    time_unix_nano: u64,
+    start_time_unix_nano: u64,
+) -> Result<u64, OtlpError> {
+    [time_unix_nano, start_time_unix_nano]
+        .into_iter()
+        .find(|value| *value != 0)
+        .ok_or(OtlpError::MissingTimestamp)
+}
+
 fn token_measure_for_metric(metric: &Value, value: &str) -> Option<TokenMeasure> {
     if is_codex_token_metric(metric) {
         codex_token_measure(value)
@@ -1027,10 +1056,6 @@ fn is_token_metric_name(name: &str) -> bool {
 
 fn is_cumulative_token_metric_name(name: &str) -> bool {
     matches!(name, "token.usage" | "github.copilot.chat.tokens")
-}
-
-fn is_tool_call_metric_name(name: &str) -> bool {
-    is_codex_tool_call_metric_name(name) || is_tool_call_sum_metric_name(name)
 }
 
 fn is_codex_tool_call_metric_name(name: &str) -> bool {
@@ -1386,13 +1411,13 @@ fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError
 fn proto_codex_metric_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
     first_proto_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
         .map(|value| ToolName::try_new(value).ok_or(OtlpError::InvalidToolName))
-        .unwrap_or_else(|| Ok(ToolName::new("Unknown")))
+        .unwrap_or_else(|| Ok(ToolName::unknown()))
 }
 
 fn json_codex_metric_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError> {
     first_json_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
         .map(|value| ToolName::try_new(value).ok_or(OtlpError::InvalidToolName))
-        .unwrap_or_else(|| Ok(ToolName::new("Unknown")))
+        .unwrap_or_else(|| Ok(ToolName::unknown()))
 }
 
 fn proto_log_counter_start(log_record: &LogRecord) -> Result<Option<TimestampMillis>, OtlpError> {
@@ -3320,6 +3345,75 @@ mod tests {
     }
 
     #[test]
+    fn json_copilot_tool_call_metrics_fall_back_to_start_when_time_is_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "0",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_metrics(payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].occurred_at.value(), 1_781_956_700_000);
+        assert!(
+            records.tool_calls[0]
+                .event_key
+                .as_str()
+                .contains("occurred_at_nanos=1781956700000000000\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_copilot_tool_call_metrics_reject_zero_time_and_start_as_missing_timestamp() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "0",
+                                "timeUnixNano": "0",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingTimestamp)
+        ));
+    }
+
+    #[test]
     fn json_copilot_tool_call_metrics_require_cumulative_counter_start() {
         let payload = br#"{
             "resourceMetrics": [{
@@ -3404,6 +3498,36 @@ mod tests {
     }
 
     #[test]
+    fn json_copilot_tool_call_metrics_reject_unknown_tool_name() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Unknown" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::InvalidToolName)
+        ));
+    }
+
+    #[test]
     fn json_codex_tool_call_metrics_without_tool_name_normalize_to_unknown_tool_record()
     -> Result<(), Box<dyn std::error::Error>> {
         let payload = br#"{
@@ -3436,7 +3560,7 @@ mod tests {
 
         assert_eq!(records.tool_calls.len(), 1);
         assert_eq!(records.tool_calls[0].harness, HarnessName::new("codex"));
-        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Unknown"));
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::unknown());
         assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(2));
         assert_eq!(
             records.tool_calls[0].kind,
@@ -3444,6 +3568,105 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn json_codex_tool_call_metrics_fall_back_to_start_when_time_is_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.tool.call",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956799000000000",
+                                "timeUnixNano": "0",
+                                "count": "1",
+                                "sum": 2,
+                                "attributes": [
+                                    { "key": "tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_metrics(payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].occurred_at.value(), 1_781_956_799_000);
+        assert!(
+            records.tool_calls[0]
+                .event_key
+                .as_str()
+                .contains("occurred_at_nanos=1781956799000000000\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_codex_tool_call_metrics_reject_zero_time_and_start_as_missing_timestamp() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.tool.call",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "0",
+                                "timeUnixNano": "0",
+                                "count": "1",
+                                "sum": 2,
+                                "attributes": [
+                                    { "key": "tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingTimestamp)
+        ));
+    }
+
+    #[test]
+    fn json_codex_tool_call_metrics_reject_explicit_unknown_tool_name() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.tool.call",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956799000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 2,
+                                "attributes": [
+                                    { "key": "tool.name", "value": { "stringValue": "Unknown" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::InvalidToolName)
+        ));
     }
 
     #[test]
@@ -3634,7 +3857,7 @@ mod tests {
 
         assert_eq!(records.tool_calls.len(), 1);
         assert_eq!(records.tool_calls[0].harness, HarnessName::new("codex"));
-        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Unknown"));
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::unknown());
         assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(2));
         assert_eq!(
             records.tool_calls[0].kind,
@@ -3642,6 +3865,65 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_metrics_fall_back_to_start_when_time_is_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+            Vec::new(),
+            vec![HistogramDataPoint {
+                attributes: vec![string_attribute("tool.name", "Read")],
+                start_time_unix_nano: 1_781_956_799_000_000_000,
+                time_unix_nano: 0,
+                count: 1,
+                sum: Some(2.0),
+                bucket_counts: Vec::new(),
+                explicit_bounds: Vec::new(),
+                exemplars: Vec::new(),
+                flags: 0,
+                min: None,
+                max: None,
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].occurred_at.value(), 1_781_956_799_000);
+        assert!(
+            records.tool_calls[0]
+                .event_key
+                .as_str()
+                .contains("occurred_at_nanos=1781956799000000000\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_metrics_reject_zero_time_and_start_as_missing_timestamp() {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+            Vec::new(),
+            vec![HistogramDataPoint {
+                attributes: vec![string_attribute("tool.name", "Read")],
+                start_time_unix_nano: 0,
+                time_unix_nano: 0,
+                count: 1,
+                sum: Some(2.0),
+                bucket_counts: Vec::new(),
+                explicit_bounds: Vec::new(),
+                exemplars: Vec::new(),
+                flags: 0,
+                min: None,
+                max: None,
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingTimestamp)
+        ));
     }
 
     #[test]
@@ -3755,6 +4037,57 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_copilot_tool_call_metrics_fall_back_to_start_when_time_is_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tool_calls",
+            Vec::new(),
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("gen_ai.tool.name", "Read")],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 0,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(3)),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].occurred_at.value(), 1_781_956_700_000);
+        assert!(
+            records.tool_calls[0]
+                .event_key
+                .as_str()
+                .contains("occurred_at_nanos=1781956700000000000\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_copilot_tool_call_metrics_reject_zero_time_and_start_as_missing_timestamp() {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tool_calls",
+            Vec::new(),
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("gen_ai.tool.name", "Read")],
+                start_time_unix_nano: 0,
+                time_unix_nano: 0,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(3)),
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingTimestamp)
+        ));
+    }
+
+    #[test]
     fn protobuf_copilot_tool_call_metrics_require_cumulative_counter_start() {
         let payload = protobuf_payload_with_metric_name_and_resource_attributes(
             "github.copilot.chat.tool_calls",
@@ -3793,6 +4126,52 @@ mod tests {
         assert!(matches!(
             parse_otlp_protobuf_usage_metrics(&payload),
             Err(OtlpError::MissingToolName)
+        ));
+    }
+
+    #[test]
+    fn protobuf_copilot_tool_call_metrics_reject_unknown_tool_name() {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tool_calls",
+            Vec::new(),
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("gen_ai.tool.name", "Unknown")],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(3)),
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::InvalidToolName)
+        ));
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_metrics_reject_explicit_unknown_tool_name() {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+            Vec::new(),
+            vec![HistogramDataPoint {
+                attributes: vec![string_attribute("tool.name", "Unknown")],
+                start_time_unix_nano: 1_781_956_799_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                count: 1,
+                sum: Some(2.0),
+                bucket_counts: Vec::new(),
+                explicit_bounds: Vec::new(),
+                exemplars: Vec::new(),
+                flags: 0,
+                min: None,
+                max: None,
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::InvalidToolName)
         ));
     }
 
@@ -4155,6 +4534,28 @@ mod tests {
                         "eventName": "tool_result",
                         "attributes": [
                             { "key": "tool.name", "value": { "stringValue": "InventedTool" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_logs(payload),
+            Err(OtlpError::InvalidToolName)
+        ));
+    }
+
+    #[test]
+    fn json_tool_result_rejects_unknown_sentinel_tool_name() {
+        let payload = br#"{
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "tool_result",
+                        "attributes": [
+                            { "key": "tool.name", "value": { "stringValue": "Unknown" } }
                         ]
                     }]
                 }]
@@ -4538,6 +4939,31 @@ mod tests {
         assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
 
         Ok(())
+    }
+
+    #[test]
+    fn protobuf_tool_result_rejects_unknown_sentinel_tool_name() {
+        let payload = protobuf_logs_payload_with_resource_attributes(
+            Vec::new(),
+            vec![LogRecord {
+                time_unix_nano: 1_781_956_800_000_000_000,
+                observed_time_unix_nano: 0,
+                severity_number: 0,
+                severity_text: String::new(),
+                body: None,
+                attributes: vec![string_attribute("tool.name", "Unknown")],
+                dropped_attributes_count: 0,
+                flags: 0,
+                trace_id: Vec::new(),
+                span_id: Vec::new(),
+                event_name: "tool_result".to_owned(),
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_logs(&payload),
+            Err(OtlpError::InvalidToolName)
+        ));
     }
 
     #[test]
