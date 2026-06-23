@@ -23,8 +23,8 @@ use crate::rpc::{
 use crate::usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
     RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageEventKey,
-    TokenUsageRecord, TokenUsageSignal, ToolCallEventKey, ToolCallRecord, TraceSpanRecord,
-    UsageRecords,
+    TokenUsageRecord, TokenUsageSignal, ToolCallCount, ToolCallEventKey, ToolCallRecord,
+    TraceSpanRecord, UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +130,7 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
             .and_then(|resource| resource.get("attributes"))
             .and_then(Value::as_array);
         let repo = repo_from_json_attributes(resource_attributes);
+        let resource_harness = harness_from_json_attributes(resource_attributes);
         let scope_metrics = resource_metrics
             .get("scopeMetrics")
             .and_then(Value::as_array)
@@ -160,6 +161,20 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
                             records
                                 .cost_usage
                                 .push(json_cost_record(data_point, repo.clone())?);
+                        }
+                    }
+                    Some(name) if is_tool_call_metric_name(name) => {
+                        let data_points = json_tool_call_data_points(metric)?;
+                        for data_point in data_points {
+                            if let Some(record) = json_tool_call_metric_record(
+                                name,
+                                data_point,
+                                &mut codex_point_ordinals,
+                                repo.clone(),
+                                resource_harness.as_deref(),
+                            )? {
+                                records.tool_calls.push(record);
+                            }
                         }
                     }
                     _ => {}
@@ -298,6 +313,10 @@ fn records_from_resource_metrics(
         .as_ref()
         .map(|resource| repo_from_proto_attributes(&resource.attributes))
         .unwrap_or_else(RepoBucket::no_repo);
+    let resource_harness = resource_metrics
+        .resource
+        .as_ref()
+        .and_then(|resource| harness_from_proto_attributes(&resource.attributes));
 
     if resource_metrics.scope_metrics.is_empty() {
         return Err(OtlpError::MissingScopeMetrics);
@@ -307,6 +326,7 @@ fn records_from_resource_metrics(
         records.extend(records_from_scope_metrics(
             scope_metrics,
             repo.clone(),
+            resource_harness.as_deref(),
             codex_point_ordinals,
         )?);
     }
@@ -316,6 +336,7 @@ fn records_from_resource_metrics(
 fn records_from_scope_metrics(
     scope_metrics: ScopeMetrics,
     repo: RepoBucket,
+    resource_harness: Option<&str>,
     codex_point_ordinals: &mut BTreeMap<String, usize>,
 ) -> Result<UsageRecords, OtlpError> {
     if scope_metrics.metrics.is_empty() {
@@ -326,6 +347,7 @@ fn records_from_scope_metrics(
         records.extend(records_from_metric(
             metric,
             repo.clone(),
+            resource_harness,
             codex_point_ordinals,
         )?);
     }
@@ -335,10 +357,12 @@ fn records_from_scope_metrics(
 fn records_from_metric(
     metric: Metric,
     repo: RepoBucket,
+    resource_harness: Option<&str>,
     codex_point_ordinals: &mut BTreeMap<String, usize>,
 ) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
-    match metric.name.as_str() {
+    let metric_name = metric.name.clone();
+    match metric_name.as_str() {
         name if is_cumulative_token_metric_name(name) => {
             for data_point in proto_sum_data_points(metric)? {
                 records
@@ -354,6 +378,29 @@ fn records_from_metric(
                     repo.clone(),
                 )? {
                     records.token_usage.push(record);
+                }
+            }
+        }
+        name if is_codex_tool_call_metric_name(name) => {
+            for data_point in proto_codex_delta_histogram_data_points(metric)? {
+                if let Some(record) = record_from_codex_proto_tool_call_histogram(
+                    data_point,
+                    codex_point_ordinals,
+                    repo.clone(),
+                )? {
+                    records.tool_calls.push(record);
+                }
+            }
+        }
+        name if is_tool_call_sum_metric_name(name) => {
+            for data_point in proto_cumulative_sum_data_points(metric)? {
+                if let Some(record) = record_from_proto_tool_call_sum_data_point(
+                    name,
+                    data_point,
+                    repo.clone(),
+                    resource_harness,
+                )? {
+                    records.tool_calls.push(record);
                 }
             }
         }
@@ -471,6 +518,22 @@ fn proto_sum_data_points(
         Some(metric::Data::Sum(sum)) => sum,
         Some(_) | None => return Err(OtlpError::InvalidMetricKind),
     };
+    if sum.data_points.is_empty() {
+        return Err(OtlpError::MissingDataPoints);
+    }
+    Ok(sum.data_points)
+}
+
+fn proto_cumulative_sum_data_points(
+    metric: Metric,
+) -> Result<Vec<opentelemetry_proto::tonic::metrics::v1::NumberDataPoint>, OtlpError> {
+    let sum = match metric.data {
+        Some(metric::Data::Sum(sum)) => sum,
+        Some(_) | None => return Err(OtlpError::InvalidMetricKind),
+    };
+    if sum.aggregation_temporality != 2 || !sum.is_monotonic {
+        return Err(OtlpError::InvalidMetricKind);
+    }
     if sum.data_points.is_empty() {
         return Err(OtlpError::MissingDataPoints);
     }
@@ -605,6 +668,89 @@ fn record_from_codex_proto_histogram(
     )))
 }
 
+fn record_from_codex_proto_tool_call_histogram(
+    data_point: HistogramDataPoint,
+    point_ordinals: &mut BTreeMap<String, usize>,
+    repo: RepoBucket,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    let tool_name = proto_codex_metric_tool_name(&data_point.attributes)?;
+    let call_count = tool_call_count_from_f64(data_point.sum.ok_or(OtlpError::MissingTokenCount)?)?;
+    if call_count.value() == 0 {
+        return Ok(None);
+    }
+    let raw_occurred_at_nanos = if data_point.time_unix_nano == 0 {
+        data_point.start_time_unix_nano
+    } else {
+        data_point.time_unix_nano
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let harness = HarnessName::new("codex");
+    let point_ordinal = codex_tool_call_point_ordinal(
+        point_ordinals,
+        &repo,
+        tool_name.as_str(),
+        raw_occurred_at_nanos,
+        call_count,
+    );
+    let event_key = codex_tool_call_event_key(
+        &repo,
+        tool_name.as_str(),
+        raw_occurred_at_nanos,
+        point_ordinal,
+        call_count,
+    );
+    Ok(Some(ToolCallRecord::new_counted(
+        event_key,
+        occurred_at,
+        repo,
+        harness,
+        tool_name,
+        call_count,
+    )))
+}
+
+fn record_from_proto_tool_call_sum_data_point(
+    metric_name: &str,
+    data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    let tool_name = proto_tool_name(&data_point.attributes)?;
+    let call_count = proto_tool_call_count(&data_point)?;
+    if call_count.value() == 0 {
+        return Ok(None);
+    }
+    let raw_occurred_at_nanos = if data_point.time_unix_nano == 0 {
+        data_point.start_time_unix_nano
+    } else {
+        data_point.time_unix_nano
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let counter_start = TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
+        .filter(|timestamp| data_point.start_time_unix_nano != 0 && timestamp.value() != 0)
+        .ok_or(OtlpError::MissingCounterStart)?;
+    let harness = tool_call_metric_harness(metric_name, resource_harness);
+    let event_key = metric_tool_call_event_key(
+        &repo,
+        harness.as_str(),
+        tool_name.as_str(),
+        data_point.start_time_unix_nano,
+        raw_occurred_at_nanos,
+        call_count,
+    );
+    Ok(Some(ToolCallRecord::new_cumulative(
+        event_key,
+        occurred_at,
+        counter_start,
+        repo,
+        harness,
+        tool_name,
+        call_count,
+    )))
+}
+
 fn cost_record_from_proto_data_point(
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     repo: RepoBucket,
@@ -669,6 +815,51 @@ fn json_codex_histogram_is_delta(histogram: &Value) -> bool {
         Some(Value::String(value)) => value == "1" || value == "AGGREGATION_TEMPORALITY_DELTA",
         _ => false,
     }
+}
+
+fn json_tool_call_data_points(metric: &Value) -> Result<&Vec<Value>, OtlpError> {
+    match metric.get("name").and_then(Value::as_str) {
+        Some(name) if is_codex_tool_call_metric_name(name) => {
+            let histogram = metric
+                .get("histogram")
+                .ok_or(OtlpError::InvalidMetricKind)?;
+            if !json_codex_histogram_is_delta(histogram) {
+                return Err(OtlpError::InvalidMetricKind);
+            }
+            histogram
+                .get("dataPoints")
+                .and_then(Value::as_array)
+                .filter(|data_points| !data_points.is_empty())
+                .ok_or(OtlpError::MissingDataPoints)
+        }
+        Some(name) if is_tool_call_sum_metric_name(name) => metric
+            .get("sum")
+            .ok_or(OtlpError::InvalidMetricKind)
+            .and_then(|sum| {
+                if !json_sum_is_cumulative(sum) {
+                    return Err(OtlpError::InvalidMetricKind);
+                }
+                sum.get("dataPoints")
+                    .and_then(Value::as_array)
+                    .filter(|data_points| !data_points.is_empty())
+                    .ok_or(OtlpError::MissingDataPoints)
+            }),
+        _ => Err(OtlpError::InvalidMetricKind),
+    }
+}
+
+fn json_sum_is_cumulative(sum: &Value) -> bool {
+    let cumulative = match sum.get("aggregationTemporality") {
+        Some(Value::Number(value)) => value.as_u64() == Some(2),
+        Some(Value::String(value)) => value == "2" || value == "AGGREGATION_TEMPORALITY_CUMULATIVE",
+        _ => false,
+    };
+    let monotonic = match sum.get("isMonotonic") {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => value == "true",
+        _ => false,
+    };
+    cumulative && monotonic
 }
 
 fn json_token_record(
@@ -750,6 +941,78 @@ fn json_token_record(
     }
 }
 
+fn json_tool_call_metric_record(
+    metric_name: &str,
+    data_point: &Value,
+    point_ordinals: &mut BTreeMap<String, usize>,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<Option<ToolCallRecord>, OtlpError> {
+    let attributes = data_point.get("attributes").and_then(Value::as_array);
+    let tool_name = if is_codex_tool_call_metric_name(metric_name) {
+        json_codex_metric_tool_name(attributes)?
+    } else {
+        json_tool_name(attributes)?
+    };
+    let call_count = json_tool_call_count(data_point)?;
+    if call_count.value() == 0 {
+        return Ok(None);
+    }
+    let raw_occurred_at_nanos = json_number(data_point, "timeUnixNano")
+        .or_else(|| json_number(data_point, "startTimeUnixNano"))
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let occurred_at = TimestampMillis::try_from_unix_nanos(raw_occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let harness = tool_call_metric_harness(metric_name, resource_harness);
+    if is_codex_tool_call_metric_name(metric_name) {
+        let point_ordinal = codex_tool_call_point_ordinal(
+            point_ordinals,
+            &repo,
+            tool_name.as_str(),
+            raw_occurred_at_nanos,
+            call_count,
+        );
+        let event_key = codex_tool_call_event_key(
+            &repo,
+            tool_name.as_str(),
+            raw_occurred_at_nanos,
+            point_ordinal,
+            call_count,
+        );
+        return Ok(Some(ToolCallRecord::new_counted(
+            event_key,
+            occurred_at,
+            repo,
+            harness,
+            tool_name,
+            call_count,
+        )));
+    }
+
+    let counter_start = json_counter_start(data_point, "startTimeUnixNano")
+        .ok_or(OtlpError::MissingCounterStart)?;
+    let raw_counter_start_nanos = json_number(data_point, "startTimeUnixNano")
+        .filter(|value| *value != 0)
+        .ok_or(OtlpError::MissingCounterStart)?;
+    let event_key = metric_tool_call_event_key(
+        &repo,
+        harness.as_str(),
+        tool_name.as_str(),
+        raw_counter_start_nanos,
+        raw_occurred_at_nanos,
+        call_count,
+    );
+    Ok(Some(ToolCallRecord::new_cumulative(
+        event_key,
+        occurred_at,
+        counter_start,
+        repo,
+        harness,
+        tool_name,
+        call_count,
+    )))
+}
+
 fn token_measure_for_metric(metric: &Value, value: &str) -> Option<TokenMeasure> {
     if is_codex_token_metric(metric) {
         codex_token_measure(value)
@@ -764,6 +1027,40 @@ fn is_token_metric_name(name: &str) -> bool {
 
 fn is_cumulative_token_metric_name(name: &str) -> bool {
     matches!(name, "token.usage" | "github.copilot.chat.tokens")
+}
+
+fn is_tool_call_metric_name(name: &str) -> bool {
+    is_codex_tool_call_metric_name(name) || is_tool_call_sum_metric_name(name)
+}
+
+fn is_codex_tool_call_metric_name(name: &str) -> bool {
+    matches!(name, "codex.turn.tool.call" | "codex.tool.call")
+}
+
+fn is_tool_call_sum_metric_name(name: &str) -> bool {
+    matches!(
+        name,
+        "github.copilot.chat.tool_calls"
+            | "github.copilot.chat.tool.calls"
+            | "gen_ai.tool.calls"
+            | "gen_ai.client.tool.calls"
+    )
+}
+
+fn tool_call_metric_harness(metric_name: &str, resource_harness: Option<&str>) -> HarnessName {
+    if is_codex_tool_call_metric_name(metric_name) {
+        return HarnessName::new("codex");
+    }
+    if metric_name.starts_with("github.copilot.") {
+        return HarnessName::new("github_copilot");
+    }
+    resource_harness
+        .map(canonical_harness_name)
+        .unwrap_or_else(|| HarnessName::new("unknown"))
+}
+
+fn canonical_harness_name(value: &str) -> HarnessName {
+    HarnessName::new(value.trim().replace('-', "_"))
 }
 
 fn is_codex_token_metric(metric: &Value) -> bool {
@@ -1064,32 +1361,38 @@ fn json_opencode_content_record(
     )))
 }
 
+const TOOL_NAME_ATTRIBUTE_KEYS: &[&str] = &[
+    "tool.name",
+    "tool_name",
+    "ai.toolCall.name",
+    "gen_ai.tool.name",
+    "gen_ai.tool_name",
+    "gen_ai.client.tool.name",
+    "gen_ai.client.tool_name",
+];
+
 fn proto_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
-    let value = first_proto_attribute(
-        attributes,
-        &[
-            "tool.name",
-            "tool_name",
-            "ai.toolCall.name",
-            "gen_ai.tool.name",
-        ],
-    )
-    .ok_or(OtlpError::MissingToolName)?;
+    let value = first_proto_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
+        .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
 }
 
 fn json_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError> {
-    let value = first_json_attribute(
-        attributes,
-        &[
-            "tool.name",
-            "tool_name",
-            "ai.toolCall.name",
-            "gen_ai.tool.name",
-        ],
-    )
-    .ok_or(OtlpError::MissingToolName)?;
+    let value = first_json_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
+        .ok_or(OtlpError::MissingToolName)?;
     ToolName::try_new(value).ok_or(OtlpError::InvalidToolName)
+}
+
+fn proto_codex_metric_tool_name(attributes: &[KeyValue]) -> Result<ToolName, OtlpError> {
+    first_proto_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
+        .map(|value| ToolName::try_new(value).ok_or(OtlpError::InvalidToolName))
+        .unwrap_or_else(|| Ok(ToolName::new("Unknown")))
+}
+
+fn json_codex_metric_tool_name(attributes: Option<&Vec<Value>>) -> Result<ToolName, OtlpError> {
+    first_json_attribute(attributes, TOOL_NAME_ATTRIBUTE_KEYS)
+        .map(|value| ToolName::try_new(value).ok_or(OtlpError::InvalidToolName))
+        .unwrap_or_else(|| Ok(ToolName::new("Unknown")))
 }
 
 fn proto_log_counter_start(log_record: &LogRecord) -> Result<Option<TimestampMillis>, OtlpError> {
@@ -1195,6 +1498,22 @@ fn proto_token_count_value(value: &AnyValue) -> Result<TokenCount, OtlpError> {
             TokenCount::try_new(value).ok_or(OtlpError::NumberOutOfRange)
         }
         _ => Err(OtlpError::MissingTokenCount),
+    }
+}
+
+fn proto_tool_call_count(
+    data_point: &opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
+) -> Result<ToolCallCount, OtlpError> {
+    match data_point
+        .value
+        .as_ref()
+        .ok_or(OtlpError::MissingTokenCount)?
+    {
+        number_data_point::Value::AsInt(value) => {
+            ToolCallCount::try_new(u64::try_from(*value).map_err(|_| OtlpError::NumberOutOfRange)?)
+                .ok_or(OtlpError::NumberOutOfRange)
+        }
+        number_data_point::Value::AsDouble(value) => tool_call_count_from_f64(*value),
     }
 }
 
@@ -1992,6 +2311,88 @@ fn tool_call_event_key(
     ToolCallEventKey::new(canonical)
 }
 
+fn metric_tool_call_event_key(
+    repo: &RepoBucket,
+    harness: &str,
+    tool_name: &str,
+    counter_start_nanos: u64,
+    occurred_at_nanos: u64,
+    call_count: ToolCallCount,
+) -> ToolCallEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-metric-tool-call");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("harness=");
+    canonical.push_str(harness);
+    canonical.push('\n');
+    canonical.push_str("tool_name=");
+    canonical.push_str(tool_name);
+    canonical.push('\n');
+    canonical.push_str("counter_start_nanos=");
+    canonical.push_str(&counter_start_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("call_count=");
+    canonical.push_str(&call_count.value().to_string());
+    canonical.push('\n');
+    ToolCallEventKey::new(canonical)
+}
+
+fn codex_tool_call_event_key(
+    repo: &RepoBucket,
+    tool_name: &str,
+    occurred_at_nanos: u64,
+    point_ordinal: usize,
+    call_count: ToolCallCount,
+) -> ToolCallEventKey {
+    let mut canonical =
+        codex_tool_call_point_fingerprint(repo, tool_name, occurred_at_nanos, call_count);
+    canonical.push_str("point_ordinal=");
+    canonical.push_str(&point_ordinal.to_string());
+    canonical.push('\n');
+    ToolCallEventKey::new(canonical)
+}
+
+fn codex_tool_call_point_ordinal(
+    point_ordinals: &mut BTreeMap<String, usize>,
+    repo: &RepoBucket,
+    tool_name: &str,
+    occurred_at_nanos: u64,
+    call_count: ToolCallCount,
+) -> usize {
+    let fingerprint =
+        codex_tool_call_point_fingerprint(repo, tool_name, occurred_at_nanos, call_count);
+    let ordinal = point_ordinals.entry(fingerprint).or_default();
+    let current = *ordinal;
+    *ordinal += 1;
+    current
+}
+
+fn codex_tool_call_point_fingerprint(
+    repo: &RepoBucket,
+    tool_name: &str,
+    occurred_at_nanos: u64,
+    call_count: ToolCallCount,
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-metric-codex-tool-call");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("tool_name=");
+    canonical.push_str(tool_name);
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("call_count=");
+    canonical.push_str(&call_count.value().to_string());
+    canonical.push('\n');
+    canonical
+}
+
 fn log_token_usage_event_key(
     repo: &RepoBucket,
     model: &str,
@@ -2373,6 +2774,17 @@ fn json_token_count(value: &Value) -> Result<TokenCount, OtlpError> {
     TokenCount::try_new(raw_value).ok_or(OtlpError::NumberOutOfRange)
 }
 
+fn json_tool_call_count(value: &Value) -> Result<ToolCallCount, OtlpError> {
+    let raw_value = match (value.get("asInt"), value.get("asDouble"), value.get("sum")) {
+        (Some(value), _, _) => json_u64_value(value).ok_or(OtlpError::NumberOutOfRange)?,
+        (None, Some(value), _) | (None, None, Some(value)) => {
+            json_u64_value(value).ok_or(OtlpError::NumberOutOfRange)?
+        }
+        (None, None, None) => return Err(OtlpError::MissingTokenCount),
+    };
+    ToolCallCount::try_new(raw_value).ok_or(OtlpError::NumberOutOfRange)
+}
+
 fn json_cost(value: &Value) -> Result<CostUsd, OtlpError> {
     let raw_value = match (value.get("asDouble"), value.get("asInt")) {
         (Some(value), _) => json_cost_value(value).ok_or(OtlpError::InvalidCost)?,
@@ -2393,6 +2805,19 @@ fn token_count_from_f64(value: f64) -> Result<TokenCount, OtlpError> {
         );
     };
     TokenCount::try_new(value).ok_or(OtlpError::NumberOutOfRange)
+}
+
+fn tool_call_count_from_f64(value: f64) -> Result<ToolCallCount, OtlpError> {
+    let Some(value) = valid_u64_from_f64(value) else {
+        return Err(
+            if value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 {
+                OtlpError::NonIntegralTokenCount
+            } else {
+                OtlpError::NumberOutOfRange
+            },
+        );
+    };
+    ToolCallCount::try_new(value).ok_or(OtlpError::NumberOutOfRange)
 }
 
 fn valid_u64_from_f64(value: f64) -> Option<u64> {
@@ -2836,6 +3261,192 @@ mod tests {
     }
 
     #[test]
+    fn json_copilot_tool_call_metrics_normalize_to_tool_call_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "github-copilot" } },
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_metrics(payload)?;
+
+        assert!(records.token_usage.is_empty());
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(
+            records.tool_calls[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir"),
+            ))
+        );
+        assert_eq!(
+            records.tool_calls[0].harness,
+            HarnessName::new("github_copilot")
+        );
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
+        assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(3));
+        assert_eq!(
+            records.tool_calls[0].kind,
+            crate::usage::ToolCallKind::Cumulative {
+                counter_start: TimestampMillis::new_for_test(1_781_956_700_000)
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_copilot_tool_call_metrics_require_cumulative_counter_start() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn json_copilot_tool_call_metrics_require_cumulative_sum_metadata() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::InvalidMetricKind)
+        ));
+    }
+
+    #[test]
+    fn json_copilot_tool_call_metrics_require_tool_name() {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "3"
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_usage_metrics(payload),
+            Err(OtlpError::MissingToolName)
+        ));
+    }
+
+    #[test]
+    fn json_codex_tool_call_metrics_without_tool_name_normalize_to_unknown_tool_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "codex" } },
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.tool.call",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956799000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 2
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_metrics(payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].harness, HarnessName::new("codex"));
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Unknown"));
+        assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(2));
+        assert_eq!(
+            records.tool_calls[0].kind,
+            crate::usage::ToolCallKind::Delta
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn protobuf_codex_turn_token_usage_metrics_normalize_to_token_records() {
         let payload = protobuf_codex_histogram_payload_with_resource_attributes(
             vec![
@@ -2871,6 +3482,166 @@ mod tests {
                 && record.occurred_at == TimestampMillis::new_for_test(1_781_956_800_000)
                 && record.counter_start == TimestampMillis::new_for_test(1_781_956_799_000)
         }));
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_metrics_normalize_to_tool_call_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![codex_tool_call_histogram_point("Read", 2.0)],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert!(records.token_usage.is_empty());
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(
+            records.tool_calls[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir"),
+            ))
+        );
+        assert_eq!(records.tool_calls[0].harness, HarnessName::new("codex"));
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
+        assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(2));
+        assert_eq!(
+            records.tool_calls[0].kind,
+            crate::usage::ToolCallKind::Delta
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_alias_metrics_normalize_to_tool_call_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_metric_name(
+            "codex.tool.call",
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![codex_tool_call_histogram_point("Read", 2.0)],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].harness, HarnessName::new("codex"));
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
+        assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(2));
+        assert_eq!(
+            records.tool_calls[0].kind,
+            crate::usage::ToolCallKind::Delta
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_metrics_keep_identical_points_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![
+                codex_tool_call_histogram_point("Read", 2.0),
+                codex_tool_call_histogram_point("Read", 2.0),
+            ],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 2);
+        assert_ne!(
+            records.tool_calls[0].event_key,
+            records.tool_calls[1].event_key
+        );
+        assert_eq!(
+            records
+                .tool_calls
+                .iter()
+                .map(|record| record.call_count.value())
+                .sum::<u64>(),
+            4
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_split_metrics_keep_identical_points_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_codex_split_tool_call_histogram_payload(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            codex_tool_call_histogram_point("Read", 2.0),
+            codex_tool_call_histogram_point("Read", 2.0),
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 2);
+        assert_ne!(
+            records.tool_calls[0].event_key,
+            records.tool_calls[1].event_key
+        );
+        assert_eq!(
+            records
+                .tool_calls
+                .iter()
+                .map(|record| record.call_count.value())
+                .sum::<u64>(),
+            4
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_codex_tool_call_metrics_without_tool_name_normalize_to_unknown_tool_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+            vec![
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![HistogramDataPoint {
+                attributes: Vec::new(),
+                start_time_unix_nano: 1_781_956_799_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                count: 1,
+                sum: Some(2.0),
+                bucket_counts: Vec::new(),
+                explicit_bounds: Vec::new(),
+                exemplars: Vec::new(),
+                flags: 0,
+                min: None,
+                max: None,
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(records.tool_calls[0].harness, HarnessName::new("codex"));
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Unknown"));
+        assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(2));
+        assert_eq!(
+            records.tool_calls[0].kind,
+            crate::usage::ToolCallKind::Delta
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -2934,6 +3705,95 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn protobuf_copilot_tool_call_metrics_normalize_to_tool_call_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tool_calls",
+            vec![
+                string_attribute("service.name", "github-copilot"),
+                string_attribute("repo.name", "kvasir"),
+                string_attribute("repo.path", "/repos/kvasir"),
+            ],
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("gen_ai.client.tool.name", "Read")],
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(3)),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_metrics(&payload)?;
+
+        assert!(records.token_usage.is_empty());
+        assert_eq!(records.tool_calls.len(), 1);
+        assert_eq!(
+            records.tool_calls[0].repo,
+            RepoBucket::repo(RepoIdentity::new(
+                RepoName::new("kvasir"),
+                RepoPath::new("/repos/kvasir"),
+            ))
+        );
+        assert_eq!(
+            records.tool_calls[0].harness,
+            HarnessName::new("github_copilot")
+        );
+        assert_eq!(records.tool_calls[0].tool_name, ToolName::new("Read"));
+        assert_eq!(records.tool_calls[0].call_count, ToolCallCount::new(3));
+        assert_eq!(
+            records.tool_calls[0].kind,
+            crate::usage::ToolCallKind::Cumulative {
+                counter_start: TimestampMillis::new_for_test(1_781_956_700_000)
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_copilot_tool_call_metrics_require_cumulative_counter_start() {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tool_calls",
+            Vec::new(),
+            vec![NumberDataPoint {
+                attributes: vec![string_attribute("gen_ai.tool.name", "Read")],
+                start_time_unix_nano: 0,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(3)),
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingCounterStart)
+        ));
+    }
+
+    #[test]
+    fn protobuf_copilot_tool_call_metrics_require_tool_name() {
+        let payload = protobuf_payload_with_metric_name_and_resource_attributes(
+            "github.copilot.chat.tool_calls",
+            Vec::new(),
+            vec![NumberDataPoint {
+                attributes: Vec::new(),
+                start_time_unix_nano: 1_781_956_700_000_000_000,
+                time_unix_nano: 1_781_956_800_000_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(Value::AsInt(3)),
+            }],
+        );
+
+        assert!(matches!(
+            parse_otlp_protobuf_usage_metrics(&payload),
+            Err(OtlpError::MissingToolName)
+        ));
     }
 
     #[test]
@@ -4257,12 +5117,115 @@ mod tests {
         .encode_to_vec()
     }
 
+    fn protobuf_codex_tool_call_histogram_payload_with_resource_attributes(
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<HistogramDataPoint>,
+    ) -> Vec<u8> {
+        protobuf_codex_tool_call_histogram_payload_with_metric_name(
+            "codex.turn.tool.call",
+            resource_attributes,
+            data_points,
+        )
+    }
+
+    fn protobuf_codex_tool_call_histogram_payload_with_metric_name(
+        metric_name: &str,
+        resource_attributes: Vec<KeyValue>,
+        data_points: Vec<HistogramDataPoint>,
+    ) -> Vec<u8> {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: metric_name.to_owned(),
+                        description: String::new(),
+                        unit: "{call}".to_owned(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Histogram(Histogram {
+                            data_points,
+                            aggregation_temporality: 1,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn protobuf_codex_split_tool_call_histogram_payload(
+        resource_attributes: Vec<KeyValue>,
+        first: HistogramDataPoint,
+        second: HistogramDataPoint,
+    ) -> Vec<u8> {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![
+                        Metric {
+                            name: "codex.turn.tool.call".to_owned(),
+                            description: String::new(),
+                            unit: "{call}".to_owned(),
+                            metadata: Vec::new(),
+                            data: Some(Data::Histogram(Histogram {
+                                data_points: vec![first],
+                                aggregation_temporality: 1,
+                            })),
+                        },
+                        Metric {
+                            name: "codex.turn.tool.call".to_owned(),
+                            description: String::new(),
+                            unit: "{call}".to_owned(),
+                            metadata: Vec::new(),
+                            data: Some(Data::Histogram(Histogram {
+                                data_points: vec![second],
+                                aggregation_temporality: 1,
+                            })),
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
     fn codex_histogram_point(model: &str, token_type: &str, sum: f64) -> HistogramDataPoint {
         HistogramDataPoint {
             attributes: vec![
                 string_attribute("model", model),
                 string_attribute("token_type", token_type),
             ],
+            start_time_unix_nano: 1_781_956_799_000_000_000,
+            time_unix_nano: 1_781_956_800_000_000_000,
+            count: 1,
+            sum: Some(sum),
+            bucket_counts: Vec::new(),
+            explicit_bounds: Vec::new(),
+            exemplars: Vec::new(),
+            flags: 0,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn codex_tool_call_histogram_point(tool_name: &str, sum: f64) -> HistogramDataPoint {
+        HistogramDataPoint {
+            attributes: vec![string_attribute("tool.name", tool_name)],
             start_time_unix_nano: 1_781_956_799_000_000_000,
             time_unix_nano: 1_781_956_800_000_000_000,
             count: 1,

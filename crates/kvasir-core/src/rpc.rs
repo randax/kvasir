@@ -174,6 +174,7 @@ fn is_known_claude_tool_name(value: &str) -> bool {
             | "Read"
             | "Task"
             | "TodoWrite"
+            | "Unknown"
             | "WebFetch"
             | "WebSearch"
             | "Write"
