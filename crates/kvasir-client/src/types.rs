@@ -121,6 +121,13 @@ pub struct KvasirToolCallRollup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewRollup {
+    pub token_rollups: Vec<KvasirTokenRollup>,
+    pub cost_rollups: Vec<KvasirCostRollup>,
+    pub tool_call_rollups: Vec<KvasirToolCallRollup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirTrace {
     pub session_id: KvasirSessionId,
     pub prompt_id: KvasirPromptId,

@@ -6,9 +6,9 @@ use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
     KvasirClient, KvasirClientError, KvasirCostRollup, KvasirCostUsd, KvasirHarnessName,
-    KvasirModelName, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
-    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath,
-    KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirModelName, KvasirOverviewRollup, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind,
+    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId,
+    KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
     KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures,
     KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
@@ -371,6 +371,176 @@ async fn client_queries_protobuf_claude_trace_by_session_and_prompt() -> anyhow:
     );
     assert_eq!(traces[0].spans[0].span_id, span("1111111111111111"));
     assert_eq!(traces[0].durations.request_ms, Some(2_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+    let http_client = reqwest::Client::new();
+
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(native_cost_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    http_client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_tool_result_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: Some(kvasir_repo()),
+    };
+    let overview = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.overview_rollups(query)
+    })
+    .await??;
+
+    assert_eq!(
+        overview,
+        KvasirOverviewRollup {
+            token_rollups: vec![
+                KvasirTokenRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-opus-4-20250514"),
+                    input_tokens: 1100,
+                    output_tokens: 500,
+                    cache_tokens: 100,
+                },
+                KvasirTokenRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-sonnet-4-20250514"),
+                    input_tokens: 300,
+                    output_tokens: 120,
+                    cache_tokens: 30,
+                },
+                KvasirTokenRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 21,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-sonnet-4-20250514"),
+                    input_tokens: 2000,
+                    output_tokens: 800,
+                    cache_tokens: 50,
+                },
+            ],
+            cost_rollups: vec![
+                KvasirCostRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-opus-4-20250514"),
+                    cost_usd: KvasirCostUsd {
+                        nanos: 1_250_000_000,
+                    },
+                },
+                KvasirCostRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-sonnet-4-20250514"),
+                    cost_usd: KvasirCostUsd { nanos: 200_000_000 },
+                },
+                KvasirCostRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 21,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-opus-4-20250514"),
+                    cost_usd: KvasirCostUsd { nanos: 500_000_000 },
+                },
+                KvasirCostRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 21,
+                    },
+                    repo: kvasir_repo(),
+                    model: model("claude-sonnet-4-20250514"),
+                    cost_usd: KvasirCostUsd { nanos: 18_015_000 },
+                },
+            ],
+            tool_call_rollups: vec![
+                KvasirToolCallRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    repo: kvasir_repo(),
+                    harness: harness("claude_code"),
+                    tool_name: tool("Bash"),
+                    call_count: 1,
+                },
+                KvasirToolCallRollup {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    repo: kvasir_repo(),
+                    harness: harness("claude_code"),
+                    tool_name: tool("Read"),
+                    call_count: 2,
+                },
+            ],
+        }
+    );
 
     Ok(())
 }

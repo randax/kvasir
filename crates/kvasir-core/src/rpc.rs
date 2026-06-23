@@ -358,6 +358,13 @@ pub struct ToolCallRollup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverviewRollup {
+    pub token_rollups: Vec<TokenRollup>,
+    pub cost_rollups: Vec<CostRollup>,
+    pub tool_call_rollups: Vec<ToolCallRollup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trace {
     pub session_id: SessionId,
     pub prompt_id: PromptId,
@@ -433,6 +440,7 @@ pub enum CostSource {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcRequest {
     TokenRollup { query: RollupQuery },
+    OverviewRollup { query: RollupQuery },
     CostRollup { query: CostRollupQuery },
     ToolCallRollup { query: ToolCallRollupQuery },
     Trace { query: TraceQuery },
@@ -443,6 +451,7 @@ pub enum RpcRequest {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcResponse {
     TokenRollup { rollups: Vec<TokenRollup> },
+    OverviewRollup { rollup: OverviewRollup },
     CostRollup { rollups: Vec<CostRollup> },
     ToolCallRollup { rollups: Vec<ToolCallRollup> },
     Trace { traces: Vec<Trace> },

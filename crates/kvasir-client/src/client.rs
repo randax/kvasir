@@ -8,7 +8,7 @@ use kvasir_core::rpc::{RpcRequest, RpcResponse, RpcStreamEvent};
 use crate::error::KvasirClientError;
 use crate::transport::{connect_with_retries, read_rpc_stream_event, send_rpc_request};
 use crate::types::{
-    KvasirCostRollup, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
+    KvasirCostRollup, KvasirOverviewRollup, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
     KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
 };
 
@@ -46,6 +46,23 @@ impl KvasirClient {
                 .into_iter()
                 .map(KvasirTokenRollup::try_from)
                 .collect::<Result<Vec<_>, _>>(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn overview_rollups(
+        &self,
+        query: KvasirRollupQuery,
+    ) -> Result<KvasirOverviewRollup, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::OverviewRollup {
+                query: query.try_into()?,
+            },
+        )?;
+        match response {
+            RpcResponse::OverviewRollup { rollup } => rollup.try_into(),
             RpcResponse::Error { error } => Err(error.into()),
             _ => Err(KvasirClientError::WrongResponseType),
         }
