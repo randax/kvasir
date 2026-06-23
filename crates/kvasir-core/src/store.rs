@@ -8,9 +8,9 @@ use crate::pricing::PriceTable;
 use crate::rpc::{
     ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay, ContentReplayItem,
     ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName,
-    RollupDay, RollupQuery, SpanId, SpanName, TimestampMillis, TokenRollup, ToolCallRollup,
-    ToolCallRollupQuery, ToolName, Trace, TraceDurationMeasures, TraceId, TraceQuery, TraceSpan,
-    TraceSpanKind,
+    PromptId, RollupDay, RollupQuery, SessionId, SpanId, SpanName, TimestampMillis, TokenRollup,
+    ToolCallRollup, ToolCallRollupQuery, ToolName, Trace, TraceDurationMeasures, TraceId,
+    TraceQuery, TraceSpan, TraceSpanKind,
 };
 use crate::usage::{
     ContentKind, ContentRecord, ContentText, CostUsageRecord, RepoBucket, RepoIdentity, RepoName,
@@ -18,7 +18,7 @@ use crate::usage::{
     ToolCallKind, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -476,12 +476,16 @@ impl UsageStore {
                 duration_ms,
                 tool_name
              FROM canonical_trace_spans
-             WHERE session_id = ?1 AND prompt_id = ?2
+             WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
              ORDER BY trace_id, started_at_ms, span_id",
         )?;
         let rows = statement
             .query_map(
-                params![query.session_id.as_str(), query.prompt_id.as_str()],
+                params![
+                    query.harness.as_str(),
+                    query.session_id.as_str(),
+                    query.prompt_id.as_str()
+                ],
                 |row| {
                     let kind: String = row.get(3)?;
                     let parent_span_id: Option<String> = row.get(2)?;
@@ -562,13 +566,34 @@ impl UsageStore {
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        let availability = content_availability(&query.harness, &items);
+        let prompt_exists = !items.is_empty()
+            || self.prompt_exists(&query.harness, &query.session_id, &query.prompt_id)?;
+        let availability = content_availability(&query.harness, &items, prompt_exists);
         Ok(ContentReplay {
             session_id: query.session_id,
             prompt_id: query.prompt_id,
             items,
             availability,
         })
+    }
+
+    fn prompt_exists(
+        &self,
+        harness: &HarnessName,
+        session_id: &SessionId,
+        prompt_id: &PromptId,
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM canonical_trace_spans
+                    WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
+                )",
+                params![harness.as_str(), session_id.as_str(), prompt_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
@@ -586,21 +611,28 @@ impl UsageStore {
         let transaction = self.connection.transaction()?;
         match schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            8 => migrate_v8_to_v9(&transaction)?,
+            9 => migrate_v9_to_v10(&transaction)?,
+            8 => {
+                migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
+            }
             7 => {
                 migrate_v7_to_v8(&transaction)?;
                 migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
             }
             6 => {
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
                 migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
             }
             5 => {
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
                 migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
             }
             4 => {
                 migrate_v4_to_v5(&transaction)?;
@@ -608,6 +640,7 @@ impl UsageStore {
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
                 migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
             }
             3 => {
                 migrate_v3_to_v4(&transaction)?;
@@ -616,6 +649,7 @@ impl UsageStore {
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
                 migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
             }
             2 => {
                 migrate_v2_to_v4(&transaction)?;
@@ -624,6 +658,7 @@ impl UsageStore {
                 migrate_v6_to_v7(&transaction)?;
                 migrate_v7_to_v8(&transaction)?;
                 migrate_v8_to_v9(&transaction)?;
+                migrate_v9_to_v10(&transaction)?;
             }
             _ if schema_version < 2 => drop_incompatible_usage_tables(&transaction)?,
             _ => {}
@@ -749,6 +784,7 @@ impl UsageStore {
 
             CREATE TABLE IF NOT EXISTS canonical_trace_spans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                harness TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 prompt_id TEXT NOT NULL,
                 trace_id TEXT NOT NULL,
@@ -760,7 +796,7 @@ impl UsageStore {
                 ended_at_ms INTEGER NOT NULL,
                 duration_ms INTEGER NOT NULL,
                 tool_name TEXT,
-                UNIQUE(session_id, prompt_id, trace_id, span_id)
+                UNIQUE(harness, session_id, prompt_id, trace_id, span_id)
             );
 
             CREATE TABLE IF NOT EXISTS canonical_content_records (
@@ -780,7 +816,7 @@ impl UsageStore {
         )?;
         transaction.execute(
             "CREATE INDEX IF NOT EXISTS canonical_trace_spans_session_prompt
-             ON canonical_trace_spans (session_id, prompt_id, started_at_ms, span_id)",
+             ON canonical_trace_spans (harness, session_id, prompt_id, started_at_ms, span_id)",
             [],
         )?;
         transaction.execute(
@@ -1222,6 +1258,7 @@ impl UsageStore {
         for record in records {
             transaction.execute(
                 "INSERT OR REPLACE INTO canonical_trace_spans (
+                    harness,
                     session_id,
                     prompt_id,
                     trace_id,
@@ -1233,8 +1270,9 @@ impl UsageStore {
                     ended_at_ms,
                     duration_ms,
                     tool_name
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
+                    record.harness.as_str(),
                     record.session_id.as_str(),
                     record.prompt_id.as_str(),
                     record.trace_id.as_str(),
@@ -1674,6 +1712,7 @@ fn migrate_v4_to_v5(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS canonical_trace_spans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            harness TEXT NOT NULL DEFAULT 'unknown',
             session_id TEXT NOT NULL,
             prompt_id TEXT NOT NULL,
             trace_id TEXT NOT NULL,
@@ -1685,11 +1724,11 @@ fn migrate_v4_to_v5(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
             ended_at_ms INTEGER NOT NULL,
             duration_ms INTEGER NOT NULL,
             tool_name TEXT,
-            UNIQUE(session_id, prompt_id, trace_id, span_id)
+            UNIQUE(harness, session_id, prompt_id, trace_id, span_id)
         );
 
         CREATE INDEX IF NOT EXISTS canonical_trace_spans_session_prompt
-        ON canonical_trace_spans (session_id, prompt_id, started_at_ms, span_id);",
+        ON canonical_trace_spans (harness, session_id, prompt_id, started_at_ms, span_id);",
     )?;
     Ok(())
 }
@@ -1846,6 +1885,104 @@ fn migrate_v8_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
     Ok(())
 }
 
+fn migrate_v9_to_v10(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_trace_spans")? {
+        let has_harness = table_column_exists(transaction, "canonical_trace_spans", "harness")?;
+        transaction.execute_batch(
+            "CREATE TABLE canonical_trace_spans_v10 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                harness TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                span_id TEXT NOT NULL,
+                parent_span_id TEXT,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                tool_name TEXT,
+                UNIQUE(harness, session_id, prompt_id, trace_id, span_id)
+            );",
+        )?;
+        if has_harness {
+            transaction.execute_batch(
+                "INSERT INTO canonical_trace_spans_v10 (
+                    id,
+                    harness,
+                    session_id,
+                    prompt_id,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    kind,
+                    name,
+                    started_at_ms,
+                    ended_at_ms,
+                    duration_ms,
+                    tool_name
+                )
+                SELECT
+                    id,
+                    harness,
+                    session_id,
+                    prompt_id,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    kind,
+                    name,
+                    started_at_ms,
+                    ended_at_ms,
+                    duration_ms,
+                    tool_name
+                FROM canonical_trace_spans;",
+            )?;
+        } else {
+            transaction.execute_batch(
+                "INSERT INTO canonical_trace_spans_v10 (
+                    id,
+                    harness,
+                    session_id,
+                    prompt_id,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    kind,
+                    name,
+                    started_at_ms,
+                    ended_at_ms,
+                    duration_ms,
+                    tool_name
+                )
+                SELECT
+                    id,
+                    'unknown',
+                    session_id,
+                    prompt_id,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    kind,
+                    name,
+                    started_at_ms,
+                    ended_at_ms,
+                    duration_ms,
+                    tool_name
+                FROM canonical_trace_spans;",
+            )?;
+        }
+        transaction.execute_batch(
+            "DROP TABLE canonical_trace_spans;
+             ALTER TABLE canonical_trace_spans_v10 RENAME TO canonical_trace_spans;
+             CREATE INDEX canonical_trace_spans_session_prompt
+             ON canonical_trace_spans (harness, session_id, prompt_id, started_at_ms, span_id);",
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_v2_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     transaction.execute_batch(
         "ALTER TABLE canonical_cost_usage ADD COLUMN counter_start_ms INTEGER;
@@ -1883,8 +2020,12 @@ fn content_kind_from_storage(value: &str) -> rusqlite::Result<ContentKind> {
     })
 }
 
-fn content_availability(harness: &HarnessName, items: &[ContentReplayItem]) -> ContentAvailability {
-    if items.is_empty() {
+fn content_availability(
+    harness: &HarnessName,
+    items: &[ContentReplayItem],
+    prompt_exists: bool,
+) -> ContentAvailability {
+    if !prompt_exists {
         return ContentAvailability::Unavailable {
             reason: ContentUnavailableReason::PromptNotFound,
         };
@@ -1920,6 +2061,9 @@ fn content_availability(harness: &HarnessName, items: &[ContentReplayItem]) -> C
 
 fn content_kinds_provided_by(harness: &HarnessName) -> Vec<ContentKind> {
     match harness.as_str() {
+        "claude" | "claude_code" => ContentKind::ALL.to_vec(),
+        "codex" => ContentKind::ALL.to_vec(),
+        "github_copilot" => ContentKind::ALL.to_vec(),
         "opencode" => ContentKind::ALL.to_vec(),
         _ => Vec::new(),
     }
@@ -5262,6 +5406,7 @@ mod tests {
             }]
         );
         let trace_query = TraceQuery {
+            harness: HarnessName::new("claude"),
             session_id: crate::rpc::SessionId::new("session-12"),
             prompt_id: crate::rpc::PromptId::new("prompt-7"),
         };
@@ -5270,6 +5415,7 @@ mod tests {
             cost_usage: Vec::new(),
             tool_calls: Vec::new(),
             trace_spans: vec![crate::usage::TraceSpanRecord {
+                harness: HarnessName::new("claude"),
                 session_id: trace_query.session_id.clone(),
                 prompt_id: trace_query.prompt_id.clone(),
                 trace_id: TraceId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -5542,6 +5688,104 @@ mod tests {
     }
 
     #[test]
+    fn opening_v9_schema_adds_trace_harness_scope() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE canonical_trace_spans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                span_id TEXT NOT NULL,
+                parent_span_id TEXT,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                tool_name TEXT,
+                UNIQUE(session_id, prompt_id, trace_id, span_id)
+            );
+
+            INSERT INTO canonical_trace_spans (
+                session_id,
+                prompt_id,
+                trace_id,
+                span_id,
+                kind,
+                name,
+                started_at_ms,
+                ended_at_ms,
+                duration_ms
+            ) VALUES (
+                'session-12',
+                'prompt-7',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                '1111111111111111',
+                'interaction',
+                'claude.interaction',
+                1781956800000,
+                1781956801000,
+                1000
+            );
+
+            PRAGMA user_version = 9;",
+        )?;
+        drop(connection);
+
+        let store = open_test_store(&database_path)?;
+        drop(store);
+
+        let connection = open_raw_test_connection(&database_path)?;
+        let harness_column_count: i64 = connection.query_row(
+            "SELECT COUNT(*)
+             FROM pragma_table_info('canonical_trace_spans')
+             WHERE name = 'harness'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(harness_column_count, 1);
+        let harness: String =
+            connection.query_row("SELECT harness FROM canonical_trace_spans", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(harness, "unknown");
+        let user_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(user_version, CURRENT_SCHEMA_VERSION);
+        connection.execute(
+            "INSERT INTO canonical_trace_spans (
+                harness,
+                session_id,
+                prompt_id,
+                trace_id,
+                span_id,
+                kind,
+                name,
+                started_at_ms,
+                ended_at_ms,
+                duration_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                "codex",
+                "session-12",
+                "prompt-7",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                "interaction",
+                "codex.interaction",
+                1_781_956_801_000_i64,
+                1_781_956_802_000_i64,
+                1_000_i64,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
     fn opening_v4_schema_chains_through_token_signal_migration()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -5703,6 +5947,7 @@ mod tests {
         let store = open_test_store(&database_path)?;
         store.connection.execute(
             "INSERT INTO canonical_trace_spans (
+                harness,
                 session_id,
                 prompt_id,
                 trace_id,
@@ -5712,8 +5957,9 @@ mod tests {
                 started_at_ms,
                 ended_at_ms,
                 duration_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
+                "claude",
                 "session-12",
                 "prompt-7",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -5728,6 +5974,7 @@ mod tests {
 
         let error = store
             .traces(TraceQuery {
+                harness: HarnessName::new("claude"),
                 session_id: crate::rpc::SessionId::new("session-12"),
                 prompt_id: crate::rpc::PromptId::new("prompt-7"),
             })

@@ -295,6 +295,7 @@ pub struct ToolCallRollupQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceQuery {
+    pub harness: HarnessName,
     pub session_id: SessionId,
     pub prompt_id: PromptId,
 }

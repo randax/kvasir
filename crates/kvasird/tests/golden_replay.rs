@@ -260,6 +260,7 @@ async fn golden_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Resu
     let traces = query_trace(
         rpc_socket_path,
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("codex"),
             session_id: kvasir_core::rpc::SessionId::new("codex-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("codex-turn-1"),
         },
@@ -303,6 +304,7 @@ async fn golden_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::Re
     let traces = query_trace(
         rpc_socket_path,
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("github_copilot"),
             session_id: kvasir_core::rpc::SessionId::new("copilot-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("copilot-turn-1"),
         },
@@ -346,6 +348,7 @@ async fn protobuf_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Re
     let traces = query_trace(
         rpc_socket_path,
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("codex"),
             session_id: kvasir_core::rpc::SessionId::new("codex-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("codex-turn-1"),
         },
@@ -389,6 +392,7 @@ async fn protobuf_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::
     let traces = query_trace(
         rpc_socket_path,
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("github_copilot"),
             session_id: kvasir_core::rpc::SessionId::new("copilot-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("copilot-turn-1"),
         },
@@ -499,6 +503,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
     let traces = query_trace(
         rpc_socket_path.clone(),
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("opencode"),
             session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
         },
@@ -659,6 +664,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
     let traces = query_trace(
         rpc_socket_path,
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("opencode"),
             session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
         },
@@ -719,6 +725,7 @@ async fn opencode_trace_ingest_degrades_when_experimental_attributes_are_missing
     let traces = query_trace(
         rpc_socket_path,
         kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("opencode"),
             session_id: kvasir_core::rpc::SessionId::new("opencode-session-2"),
             prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-2"),
         },

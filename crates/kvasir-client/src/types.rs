@@ -87,6 +87,7 @@ pub struct KvasirRollupQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirTraceQuery {
+    pub harness: KvasirHarnessName,
     pub session_id: KvasirSessionId,
     pub prompt_id: KvasirPromptId,
 }
