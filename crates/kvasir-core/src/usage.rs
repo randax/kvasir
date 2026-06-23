@@ -137,6 +137,27 @@ impl TokenCount {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallCount(u64);
+
+impl ToolCallCount {
+    pub fn new(value: u64) -> Self {
+        Self::try_new(value).expect("tool call count must fit SQLite integer storage")
+    }
+
+    pub fn try_new(value: u64) -> Option<Self> {
+        i64::try_from(value).ok().map(|_| Self(value))
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
+
+    pub fn storage_value(self) -> i64 {
+        i64::try_from(self.0).expect("tool call count is validated before storage")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsageRecord {
     pub occurred_at: TimestampMillis,
@@ -192,6 +213,14 @@ pub struct ToolCallRecord {
     pub repo: RepoBucket,
     pub harness: HarnessName,
     pub tool_name: ToolName,
+    pub call_count: ToolCallCount,
+    pub kind: ToolCallKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolCallKind {
+    Delta,
+    Cumulative { counter_start: TimestampMillis },
 }
 
 impl ToolCallRecord {
@@ -202,12 +231,52 @@ impl ToolCallRecord {
         harness: HarnessName,
         tool_name: ToolName,
     ) -> Self {
+        Self::new_counted(
+            event_key,
+            occurred_at,
+            repo,
+            harness,
+            tool_name,
+            ToolCallCount::new(1),
+        )
+    }
+
+    pub fn new_counted(
+        event_key: ToolCallEventKey,
+        occurred_at: TimestampMillis,
+        repo: RepoBucket,
+        harness: HarnessName,
+        tool_name: ToolName,
+        call_count: ToolCallCount,
+    ) -> Self {
         Self {
             event_key,
             occurred_at,
             repo,
             harness,
             tool_name,
+            call_count,
+            kind: ToolCallKind::Delta,
+        }
+    }
+
+    pub fn new_cumulative(
+        event_key: ToolCallEventKey,
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        repo: RepoBucket,
+        harness: HarnessName,
+        tool_name: ToolName,
+        call_count: ToolCallCount,
+    ) -> Self {
+        Self {
+            event_key,
+            occurred_at,
+            repo,
+            harness,
+            tool_name,
+            call_count,
+            kind: ToolCallKind::Cumulative { counter_start },
         }
     }
 }

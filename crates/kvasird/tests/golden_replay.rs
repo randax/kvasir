@@ -841,6 +841,84 @@ async fn logs_ingest_returns_tool_call_rollups_by_tool_and_repo() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn metrics_and_logs_ingest_return_tool_call_rollups_for_all_harnesses() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token,
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_tool_result_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(tool_call_metrics_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert_eq!(
+        query_tool_call_rollup(
+            rpc_socket_path,
+            ToolCallRollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+            .with_repo(kvasir_repo())
+        )
+        .await?,
+        vec![
+            ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                harness: claude_code_harness(),
+                tool_name: ToolName::new("Bash"),
+                call_count: 1,
+            },
+            ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                harness: claude_code_harness(),
+                tool_name: ToolName::new("Read"),
+                call_count: 2,
+            },
+            ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                harness: HarnessName::new("codex"),
+                tool_name: ToolName::new("Read"),
+                call_count: 2,
+            },
+            ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo(),
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 3,
+            },
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn protobuf_logs_ingest_returns_tool_call_rollups() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
@@ -1875,6 +1953,65 @@ fn claude_tool_result_logs_fixture() -> &'static str {
                         "attributes": [
                             { "key": "tool.name", "value": { "stringValue": "Read" } }
                         ]
+                    }]
+                }]
+            }
+        ]
+    }"#
+}
+
+fn tool_call_metrics_fixture() -> &'static str {
+    r#"{
+        "resourceMetrics": [
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "codex" } },
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "codex.turn.tool.call",
+                        "histogram": {
+                            "aggregationTemporality": 1,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956799000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "count": "1",
+                                "sum": 2,
+                                "attributes": [
+                                    { "key": "tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
+                    }]
+                }]
+            },
+            {
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "github-copilot" } },
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
+                    ]
+                },
+                "scopeMetrics": [{
+                    "metrics": [{
+                        "name": "github.copilot.chat.tool_calls",
+                        "sum": {
+                            "aggregationTemporality": 2,
+                            "isMonotonic": true,
+                            "dataPoints": [{
+                                "startTimeUnixNano": "1781956700000000000",
+                                "timeUnixNano": "1781956800000000000",
+                                "asInt": "3",
+                                "attributes": [
+                                    { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                                ]
+                            }]
+                        }
                     }]
                 }]
             }

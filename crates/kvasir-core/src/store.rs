@@ -12,10 +12,11 @@ use crate::rpc::{
 };
 use crate::usage::{
     ContentRecord, CostUsageRecord, RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount,
-    TokenMeasure, TokenUsageKind, TokenUsageRecord, TokenUsageSignal, ToolCallRecord, UsageRecords,
+    TokenMeasure, TokenUsageKind, TokenUsageRecord, TokenUsageSignal, ToolCallKind, ToolCallRecord,
+    UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -30,6 +31,14 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("sqlite schema version {found} is newer than supported version {supported}")]
     IncompatibleSchema { found: i64, supported: i64 },
+    #[error("non-monotonic cumulative tool-call counter")]
+    NonMonotonicToolCallCounter {
+        harness: HarnessName,
+        tool_name: ToolName,
+        counter_start: TimestampMillis,
+        previous_value: i64,
+        current_value: i64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -528,27 +537,35 @@ impl UsageStore {
         let transaction = self.connection.transaction()?;
         match schema_version {
             CURRENT_SCHEMA_VERSION => {}
-            6 => migrate_v6_to_v7(&transaction)?,
+            7 => migrate_v7_to_v8(&transaction)?,
+            6 => {
+                migrate_v6_to_v7(&transaction)?;
+                migrate_v7_to_v8(&transaction)?;
+            }
             5 => {
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
+                migrate_v7_to_v8(&transaction)?;
             }
             4 => {
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
+                migrate_v7_to_v8(&transaction)?;
             }
             3 => {
                 migrate_v3_to_v4(&transaction)?;
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
+                migrate_v7_to_v8(&transaction)?;
             }
             2 => {
                 migrate_v2_to_v4(&transaction)?;
                 migrate_v4_to_v5(&transaction)?;
                 migrate_v5_to_v6(&transaction)?;
                 migrate_v6_to_v7(&transaction)?;
+                migrate_v7_to_v8(&transaction)?;
             }
             _ if schema_version < 2 => drop_incompatible_usage_tables(&transaction)?,
             _ => {}
@@ -658,6 +675,18 @@ impl UsageStore {
                 tool_name TEXT NOT NULL,
                 call_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(day, repo_bucket, repo_name, repo_path, harness, tool_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_call_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, harness, tool_name, counter_start_ms)
             );
 
             CREATE TABLE IF NOT EXISTS canonical_trace_spans (
@@ -999,10 +1028,13 @@ impl UsageStore {
         for record in records {
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
+            let Some(call_count) = Self::tool_call_delta(transaction, record, &stored_repo)? else {
+                continue;
+            };
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO canonical_tool_calls (
                     event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -1012,6 +1044,7 @@ impl UsageStore {
                     stored_repo.path,
                     record.harness.as_str(),
                     record.tool_name.as_str(),
+                    call_count,
                 ],
             )?;
             if inserted == 0 {
@@ -1021,7 +1054,7 @@ impl UsageStore {
             transaction.execute(
                 "INSERT INTO tool_call_rollups (
                     day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(day, repo_bucket, repo_name, repo_path, harness, tool_name) DO UPDATE SET
                     call_count = call_count + excluded.call_count",
                 params![
@@ -1031,10 +1064,90 @@ impl UsageStore {
                     stored_repo.path,
                     record.harness.as_str(),
                     record.tool_name.as_str(),
+                    call_count,
                 ],
             )?;
         }
         Ok(())
+    }
+
+    fn tool_call_delta(
+        transaction: &rusqlite::Transaction<'_>,
+        record: &ToolCallRecord,
+        stored_repo: &StoredRepo<'_>,
+    ) -> Result<Option<i64>, StoreError> {
+        let current_value = record.call_count.storage_value();
+        let ToolCallKind::Cumulative { counter_start } = record.kind else {
+            return Ok(Some(current_value));
+        };
+
+        let previous_value = transaction.query_row(
+            "SELECT last_occurred_at_ms, last_value
+             FROM tool_call_counter_snapshots
+             WHERE repo_bucket = ?1
+                AND repo_name = ?2
+                AND repo_path = ?3
+                AND harness = ?4
+                AND tool_name = ?5
+                AND counter_start_ms = ?6",
+            params![
+                stored_repo.bucket,
+                stored_repo.name,
+                stored_repo.path,
+                record.harness.as_str(),
+                record.tool_name.as_str(),
+                counter_start.value(),
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        );
+
+        let delta = match previous_value {
+            Ok((last_occurred_at_ms, _previous_value))
+                if record.occurred_at.value() <= last_occurred_at_ms =>
+            {
+                return Ok(None);
+            }
+            Ok((_last_occurred_at_ms, previous_value)) if current_value > previous_value => {
+                current_value - previous_value
+            }
+            Ok((_last_occurred_at_ms, previous_value)) if current_value == previous_value => 0,
+            Ok((_last_occurred_at_ms, previous_value)) => {
+                return Err(StoreError::NonMonotonicToolCallCounter {
+                    harness: record.harness.clone(),
+                    tool_name: record.tool_name.clone(),
+                    counter_start,
+                    previous_value,
+                    current_value,
+                });
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => current_value,
+            Err(err) => return Err(StoreError::Sqlite(err)),
+        };
+
+        transaction.execute(
+            "INSERT INTO tool_call_counter_snapshots (
+                repo_bucket, repo_name, repo_path, harness, tool_name, counter_start_ms, last_occurred_at_ms, last_value
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(repo_bucket, repo_name, repo_path, harness, tool_name, counter_start_ms) DO UPDATE SET
+                last_occurred_at_ms = excluded.last_occurred_at_ms,
+                last_value = excluded.last_value",
+            params![
+                stored_repo.bucket,
+                stored_repo.name,
+                stored_repo.path,
+                record.harness.as_str(),
+                record.tool_name.as_str(),
+                counter_start.value(),
+                record.occurred_at.value(),
+                current_value,
+            ],
+        )?;
+
+        if delta == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(delta))
+        }
     }
 
     fn ingest_trace_spans_in_transaction(
@@ -1476,6 +1589,7 @@ fn drop_incompatible_usage_tables(
         "DROP TABLE IF EXISTS canonical_token_usage;
         DROP TABLE IF EXISTS canonical_cost_usage;
         DROP TABLE IF EXISTS canonical_tool_calls;
+        DROP TABLE IF EXISTS tool_call_counter_snapshots;
         DROP TABLE IF EXISTS canonical_trace_spans;
         DROP TABLE IF EXISTS canonical_content_records;
         DROP TABLE IF EXISTS cumulative_counter_snapshots;
@@ -1606,6 +1720,33 @@ fn migrate_v6_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
             harness TEXT NOT NULL,
             content_kind TEXT NOT NULL,
             content TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v7_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_tool_calls")?
+        && !table_column_exists(transaction, "canonical_tool_calls", "call_count")?
+    {
+        transaction.execute(
+            "ALTER TABLE canonical_tool_calls
+             ADD COLUMN call_count INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tool_call_counter_snapshots (
+            repo_bucket TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            harness TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            counter_start_ms INTEGER NOT NULL,
+            last_occurred_at_ms INTEGER NOT NULL,
+            last_value INTEGER NOT NULL,
+            PRIMARY KEY(repo_bucket, repo_name, repo_path, harness, tool_name, counter_start_ms)
         );",
     )?;
     Ok(())
@@ -2551,6 +2692,340 @@ mod tests {
                 harness: HarnessName::new("claude_code"),
                 tool_name: ToolName::new("Write"),
                 call_count: 1,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_rollups_span_claude_codex_and_copilot_by_tool_and_repo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: vec![tool_call_record_for_repo(
+                repo.clone(),
+                "claude_code",
+                "Read",
+                1_781_956_800_000,
+            )],
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+        })?;
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            codex_tool_call_metric_json_payload("Read", 2).as_bytes(),
+        )?)?;
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_tool_call_metric_json_payload("Read", 3).as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![
+                ToolCallRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: repo.clone(),
+                    harness: HarnessName::new("claude_code"),
+                    tool_name: ToolName::new("Read"),
+                    call_count: 1,
+                },
+                ToolCallRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo: repo.clone(),
+                    harness: HarnessName::new("codex"),
+                    tool_name: ToolName::new("Read"),
+                    call_count: 2,
+                },
+                ToolCallRollup {
+                    day: RollupDay::parse("2026-06-20")?,
+                    repo,
+                    harness: HarnessName::new("github_copilot"),
+                    tool_name: ToolName::new("Read"),
+                    call_count: 3,
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_tool_call_counters_roll_up_only_new_calls() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_cumulative_tool_call_metric_json_payload("Read", 3, 5).as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 5,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_tool_call_counter_replays_do_not_double_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+        let records = parse_otlp_json_usage_metrics(
+            copilot_cumulative_tool_call_metric_json_payload("Read", 3, 5).as_bytes(),
+        )?;
+
+        store.ingest_usage(&records)?;
+        store.ingest_usage(&records)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 5,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_tool_call_counter_ignores_out_of_order_samples()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_cumulative_tool_call_metric_json_payload("Read", 3, 5).as_bytes(),
+        )?)?;
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_tool_call_metric_json_payload_at("Read", 4, "1781956850000000000").as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 5,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_tool_call_counter_rejects_non_monotonic_sample()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        let error = store
+            .ingest_usage(&parse_otlp_json_usage_metrics(
+                copilot_cumulative_tool_call_metric_json_payload("Read", 5, 2).as_bytes(),
+            )?)
+            .expect_err("same cumulative counter cannot decrease");
+
+        assert!(matches!(
+            error,
+            StoreError::NonMonotonicToolCallCounter {
+                harness,
+                tool_name,
+                previous_value: 5,
+                current_value: 2,
+                ..
+            } if harness == HarnessName::new("github_copilot") && tool_name == ToolName::new("Read")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_tool_call_counter_restart_rolls_up_current_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_tool_call_metric_json_payload("Read", 5).as_bytes(),
+        )?)?;
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_tool_call_metric_json_payload_with_counter_start(
+                "Read",
+                2,
+                "1781956900000000000",
+                "1781956950000000000",
+            )
+            .as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 7,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_tool_call_counter_restarted_series_do_not_collide_on_event_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_tool_call_metric_json_payload_with_counter_start(
+                "Read",
+                2,
+                "1781956700000000000",
+                "1781956800000000000",
+            )
+            .as_bytes(),
+        )?)?;
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_tool_call_metric_json_payload_with_counter_start(
+                "Read",
+                2,
+                "1781956750000000000",
+                "1781956800000000000",
+            )
+            .as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 4,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tool_call_histograms_roll_up_each_delta_point()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            codex_two_point_tool_call_metric_json_payload("Read", 2, 3).as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("codex"),
+                tool_name: ToolName::new("Read"),
+                call_count: 5,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_tool_call_histograms_keep_identical_points_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            codex_duplicate_tool_call_metric_json_payload("Read", 2).as_bytes(),
+        )?)?;
+
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("codex"),
+                tool_name: ToolName::new("Read"),
+                call_count: 4,
             }]
         );
 
@@ -4690,6 +5165,105 @@ mod tests {
     }
 
     #[test]
+    fn opening_v7_schema_adds_tool_call_count_storage() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE canonical_tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL
+            );
+
+            INSERT INTO canonical_tool_calls (
+                event_key,
+                occurred_at_ms,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name
+            ) VALUES (
+                'legacy-tool-call',
+                1781956800000,
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/not/persisted',
+                'claude_code',
+                'Read'
+            );
+
+            PRAGMA user_version = 7;",
+        )?;
+        drop(connection);
+
+        let mut store = open_test_store(&database_path)?;
+
+        assert_eq!(
+            store.tool_call_rollups(ToolCallRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            ))?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                harness: HarnessName::new("claude_code"),
+                tool_name: ToolName::new("Read"),
+                call_count: 1,
+            }]
+        );
+        store.ingest_usage(&parse_otlp_json_usage_metrics(
+            copilot_cumulative_tool_call_metric_json_payload("Read", 3, 5).as_bytes(),
+        )?)?;
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(kvasir_repo("/repos/kvasir"))
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("github_copilot"),
+                tool_name: ToolName::new("Read"),
+                call_count: 5,
+            }]
+        );
+        drop(store);
+
+        let connection = open_raw_test_connection(&database_path)?;
+        let call_count_column_count: i64 = connection.query_row(
+            "SELECT COUNT(*)
+             FROM pragma_table_info('canonical_tool_calls')
+             WHERE name = 'call_count'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(call_count_column_count, 1);
+        let snapshot_table_count: i64 = connection.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'table' AND name = 'tool_call_counter_snapshots'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(snapshot_table_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
     fn opening_v4_schema_chains_through_token_signal_migration()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -5201,6 +5775,233 @@ mod tests {
             repo,
             HarnessName::new(harness),
             ToolName::new(tool_name),
+        )
+    }
+
+    fn codex_tool_call_metric_json_payload(tool_name: &str, count: u64) -> String {
+        format!(
+            r#"{{
+                "resourceMetrics": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "codex" }} }},
+                            {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                            {{ "key": "repo.path", "value": {{ "stringValue": "/repos/kvasir" }} }}
+                        ]
+                    }},
+                    "scopeMetrics": [{{
+                        "metrics": [{{
+                            "name": "codex.turn.tool.call",
+                            "histogram": {{
+                                "aggregationTemporality": 1,
+                                "dataPoints": [{{
+                                    "startTimeUnixNano": "1781956799000000000",
+                                    "timeUnixNano": "1781956800000000000",
+                                    "count": "1",
+                                    "sum": {count},
+                                    "attributes": [
+                                        {{ "key": "tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                    ]
+                                }}]
+                            }}
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
+    fn copilot_tool_call_metric_json_payload(tool_name: &str, count: u64) -> String {
+        copilot_tool_call_metric_json_payload_at(tool_name, count, "1781956800000000000")
+    }
+
+    fn copilot_tool_call_metric_json_payload_at(
+        tool_name: &str,
+        count: u64,
+        time_unix_nano: &str,
+    ) -> String {
+        copilot_tool_call_metric_json_payload_with_counter_start(
+            tool_name,
+            count,
+            "1781956700000000000",
+            time_unix_nano,
+        )
+    }
+
+    fn copilot_tool_call_metric_json_payload_with_counter_start(
+        tool_name: &str,
+        count: u64,
+        start_time_unix_nano: &str,
+        time_unix_nano: &str,
+    ) -> String {
+        format!(
+            r#"{{
+                "resourceMetrics": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "github-copilot" }} }},
+                            {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                            {{ "key": "repo.path", "value": {{ "stringValue": "/repos/kvasir" }} }}
+                        ]
+                    }},
+                    "scopeMetrics": [{{
+                        "metrics": [{{
+                            "name": "github.copilot.chat.tool_calls",
+                            "sum": {{
+                                "aggregationTemporality": 2,
+                                "isMonotonic": true,
+                                "dataPoints": [{{
+                                    "startTimeUnixNano": "{start_time_unix_nano}",
+                                    "timeUnixNano": "{time_unix_nano}",
+                                    "asInt": "{count}",
+                                    "attributes": [
+                                        {{ "key": "gen_ai.tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                    ]
+                                }}]
+                            }}
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
+    fn copilot_cumulative_tool_call_metric_json_payload(
+        tool_name: &str,
+        first_count: u64,
+        second_count: u64,
+    ) -> String {
+        format!(
+            r#"{{
+                "resourceMetrics": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "github-copilot" }} }},
+                            {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                            {{ "key": "repo.path", "value": {{ "stringValue": "/repos/kvasir" }} }}
+                        ]
+                    }},
+                    "scopeMetrics": [{{
+                        "metrics": [{{
+                            "name": "github.copilot.chat.tool_calls",
+                            "sum": {{
+                                "aggregationTemporality": 2,
+                                "isMonotonic": true,
+                                "dataPoints": [
+                                    {{
+                                        "startTimeUnixNano": "1781956700000000000",
+                                        "timeUnixNano": "1781956800000000000",
+                                        "asInt": "{first_count}",
+                                        "attributes": [
+                                            {{ "key": "gen_ai.tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                        ]
+                                    }},
+                                    {{
+                                        "startTimeUnixNano": "1781956700000000000",
+                                        "timeUnixNano": "1781956900000000000",
+                                        "asInt": "{second_count}",
+                                        "attributes": [
+                                            {{ "key": "gen_ai.tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                        ]
+                                    }}
+                                ]
+                            }}
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
+    fn codex_two_point_tool_call_metric_json_payload(
+        tool_name: &str,
+        first_count: u64,
+        second_count: u64,
+    ) -> String {
+        format!(
+            r#"{{
+                "resourceMetrics": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "codex" }} }},
+                            {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                            {{ "key": "repo.path", "value": {{ "stringValue": "/repos/kvasir" }} }}
+                        ]
+                    }},
+                    "scopeMetrics": [{{
+                        "metrics": [{{
+                            "name": "codex.turn.tool.call",
+                            "histogram": {{
+                                "aggregationTemporality": 1,
+                                "dataPoints": [
+                                    {{
+                                        "startTimeUnixNano": "1781956799000000000",
+                                        "timeUnixNano": "1781956800000000000",
+                                        "count": "1",
+                                        "sum": {first_count},
+                                        "attributes": [
+                                            {{ "key": "tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                        ]
+                                    }},
+                                    {{
+                                        "startTimeUnixNano": "1781956799000000000",
+                                        "timeUnixNano": "1781956900000000000",
+                                        "count": "1",
+                                        "sum": {second_count},
+                                        "attributes": [
+                                            {{ "key": "tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                        ]
+                                    }}
+                                ]
+                            }}
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
+    fn codex_duplicate_tool_call_metric_json_payload(tool_name: &str, count: u64) -> String {
+        format!(
+            r#"{{
+                "resourceMetrics": [{{
+                    "resource": {{
+                        "attributes": [
+                            {{ "key": "service.name", "value": {{ "stringValue": "codex" }} }},
+                            {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                            {{ "key": "repo.path", "value": {{ "stringValue": "/repos/kvasir" }} }}
+                        ]
+                    }},
+                    "scopeMetrics": [{{
+                        "metrics": [{{
+                            "name": "codex.turn.tool.call",
+                            "histogram": {{
+                                "aggregationTemporality": 1,
+                                "dataPoints": [
+                                    {{
+                                        "startTimeUnixNano": "1781956799000000000",
+                                        "timeUnixNano": "1781956800000000000",
+                                        "count": "1",
+                                        "sum": {count},
+                                        "attributes": [
+                                            {{ "key": "tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                        ]
+                                    }},
+                                    {{
+                                        "startTimeUnixNano": "1781956799000000000",
+                                        "timeUnixNano": "1781956800000000000",
+                                        "count": "1",
+                                        "sum": {count},
+                                        "attributes": [
+                                            {{ "key": "tool.name", "value": {{ "stringValue": "{tool_name}" }} }}
+                                        ]
+                                    }}
+                                ]
+                            }}
+                        }}]
+                    }}]
+                }}]
+            }}"#
         )
     }
 
