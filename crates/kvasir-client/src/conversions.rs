@@ -1,18 +1,19 @@
 use chrono::Datelike;
 use kvasir_core::rpc::{
-    CostRollup as CoreCostRollup, CostRollupQuery, RollupQuery, RpcError, TimestampMillis,
-    TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
-    Trace as CoreTrace, TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery,
-    TraceSpan as CoreTraceSpan, TraceSpanKind as CoreTraceSpanKind,
+    CostRollup as CoreCostRollup, CostRollupQuery, OverviewRollup as CoreOverviewRollup,
+    RollupQuery, RpcError, TimestampMillis, TokenRollup as CoreTokenRollup,
+    ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery, Trace as CoreTrace,
+    TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery, TraceSpan as CoreTraceSpan,
+    TraceSpanKind as CoreTraceSpanKind,
 };
 use kvasir_core::{RepoBucket, RepoIdentity};
 
 use crate::error::KvasirClientError;
 use crate::types::{
-    KvasirCostRollup, KvasirCostUsd, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
-    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceQuery,
-    KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirCostRollup, KvasirCostUsd, KvasirOverviewRollup, KvasirRepoBucket, KvasirRepoBucketKind,
+    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis,
+    KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures,
+    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -126,6 +127,30 @@ impl TryFrom<CoreToolCallRollup> for KvasirToolCallRollup {
             harness: crate::types::KvasirHarnessName::from_core(rollup.harness),
             tool_name: crate::types::KvasirToolName::from_core(rollup.tool_name),
             call_count: rollup.call_count,
+        })
+    }
+}
+
+impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
+    type Error = KvasirClientError;
+
+    fn try_from(rollup: CoreOverviewRollup) -> Result<Self, Self::Error> {
+        Ok(Self {
+            token_rollups: rollup
+                .token_rollups
+                .into_iter()
+                .map(KvasirTokenRollup::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            cost_rollups: rollup
+                .cost_rollups
+                .into_iter()
+                .map(KvasirCostRollup::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            tool_call_rollups: rollup
+                .tool_call_rollups
+                .into_iter()
+                .map(KvasirToolCallRollup::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }

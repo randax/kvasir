@@ -15,8 +15,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use kvasir_core::rpc::{
-    BearerToken, CostRollup, CostRollupQuery, RollupQuery, RpcError, RpcRequest, RpcResponse,
-    RpcStreamEvent, TokenRollup, ToolCallRollup, ToolCallRollupQuery, Trace, TraceQuery,
+    BearerToken, CostRollup, CostRollupQuery, OverviewRollup, RollupQuery, RpcError, RpcRequest,
+    RpcResponse, RpcStreamEvent, TokenRollup, ToolCallRollup, ToolCallRollupQuery, Trace,
+    TraceQuery,
 };
 use kvasir_core::{
     PriceTable, StoreKey, UsageStore, parse_otlp_json_traces, parse_otlp_json_usage_logs,
@@ -676,6 +677,15 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                 },
             }
         }
+        Ok(RpcRequest::OverviewRollup { query }) => {
+            let store = state.store.lock().await;
+            match overview_rollups(&store, query) {
+                Ok(rollup) => RpcResponse::OverviewRollup { rollup },
+                Err(_err) => RpcResponse::Error {
+                    error: RpcError::Internal,
+                },
+            }
+        }
         Ok(RpcRequest::CostRollup { query }) => {
             match state.store.lock().await.cost_rollups(query) {
                 Ok(rollups) => RpcResponse::CostRollup { rollups },
@@ -747,6 +757,25 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
     };
     write_rpc_response(&mut writer, response).await?;
     Ok(())
+}
+
+fn overview_rollups(
+    store: &kvasir_core::UsageStore,
+    query: RollupQuery,
+) -> Result<OverviewRollup, kvasir_core::store::StoreError> {
+    Ok(OverviewRollup {
+        token_rollups: store.token_rollups(query.clone())?,
+        cost_rollups: store.cost_rollups(CostRollupQuery {
+            start: query.start,
+            end: query.end,
+            repo: query.repo.clone(),
+        })?,
+        tool_call_rollups: store.tool_call_rollups(ToolCallRollupQuery {
+            start: query.start,
+            end: query.end,
+            repo: query.repo,
+        })?,
+    })
 }
 
 async fn write_rpc_response<W>(writer: &mut W, response: RpcResponse) -> anyhow::Result<()>
