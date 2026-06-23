@@ -1,19 +1,24 @@
 use chrono::Datelike;
 use kvasir_core::rpc::{
-    CostRollup as CoreCostRollup, CostRollupQuery, OverviewRollup as CoreOverviewRollup,
-    RollupQuery, RpcError, TimestampMillis, TokenRollup as CoreTokenRollup,
-    ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery, Trace as CoreTrace,
-    TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery, TraceSpan as CoreTraceSpan,
-    TraceSpanKind as CoreTraceSpanKind,
+    ContentAvailability as CoreContentAvailability,
+    ContentKindAvailability as CoreContentKindAvailability, ContentQuery,
+    ContentReplay as CoreContentReplay, ContentReplayItem as CoreContentReplayItem,
+    ContentUnavailableReason as CoreContentUnavailableReason, CostRollup as CoreCostRollup,
+    CostRollupQuery, OverviewRollup as CoreOverviewRollup, RollupQuery, RpcError, TimestampMillis,
+    TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
+    Trace as CoreTrace, TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery,
+    TraceSpan as CoreTraceSpan, TraceSpanKind as CoreTraceSpanKind,
 };
-use kvasir_core::{RepoBucket, RepoIdentity};
+use kvasir_core::{ContentKind as CoreContentKind, RepoBucket, RepoIdentity};
 
 use crate::error::KvasirClientError;
 use crate::types::{
-    KvasirCostRollup, KvasirCostUsd, KvasirOverviewRollup, KvasirRepoBucket, KvasirRepoBucketKind,
-    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis,
-    KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures,
-    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
+    KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem,
+    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostUsd, KvasirOverviewRollup,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace,
+    KvasirTraceDurationMeasures, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -67,6 +72,19 @@ impl From<KvasirTraceQuery> for TraceQuery {
             session_id: query.session_id.into_core(),
             prompt_id: query.prompt_id.into_core(),
         }
+    }
+}
+
+impl From<KvasirContentQuery> for (ContentQuery, kvasir_core::rpc::BearerToken) {
+    fn from(query: KvasirContentQuery) -> Self {
+        (
+            ContentQuery {
+                harness: query.harness.into_core(),
+                session_id: query.session_id.into_core(),
+                prompt_id: query.prompt_id.into_core(),
+            },
+            query.bearer_token.into_core(),
+        )
     }
 }
 
@@ -173,6 +191,88 @@ impl TryFrom<CoreTrace> for KvasirTrace {
     }
 }
 
+impl TryFrom<CoreContentReplay> for KvasirContentReplay {
+    type Error = KvasirClientError;
+
+    fn try_from(replay: CoreContentReplay) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: crate::types::KvasirSessionId::from_core(replay.session_id),
+            prompt_id: crate::types::KvasirPromptId::from_core(replay.prompt_id),
+            items: replay
+                .items
+                .into_iter()
+                .map(KvasirContentReplayItem::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            availability: replay.availability.into(),
+        })
+    }
+}
+
+impl TryFrom<CoreContentReplayItem> for KvasirContentReplayItem {
+    type Error = KvasirClientError;
+
+    fn try_from(item: CoreContentReplayItem) -> Result<Self, Self::Error> {
+        Ok(Self {
+            occurred_at: KvasirTimestampMillis {
+                value: item.occurred_at.value(),
+            },
+            harness: crate::types::KvasirHarnessName::from_core(item.harness),
+            kind: item.kind.into(),
+            content: crate::types::KvasirContentText::from_core(item.content),
+        })
+    }
+}
+
+impl From<CoreContentAvailability> for KvasirContentAvailability {
+    fn from(availability: CoreContentAvailability) -> Self {
+        match availability {
+            CoreContentAvailability::Captured { harness, kinds } => Self::Captured {
+                harness: crate::types::KvasirHarnessName::from_core(harness),
+                kinds: kinds
+                    .into_iter()
+                    .map(KvasirContentKindAvailability::from)
+                    .collect(),
+            },
+            CoreContentAvailability::Unavailable { reason } => Self::Unavailable {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl From<CoreContentKindAvailability> for KvasirContentKindAvailability {
+    fn from(availability: CoreContentKindAvailability) -> Self {
+        match availability {
+            CoreContentKindAvailability::Captured { kind } => Self::Captured { kind: kind.into() },
+            CoreContentKindAvailability::Unavailable { kind, reason } => Self::Unavailable {
+                kind: kind.into(),
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl From<CoreContentUnavailableReason> for KvasirContentUnavailableReason {
+    fn from(reason: CoreContentUnavailableReason) -> Self {
+        match reason {
+            CoreContentUnavailableReason::NotProvidedByHarness => Self::NotProvidedByHarness,
+            CoreContentUnavailableReason::NotCapturedForPrompt => Self::NotCapturedForPrompt,
+            CoreContentUnavailableReason::PromptNotFound => Self::PromptNotFound,
+        }
+    }
+}
+
+impl From<CoreContentKind> for KvasirContentKind {
+    fn from(kind: CoreContentKind) -> Self {
+        match kind {
+            CoreContentKind::UserPrompt => Self::UserPrompt,
+            CoreContentKind::AssistantMessage => Self::AssistantMessage,
+            CoreContentKind::ToolInput => Self::ToolInput,
+            CoreContentKind::ToolOutput => Self::ToolOutput,
+        }
+    }
+}
+
 impl TryFrom<CoreTraceSpan> for KvasirTraceSpan {
     type Error = KvasirClientError;
 
@@ -237,7 +337,9 @@ impl From<RpcError> for KvasirClientError {
     fn from(error: RpcError) -> Self {
         match error {
             RpcError::ResponseTooLarge => Self::RpcResponseTooLarge,
-            RpcError::InvalidRequest | RpcError::Internal => Self::DaemonError,
+            RpcError::InvalidRequest | RpcError::Internal | RpcError::Unauthorized => {
+                Self::DaemonError
+            }
         }
     }
 }

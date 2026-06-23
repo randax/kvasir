@@ -225,6 +225,8 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
             .and_then(Value::as_array);
         let repo = repo_from_json_attributes(resource_attributes);
         let harness = harness_from_json_attributes(resource_attributes);
+        let session_id = json_session_id(resource_attributes);
+        let prompt_id = json_prompt_id(resource_attributes);
         let scope_logs = resource_logs
             .get("scopeLogs")
             .and_then(Value::as_array)
@@ -241,9 +243,13 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
                 if let Some(record) = json_tool_call_record(log_record, repo.clone())? {
                     records.tool_calls.push(record);
                 }
-                if let Some(record) =
-                    json_opencode_content_record(log_record, repo.clone(), harness.as_deref())?
-                {
+                if let Some(record) = json_opencode_content_record(
+                    log_record,
+                    repo.clone(),
+                    harness.as_deref(),
+                    session_id.clone(),
+                    prompt_id.clone(),
+                )? {
                     records.content.push(record);
                 }
             }
@@ -437,6 +443,14 @@ fn records_from_resource_logs(resource_logs: OtlpResourceLogs) -> Result<UsageRe
         .resource
         .as_ref()
         .and_then(|resource| harness_from_proto_attributes(&resource.attributes));
+    let session_id = resource_logs
+        .resource
+        .as_ref()
+        .and_then(|resource| proto_session_id(&resource.attributes));
+    let prompt_id = resource_logs
+        .resource
+        .as_ref()
+        .and_then(|resource| proto_prompt_id(&resource.attributes));
 
     let mut records = UsageRecords::default();
     for scope_logs in resource_logs.scope_logs {
@@ -444,6 +458,8 @@ fn records_from_resource_logs(resource_logs: OtlpResourceLogs) -> Result<UsageRe
             scope_logs,
             repo.clone(),
             harness.as_deref(),
+            session_id.clone(),
+            prompt_id.clone(),
         )?);
     }
     Ok(records)
@@ -453,6 +469,8 @@ fn records_from_scope_logs_for_logs(
     scope_logs: ScopeLogs,
     repo: RepoBucket,
     resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
 ) -> Result<UsageRecords, OtlpError> {
     let mut records = UsageRecords::default();
     for log_record in scope_logs.log_records {
@@ -462,9 +480,13 @@ fn records_from_scope_logs_for_logs(
         if let Some(record) = proto_tool_call_record(log_record.clone(), repo.clone())? {
             records.tool_calls.push(record);
         }
-        if let Some(record) =
-            proto_opencode_content_record(&log_record, repo.clone(), resource_harness)?
-        {
+        if let Some(record) = proto_opencode_content_record(
+            &log_record,
+            repo.clone(),
+            resource_harness,
+            resource_session_id.clone(),
+            resource_prompt_id.clone(),
+        )? {
             records.content.push(record);
         }
     }
@@ -1308,6 +1330,8 @@ fn proto_opencode_content_record(
     log_record: &LogRecord,
     repo: RepoBucket,
     resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
 ) -> Result<Option<ContentRecord>, OtlpError> {
     if !is_opencode_context(resource_harness)
         || !is_opencode_content_event(Some(log_record.event_name.as_str()), || {
@@ -1330,6 +1354,14 @@ fn proto_opencode_content_record(
     else {
         return Ok(None);
     };
+    let Some(session_id) = resource_session_id.or_else(|| proto_session_id(&log_record.attributes))
+    else {
+        return Ok(None);
+    };
+    let Some(prompt_id) = resource_prompt_id.or_else(|| proto_prompt_id(&log_record.attributes))
+    else {
+        return Ok(None);
+    };
     let occurred_at_nanos = if log_record.time_unix_nano == 0 {
         log_record.observed_time_unix_nano
     } else {
@@ -1337,21 +1369,33 @@ fn proto_opencode_content_record(
     };
     let occurred_at = TimestampMillis::try_from_unix_nanos(occurred_at_nanos)
         .ok_or(OtlpError::MissingTimestamp)?;
-    let event_key = content_event_key(&repo, "opencode", kind, occurred_at_nanos, content.as_str());
-    Ok(Some(ContentRecord::new(
+    let event_key = content_event_key(
+        &repo,
+        "opencode",
+        &session_id,
+        &prompt_id,
+        kind,
+        occurred_at_nanos,
+        content.as_str(),
+    );
+    Ok(Some(ContentRecord {
         event_key,
         occurred_at,
+        session_id,
+        prompt_id,
         repo,
-        HarnessName::new("opencode"),
+        harness: HarnessName::new("opencode"),
         kind,
         content,
-    )))
+    }))
 }
 
 fn json_opencode_content_record(
     log_record: &Value,
     repo: RepoBucket,
     resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
 ) -> Result<Option<ContentRecord>, OtlpError> {
     let attributes = log_record.get("attributes").and_then(Value::as_array);
     if !is_opencode_context(resource_harness)
@@ -1374,16 +1418,32 @@ fn json_opencode_content_record(
     else {
         return Ok(None);
     };
+    let Some(session_id) = resource_session_id.or_else(|| json_session_id(attributes)) else {
+        return Ok(None);
+    };
+    let Some(prompt_id) = resource_prompt_id.or_else(|| json_prompt_id(attributes)) else {
+        return Ok(None);
+    };
     let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
-    let event_key = content_event_key(&repo, "opencode", kind, occurred_at_nanos, content.as_str());
-    Ok(Some(ContentRecord::new(
+    let event_key = content_event_key(
+        &repo,
+        "opencode",
+        &session_id,
+        &prompt_id,
+        kind,
+        occurred_at_nanos,
+        content.as_str(),
+    );
+    Ok(Some(ContentRecord {
         event_key,
         occurred_at,
+        session_id,
+        prompt_id,
         repo,
-        HarnessName::new("opencode"),
+        harness: HarnessName::new("opencode"),
         kind,
         content,
-    )))
+    }))
 }
 
 const TOOL_NAME_ATTRIBUTE_KEYS: &[&str] = &[
@@ -2448,6 +2508,8 @@ fn log_token_usage_event_key(
 fn content_event_key(
     repo: &RepoBucket,
     harness: &str,
+    session_id: &SessionId,
+    prompt_id: &PromptId,
     kind: ContentKind,
     occurred_at_nanos: u64,
     content: &str,
@@ -2458,6 +2520,12 @@ fn content_event_key(
     append_repo_key(&mut canonical, repo);
     canonical.push_str("harness=");
     canonical.push_str(harness);
+    canonical.push('\n');
+    canonical.push_str("session_id=");
+    canonical.push_str(session_id.as_str());
+    canonical.push('\n');
+    canonical.push_str("prompt_id=");
+    canonical.push_str(prompt_id.as_str());
     canonical.push('\n');
     canonical.push_str("kind=");
     canonical.push_str(kind.storage_name());
@@ -4905,7 +4973,9 @@ mod tests {
                     "attributes": [
                         { "key": "service.name", "value": { "stringValue": "opencode" } },
                         { "key": "repo.name", "value": { "stringValue": "kvasir" } },
-                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } }
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } },
+                        { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
                     ]
                 },
                 "scopeLogs": [{
@@ -4936,6 +5006,8 @@ mod tests {
 
         assert_eq!(records.content.len(), 1);
         assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].session_id, SessionId::new("session-12"));
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
         assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
         assert_eq!(records.content[0].content.as_str(), "stored assistant text");
         assert_eq!(
@@ -5201,6 +5273,8 @@ mod tests {
                 string_attribute("service.name", "opencode"),
                 string_attribute("repo.name", "kvasir"),
                 string_attribute("repo.path", "/repos/kvasir"),
+                string_attribute("session.id", "session-12"),
+                string_attribute("prompt.id", "prompt-7"),
             ],
             vec![
                 LogRecord {
@@ -5266,6 +5340,8 @@ mod tests {
 
         assert_eq!(records.content.len(), 1);
         assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].session_id, SessionId::new("session-12"));
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
         assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
         assert_eq!(records.content[0].content.as_str(), "stored assistant text");
 
