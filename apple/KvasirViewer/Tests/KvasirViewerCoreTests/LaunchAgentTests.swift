@@ -50,6 +50,24 @@ func daemonLaunchAgentRefreshesRegistrationWhenPackagedHelperChanged() throws {
 }
 
 @Test
+func daemonLaunchAgentCanForceRefreshRegistration() throws {
+    let registry = RecordingLaunchAgentRegistry(status: .enabled)
+    let registrationStore = RecordingLaunchAgentRegistrationStore(storedFingerprint: "current-fingerprint")
+    let launchAgent = DaemonLaunchAgent(
+        registry: registry,
+        fingerprintProvider: StaticLaunchAgentFingerprintProvider(fingerprint: "current-fingerprint"),
+        registrationStore: registrationStore
+    )
+
+    let outcome = try launchAgent.refreshRegistration()
+
+    #expect(outcome == .registered)
+    #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registrationStore.savedFingerprints == ["current-fingerprint"])
+}
+
+@Test
 func daemonLaunchAgentSurfacesApprovalRequirementWithoutRetryingRegistration() throws {
     let registry = RecordingLaunchAgentRegistry(status: .requiresApproval)
     let launchAgent = DaemonLaunchAgent(registry: registry)

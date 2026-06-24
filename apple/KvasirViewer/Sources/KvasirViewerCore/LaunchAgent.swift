@@ -51,10 +51,7 @@ public struct DaemonLaunchAgent {
         switch registry.status(plistName: Self.plistName) {
         case .enabled:
             if registrationNeedsRefresh(plistName: Self.plistName) {
-                try registry.unregister(plistName: Self.plistName)
-                try registry.register(plistName: Self.plistName)
-                saveCurrentFingerprint(plistName: Self.plistName)
-                return .registered
+                return try refreshRegistration()
             }
             return .alreadyRegistered
         case .requiresApproval:
@@ -64,6 +61,13 @@ public struct DaemonLaunchAgent {
             saveCurrentFingerprint(plistName: Self.plistName)
             return .registered
         }
+    }
+
+    public func refreshRegistration() throws -> LaunchAgentRegistrationOutcome {
+        try registry.unregister(plistName: Self.plistName)
+        try registry.register(plistName: Self.plistName)
+        saveCurrentFingerprint(plistName: Self.plistName)
+        return .registered
     }
 
     private func registrationNeedsRefresh(plistName: String) -> Bool {

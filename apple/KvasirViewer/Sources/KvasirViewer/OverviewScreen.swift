@@ -73,6 +73,9 @@ struct OverviewScreen: View {
                     if model.launchAgentOutcome == .requiresApproval {
                         approvalBanner
                     }
+                    if let setupWarningMessage = model.setupWarningMessage {
+                        warningBanner(setupWarningMessage)
+                    }
                     if let errorMessage = model.errorMessage {
                         errorBanner(errorMessage)
                     }
@@ -86,6 +89,10 @@ struct OverviewScreen: View {
                 ProgressView()
                 if model.launchAgentOutcome == .requiresApproval {
                     approvalBanner
+                        .frame(maxWidth: 520)
+                }
+                if let setupWarningMessage = model.setupWarningMessage {
+                    warningBanner(setupWarningMessage)
                         .frame(maxWidth: 520)
                 }
                 Text(model.errorMessage ?? "Loading overview")
@@ -126,6 +133,14 @@ struct OverviewScreen: View {
 
     private var approvalBanner: some View {
         Label("Daemon requires approval in System Settings", systemImage: "person.crop.circle.badge.exclamationmark")
+            .foregroundStyle(.orange)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func warningBanner(_ message: String) -> some View {
+        Label(message, systemImage: "exclamationmark.triangle")
             .foregroundStyle(.orange)
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)

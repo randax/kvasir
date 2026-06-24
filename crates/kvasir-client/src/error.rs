@@ -12,4 +12,12 @@ pub enum KvasirClientError {
     DaemonError,
     #[error("rpc returned the wrong response type")]
     WrongResponseType,
+    #[error("harness telemetry setup failed")]
+    HarnessTelemetrySetup,
+    #[error("harness telemetry setup rollback failed")]
+    HarnessTelemetryRollback,
+    #[error("harness telemetry setup state is unknown")]
+    HarnessTelemetryStateUnknown,
+    #[error("filesystem operation failed")]
+    Filesystem,
 }

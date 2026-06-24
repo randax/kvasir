@@ -1,11 +1,16 @@
 mod client;
 mod conversions;
 mod error;
+mod setup;
 mod transport;
 mod types;
 
 pub use client::{KvasirClient, KvasirTokenRollupSubscription};
 pub use error::KvasirClientError;
+pub use setup::{
+    KvasirClaudeSettingsPath, KvasirCodexConfigPath, KvasirHarnessTelemetrySetup,
+    KvasirOtlpEndpoint, KvasirRawBodyDirectory, configure_kvasir_harness_telemetry,
+};
 pub use types::{
     KvasirBearerToken, KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
     KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem, KvasirContentText,

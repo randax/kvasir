@@ -39,31 +39,58 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var overviewSnapshot: OverviewSnapshot?
     @Published public private(set) var launchAgentOutcome: LaunchAgentRegistrationOutcome?
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var setupWarningMessage: String?
     @Published public var selectedRangePreset: OverviewRangePreset
 
     private let dashboard: OverviewDashboard
+    private let telemetrySetup: any HarnessTelemetrySetup
     private let launchAgent: DaemonLaunchAgent
+    private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
+    private let enablePostStartupOverviewRecovery: @Sendable () -> Void
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
 
     public init(
         dashboard: OverviewDashboard,
+        telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
         launchAgent: DaemonLaunchAgent,
+        shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
+        enablePostStartupOverviewRecovery: @escaping @Sendable () -> Void = {},
         selectedRangePreset: OverviewRangePreset = .lastSevenDays,
         now: @escaping () -> Date = Date.init,
         calendar: Calendar = .kvasirRollupUTC
     ) {
         self.dashboard = dashboard
+        self.telemetrySetup = telemetrySetup
         self.launchAgent = launchAgent
+        self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
+        self.enablePostStartupOverviewRecovery = enablePostStartupOverviewRecovery
         self.selectedRangePreset = selectedRangePreset
         self.now = now
         self.calendar = calendar
     }
 
     public func start() async throws {
+        do {
+            try await telemetrySetup.ensureConfigured()
+            setupWarningMessage = nil
+        } catch {
+            setupWarningMessage = error.localizedDescription
+        }
         launchAgentOutcome = try launchAgent.ensureRegistered()
-        try await refreshOverview()
+        do {
+            try await refreshOverview()
+            enablePostStartupOverviewRecovery()
+        } catch {
+            guard launchAgentOutcome != .requiresApproval,
+                  shouldRefreshLaunchAgentAfterStartupOverviewError(error) else {
+                throw error
+            }
+            launchAgentOutcome = try launchAgent.refreshRegistration()
+            enablePostStartupOverviewRecovery()
+            try await refreshOverview()
+        }
     }
 
     public func selectRangePreset(_ preset: OverviewRangePreset) async throws {
@@ -94,6 +121,16 @@ public final class KvasirViewerModel: ObservableObject {
     public func record(error: any Error) {
         errorMessage = error.localizedDescription
     }
+}
+
+public protocol HarnessTelemetrySetup: Sendable {
+    func ensureConfigured() async throws
+}
+
+public struct NoOpHarnessTelemetrySetup: HarnessTelemetrySetup {
+    public init() {}
+
+    public func ensureConfigured() async throws {}
 }
 
 public extension Calendar {

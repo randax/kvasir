@@ -3,8 +3,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use zeroize::Zeroizing;
 
 use crate::rpc::BearerToken;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 const MANAGED_BLOCK_KEY: &str = "kvasirManaged";
 const CODEX_OTEL_BLOCK_START: &str = "# BEGIN KVASIR MANAGED CODEX OTEL";
@@ -59,6 +63,18 @@ pub enum SetupError {
     InvalidOpenCodeOtlpEndpointEnvValue,
     #[error("OpenCode OTLP headers env value contains unsupported characters")]
     InvalidOpenCodeOtlpHeadersEnvValue,
+    #[error("setup keychain access failed")]
+    SetupKeychain(#[from] keyring::Error),
+    #[error("setup secret JSON is invalid")]
+    InvalidSetupSecretJson(#[source] serde_json::Error),
+    #[error("setup secret serialization failed")]
+    SetupSecretSerialization(#[source] serde_json::Error),
+    #[error("bearer token generation failed")]
+    BearerTokenGeneration(#[source] crate::rpc::BearerTokenError),
+    #[error("setup credential read failed")]
+    SetupCredentialRead(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("setup credential write failed")]
+    SetupCredentialWrite(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +149,272 @@ impl SetupConfig {
     pub fn raw_body_directory(&self) -> &RawBodyDirectory {
         &self.raw_body_directory
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct KeychainSetupSecretSource {
+    service: &'static str,
+    user: String,
+}
+
+impl KeychainSetupSecretSource {
+    pub fn claude_code_settings(settings_path: &Path) -> Self {
+        Self {
+            service: "dev.kvasir.setup",
+            user: format!(
+                "claude-code-settings:{}",
+                keychain_path_component(&canonical_config_path(settings_path))
+            ),
+        }
+    }
+}
+
+pub enum SetupSecretSource {
+    Keychain(KeychainSetupSecretSource),
+}
+
+impl SetupSecretSource {
+    pub fn claude_code_keychain(settings_path: &Path) -> Self {
+        Self::Keychain(KeychainSetupSecretSource::claude_code_settings(
+            settings_path,
+        ))
+    }
+
+    pub fn resolve(
+        &self,
+        endpoint: KvasirEndpoint,
+        raw_body_directory: RawBodyDirectory,
+    ) -> Result<SetupConfig, SetupError> {
+        let pending = self.prepare(endpoint, raw_body_directory)?;
+        self.commit(pending).map(CommittedSetupConfig::into_config)
+    }
+
+    pub fn prepare(
+        &self,
+        endpoint: KvasirEndpoint,
+        raw_body_directory: RawBodyDirectory,
+    ) -> Result<PendingSetupConfig, SetupError> {
+        match self {
+            Self::Keychain(source) => source.prepare(endpoint, raw_body_directory),
+        }
+    }
+
+    pub fn commit(&self, pending: PendingSetupConfig) -> Result<CommittedSetupConfig, SetupError> {
+        match self {
+            Self::Keychain(source) => source.commit(pending),
+        }
+    }
+
+    pub fn rollback(&self, committed: CommittedSetupConfig) -> Result<(), SetupError> {
+        match self {
+            Self::Keychain(source) => source.rollback(committed),
+        }
+    }
+}
+
+impl KeychainSetupSecretSource {
+    fn prepare(
+        &self,
+        endpoint: KvasirEndpoint,
+        raw_body_directory: RawBodyDirectory,
+    ) -> Result<PendingSetupConfig, SetupError> {
+        let entry = keyring::Entry::new(self.service, &self.user)?;
+        prepare_setup_config(
+            &KeyringSetupCredential { entry },
+            endpoint,
+            raw_body_directory,
+        )
+    }
+
+    fn commit(&self, pending: PendingSetupConfig) -> Result<CommittedSetupConfig, SetupError> {
+        let entry = keyring::Entry::new(self.service, &self.user)?;
+        pending.commit(&KeyringSetupCredential { entry })
+    }
+
+    fn rollback(&self, committed: CommittedSetupConfig) -> Result<(), SetupError> {
+        let entry = keyring::Entry::new(self.service, &self.user)?;
+        committed.rollback(&KeyringSetupCredential { entry })
+    }
+}
+
+pub trait SetupCredential {
+    fn read(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+    fn write(&self, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+struct KeyringSetupCredential {
+    entry: keyring::Entry,
+}
+
+impl SetupCredential for KeyringSetupCredential {
+    fn read(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.entry.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(Box::new(err)),
+        }
+    }
+
+    fn write(&self, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.entry.set_password(password)?;
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self.entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(Box::new(err)),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredSetupSecrets {
+    endpoint: KvasirEndpoint,
+    bearer_token: BearerToken,
+}
+
+pub struct PendingSetupConfig {
+    config: SetupConfig,
+    encoded_secrets: Zeroizing<String>,
+    previous_encoded_secrets: Option<Zeroizing<String>>,
+}
+
+impl PendingSetupConfig {
+    pub fn config(&self) -> &SetupConfig {
+        &self.config
+    }
+
+    pub fn commit(
+        self,
+        credential: &dyn SetupCredential,
+    ) -> Result<CommittedSetupConfig, SetupError> {
+        credential
+            .write(&self.encoded_secrets)
+            .map_err(SetupError::SetupCredentialWrite)?;
+        Ok(CommittedSetupConfig {
+            config: self.config,
+            previous_encoded_secrets: self.previous_encoded_secrets,
+        })
+    }
+}
+
+pub struct CommittedSetupConfig {
+    config: SetupConfig,
+    previous_encoded_secrets: Option<Zeroizing<String>>,
+}
+
+impl CommittedSetupConfig {
+    pub fn config(&self) -> &SetupConfig {
+        &self.config
+    }
+
+    pub fn into_config(self) -> SetupConfig {
+        self.config
+    }
+
+    pub fn rollback(self, credential: &dyn SetupCredential) -> Result<(), SetupError> {
+        match self.previous_encoded_secrets {
+            Some(encoded) => credential
+                .write(&encoded)
+                .map_err(SetupError::SetupCredentialWrite),
+            None => credential
+                .delete()
+                .map_err(SetupError::SetupCredentialWrite),
+        }
+    }
+}
+
+pub fn prepare_setup_config(
+    credential: &dyn SetupCredential,
+    endpoint: KvasirEndpoint,
+    raw_body_directory: RawBodyDirectory,
+) -> Result<PendingSetupConfig, SetupError> {
+    let previous_encoded_secrets = credential.read().map_err(SetupError::SetupCredentialRead)?;
+    let bearer_token = match previous_encoded_secrets.as_deref() {
+        Some(encoded) => {
+            serde_json::from_str::<StoredSetupSecrets>(encoded)
+                .map_err(SetupError::InvalidSetupSecretJson)?
+                .bearer_token
+        }
+        None => BearerToken::generate().map_err(SetupError::BearerTokenGeneration)?,
+    };
+    let secrets = StoredSetupSecrets {
+        endpoint,
+        bearer_token,
+    };
+    let encoded_secrets = Zeroizing::new(
+        serde_json::to_string(&secrets).map_err(SetupError::SetupSecretSerialization)?,
+    );
+    let config = SetupConfig::new(secrets.endpoint, secrets.bearer_token, raw_body_directory);
+
+    Ok(PendingSetupConfig {
+        config,
+        encoded_secrets,
+        previous_encoded_secrets: previous_encoded_secrets.map(Zeroizing::new),
+    })
+}
+
+pub fn resolve_setup_config(
+    credential: &dyn SetupCredential,
+    endpoint: KvasirEndpoint,
+    raw_body_directory: RawBodyDirectory,
+) -> Result<SetupConfig, SetupError> {
+    prepare_setup_config(credential, endpoint, raw_body_directory)?
+        .commit(credential)
+        .map(CommittedSetupConfig::into_config)
+}
+
+fn canonical_config_path(config_path: &Path) -> PathBuf {
+    if let Ok(path) = config_path.canonicalize() {
+        return path;
+    }
+
+    let absolute_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(config_path))
+            .unwrap_or_else(|_| config_path.to_path_buf())
+    };
+    let Some(parent) = absolute_path.parent() else {
+        return absolute_path;
+    };
+    let Some(file_name) = absolute_path.file_name() else {
+        return absolute_path;
+    };
+    parent
+        .canonicalize()
+        .map(|parent| parent.join(file_name))
+        .unwrap_or(absolute_path)
+}
+
+fn keychain_path_component(stable_path: &Path) -> String {
+    if let Some(path) = stable_path.to_str() {
+        return format!("utf8:{path}");
+    }
+
+    format!("hex:{}", hex_encode_path_bytes(stable_path))
+}
+
+#[cfg(unix)]
+fn hex_encode_path_bytes(path: &Path) -> String {
+    hex_encode(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn hex_encode_path_bytes(path: &Path) -> String {
+    hex_encode(path.to_string_lossy().as_bytes())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    encoded
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,4 +1311,100 @@ fn managed_env_values(config: &SetupConfig) -> Vec<(&'static str, String)> {
         ("OTEL_METRICS_EXPORTER", "otlp".to_owned()),
         ("OTEL_TRACES_EXPORTER", "otlp".to_owned()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[cfg(unix)]
+    use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn setup_secret_resolution_generates_and_persists_endpoint_and_bearer_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credential = MemorySetupCredential::default();
+        let config = resolve_setup_config(
+            &credential,
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            RawBodyDirectory::new("/tmp/kvasir/raw-bodies".into()),
+        )?;
+
+        assert_eq!(config.endpoint().as_str(), "http://127.0.0.1:4318");
+        assert_eq!(config.bearer_token().as_str().len(), 64);
+        let stored = credential.stored_secrets()?;
+        assert_eq!(
+            (stored.endpoint.as_str(), stored.bearer_token.as_str()),
+            ("http://127.0.0.1:4318", config.bearer_token().as_str())
+        );
+
+        let reloaded = resolve_setup_config(
+            &credential,
+            KvasirEndpoint::new("http://127.0.0.1:9999"),
+            RawBodyDirectory::new("/tmp/kvasir/other-raw-bodies".into()),
+        )?;
+        assert_eq!(reloaded.endpoint().as_str(), "http://127.0.0.1:9999");
+        assert_eq!(reloaded.bearer_token(), config.bearer_token());
+        assert_eq!(
+            reloaded.raw_body_directory().as_path(),
+            std::path::Path::new("/tmp/kvasir/other-raw-bodies")
+        );
+        let stored = credential.stored_secrets()?;
+        assert_eq!(
+            (stored.endpoint.as_str(), stored.bearer_token.as_str()),
+            ("http://127.0.0.1:9999", config.bearer_token().as_str())
+        );
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_settings_paths_have_distinct_keychain_users() {
+        let first_path = PathBuf::from(OsStr::from_bytes(b"/tmp/settings-\xff.json"));
+        let second_path = PathBuf::from(OsStr::from_bytes(b"/tmp/settings-\xfe.json"));
+
+        assert_eq!(
+            keychain_path_component(&first_path),
+            "hex:2f746d702f73657474696e67732dff2e6a736f6e"
+        );
+        assert_ne!(
+            keychain_path_component(&first_path),
+            keychain_path_component(&second_path)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct MemorySetupCredential {
+        password: Rc<RefCell<Option<String>>>,
+    }
+
+    impl MemorySetupCredential {
+        fn stored_secrets(&self) -> Result<StoredSetupSecrets, Box<dyn std::error::Error>> {
+            let Some(encoded) = self.password.borrow().clone() else {
+                return Err("expected stored setup secrets".into());
+            };
+            Ok(serde_json::from_str(&encoded)?)
+        }
+    }
+
+    impl SetupCredential for MemorySetupCredential {
+        fn read(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.password.borrow().clone())
+        }
+
+        fn write(&self, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.password.replace(Some(password.to_owned()));
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.password.replace(None);
+            Ok(())
+        }
+    }
 }
