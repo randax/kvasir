@@ -10,6 +10,7 @@ enum ProductionModelFactory {
     static func make() -> KvasirViewerModel {
         KvasirViewerModel(
             dashboard: OverviewDashboard(client: makeOverviewClient()),
+            telemetrySetup: makeHarnessTelemetrySetup(),
             launchAgent: DaemonLaunchAgent()
         )
     }
@@ -40,7 +41,68 @@ enum ProductionModelFactory {
             .appendingPathComponent("kvasird.sock")
             .path
     }
+
+    @MainActor
+    private static func makeHarnessTelemetrySetup() -> any HarnessTelemetrySetup {
+        #if canImport(kvasir_client)
+        return KvasirClientHarnessTelemetrySetup(config: harnessTelemetrySetupConfig)
+        #else
+        return NoOpHarnessTelemetrySetup()
+        #endif
+    }
+
+    private static var harnessTelemetrySetupConfig: HarnessTelemetrySetupConfig {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return HarnessTelemetrySetupConfig(
+            codexConfigPath: home
+                .appendingPathComponent(".codex", isDirectory: true)
+                .appendingPathComponent("config.toml")
+                .path,
+            claudeSettingsPath: home
+                .appendingPathComponent(".claude", isDirectory: true)
+                .appendingPathComponent("settings.json")
+                .path,
+            rawBodyDirectory: applicationSupportDirectory
+                .appendingPathComponent("dev.kvasir", isDirectory: true)
+                .appendingPathComponent("raw-bodies", isDirectory: true)
+                .path,
+            otlpEndpoint: "http://127.0.0.1:4318"
+        )
+    }
+
+    private static var applicationSupportDirectory: URL {
+        FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+    }
 }
+
+struct HarnessTelemetrySetupConfig: Sendable {
+    let codexConfigPath: String
+    let claudeSettingsPath: String
+    let rawBodyDirectory: String
+    let otlpEndpoint: String
+}
+
+#if canImport(kvasir_client)
+struct KvasirClientHarnessTelemetrySetup: HarnessTelemetrySetup {
+    let config: HarnessTelemetrySetupConfig
+
+    func ensureConfigured() async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try configureKvasirHarnessTelemetry(
+                config: KvasirHarnessTelemetrySetup(
+                    codexConfigPath: config.codexConfigPath,
+                    claudeSettingsPath: config.claudeSettingsPath,
+                    rawBodyDirectory: config.rawBodyDirectory,
+                    otlpEndpoint: config.otlpEndpoint
+                )
+            )
+        }.value
+    }
+}
+#endif
 
 private struct MissingKvasirClient: OverviewClient {
     func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {

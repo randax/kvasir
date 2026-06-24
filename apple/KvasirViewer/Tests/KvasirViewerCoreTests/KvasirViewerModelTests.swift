@@ -22,9 +22,12 @@ func viewerStartupRegistersDaemonAndLoadsOverviewForDefaultRange() async throws 
             ]
         )
     )
-    let registry = RecordingStartupLaunchAgentRegistry(status: .notRegistered)
+    let startupEvents = StartupEventRecorder()
+    let telemetrySetup = RecordingHarnessTelemetrySetup(events: startupEvents)
+    let registry = RecordingStartupLaunchAgentRegistry(status: .notRegistered, events: startupEvents)
     let model = KvasirViewerModel(
         dashboard: OverviewDashboard(client: client),
+        telemetrySetup: telemetrySetup,
         launchAgent: DaemonLaunchAgent(registry: registry),
         now: { now },
         calendar: calendar
@@ -33,11 +36,41 @@ func viewerStartupRegistersDaemonAndLoadsOverviewForDefaultRange() async throws 
     try await model.start()
 
     #expect(model.launchAgentOutcome == .registered)
+    #expect(startupEvents.events == [.configuredTelemetry, .registeredLaunchAgent])
     #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(client.queries == [
         OverviewRangePreset.lastSevenDays.range(containing: now, calendar: calendar).query
     ])
     #expect(model.overviewSnapshot?.totals == .init(totalTokens: 35, costUsdNanos: 42, toolCalls: 3))
+}
+
+@MainActor
+@Test
+func viewerStartupStopsBeforeLaunchAgentRegistrationWhenTelemetrySetupFails() async throws {
+    let client = RecordingStartupOverviewClient(
+        rollups: OverviewRollups(tokenRollups: [], costRollups: [], toolCallRollups: [])
+    )
+    let startupEvents = StartupEventRecorder()
+    let registry = RecordingStartupLaunchAgentRegistry(status: .notRegistered, events: startupEvents)
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        telemetrySetup: RecordingHarnessTelemetrySetup(
+            events: startupEvents,
+            error: StartupTestError.transient
+        ),
+        launchAgent: DaemonLaunchAgent(registry: registry)
+    )
+
+    do {
+        try await model.start()
+        Issue.record("expected telemetry setup failure")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    #expect(startupEvents.events == [.configuredTelemetry])
+    #expect(registry.registeredPlistNames.isEmpty)
+    #expect(client.queries.isEmpty)
 }
 
 @MainActor
@@ -275,11 +308,13 @@ private final class OrderedOverviewResultClient: OverviewClient, @unchecked Send
 
 private final class RecordingStartupLaunchAgentRegistry: LaunchAgentRegistry {
     private let launchAgentStatus: LaunchAgentStatus
+    private let events: StartupEventRecorder?
     private(set) var registeredPlistNames: [String] = []
     private(set) var unregisteredPlistNames: [String] = []
 
-    init(status: LaunchAgentStatus) {
+    init(status: LaunchAgentStatus, events: StartupEventRecorder? = nil) {
         self.launchAgentStatus = status
+        self.events = events
     }
 
     func status(plistName: String) -> LaunchAgentStatus {
@@ -287,12 +322,46 @@ private final class RecordingStartupLaunchAgentRegistry: LaunchAgentRegistry {
     }
 
     func register(plistName: String) throws {
+        events?.append(.registeredLaunchAgent)
         registeredPlistNames.append(plistName)
     }
 
     func unregister(plistName: String) throws {
         unregisteredPlistNames.append(plistName)
     }
+}
+
+private final class RecordingHarnessTelemetrySetup: HarnessTelemetrySetup, @unchecked Sendable {
+    private let events: StartupEventRecorder
+    private let error: (any Error)?
+
+    init(events: StartupEventRecorder, error: (any Error)? = nil) {
+        self.events = events
+        self.error = error
+    }
+
+    func ensureConfigured() async throws {
+        events.append(.configuredTelemetry)
+        if let error {
+            throw error
+        }
+    }
+}
+
+private final class StartupEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var events: [StartupEvent] = []
+
+    func append(_ event: StartupEvent) {
+        lock.withLock {
+            events.append(event)
+        }
+    }
+}
+
+private enum StartupEvent: Equatable {
+    case configuredTelemetry
+    case registeredLaunchAgent
 }
 
 private extension OverviewTimeRange {

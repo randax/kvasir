@@ -42,6 +42,7 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public var selectedRangePreset: OverviewRangePreset
 
     private let dashboard: OverviewDashboard
+    private let telemetrySetup: any HarnessTelemetrySetup
     private let launchAgent: DaemonLaunchAgent
     private let now: () -> Date
     private let calendar: Calendar
@@ -49,12 +50,14 @@ public final class KvasirViewerModel: ObservableObject {
 
     public init(
         dashboard: OverviewDashboard,
+        telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
         launchAgent: DaemonLaunchAgent,
         selectedRangePreset: OverviewRangePreset = .lastSevenDays,
         now: @escaping () -> Date = Date.init,
         calendar: Calendar = .kvasirRollupUTC
     ) {
         self.dashboard = dashboard
+        self.telemetrySetup = telemetrySetup
         self.launchAgent = launchAgent
         self.selectedRangePreset = selectedRangePreset
         self.now = now
@@ -62,6 +65,7 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     public func start() async throws {
+        try await telemetrySetup.ensureConfigured()
         launchAgentOutcome = try launchAgent.ensureRegistered()
         try await refreshOverview()
     }
@@ -94,6 +98,16 @@ public final class KvasirViewerModel: ObservableObject {
     public func record(error: any Error) {
         errorMessage = error.localizedDescription
     }
+}
+
+public protocol HarnessTelemetrySetup: Sendable {
+    func ensureConfigured() async throws
+}
+
+public struct NoOpHarnessTelemetrySetup: HarnessTelemetrySetup {
+    public init() {}
+
+    public func ensureConfigured() async throws {}
 }
 
 public extension Calendar {
