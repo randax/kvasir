@@ -39,11 +39,13 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var overviewSnapshot: OverviewSnapshot?
     @Published public private(set) var launchAgentOutcome: LaunchAgentRegistrationOutcome?
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var setupWarningMessage: String?
     @Published public var selectedRangePreset: OverviewRangePreset
 
     private let dashboard: OverviewDashboard
     private let telemetrySetup: any HarnessTelemetrySetup
     private let launchAgent: DaemonLaunchAgent
+    private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
@@ -52,6 +54,7 @@ public final class KvasirViewerModel: ObservableObject {
         dashboard: OverviewDashboard,
         telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
         launchAgent: DaemonLaunchAgent,
+        shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
         selectedRangePreset: OverviewRangePreset = .lastSevenDays,
         now: @escaping () -> Date = Date.init,
         calendar: Calendar = .kvasirRollupUTC
@@ -59,18 +62,25 @@ public final class KvasirViewerModel: ObservableObject {
         self.dashboard = dashboard
         self.telemetrySetup = telemetrySetup
         self.launchAgent = launchAgent
+        self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
         self.selectedRangePreset = selectedRangePreset
         self.now = now
         self.calendar = calendar
     }
 
     public func start() async throws {
-        try await telemetrySetup.ensureConfigured()
+        do {
+            try await telemetrySetup.ensureConfigured()
+            setupWarningMessage = nil
+        } catch {
+            setupWarningMessage = error.localizedDescription
+        }
         launchAgentOutcome = try launchAgent.ensureRegistered()
         do {
             try await refreshOverview()
         } catch {
-            guard launchAgentOutcome != .requiresApproval else {
+            guard launchAgentOutcome != .requiresApproval,
+                  shouldRefreshLaunchAgentAfterStartupOverviewError(error) else {
                 throw error
             }
             launchAgentOutcome = try launchAgent.refreshRegistration()

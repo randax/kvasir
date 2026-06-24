@@ -1,5 +1,4 @@
 import Foundation
-import Darwin
 import ServiceManagement
 
 public enum LaunchAgentStatus: Equatable, Sendable {
@@ -20,7 +19,6 @@ public protocol LaunchAgentRegistry {
     func status(plistName: String) -> LaunchAgentStatus
     func register(plistName: String) throws
     func unregister(plistName: String) throws
-    func terminate(plistName: String)
 }
 
 public protocol LaunchAgentFingerprintProvider {
@@ -67,7 +65,6 @@ public struct DaemonLaunchAgent {
 
     public func refreshRegistration() throws -> LaunchAgentRegistrationOutcome {
         try registry.unregister(plistName: Self.plistName)
-        registry.terminate(plistName: Self.plistName)
         try registry.register(plistName: Self.plistName)
         saveCurrentFingerprint(plistName: Self.plistName)
         return .registered
@@ -112,20 +109,6 @@ public struct ServiceManagementLaunchAgentRegistry: LaunchAgentRegistry {
 
     public func unregister(plistName: String) throws {
         try SMAppService.agent(plistName: plistName).unregister()
-    }
-
-    public func terminate(plistName: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = [
-            "kill",
-            "TERM",
-            "gui/\(getuid())/\(plistName.replacingOccurrences(of: ".plist", with: ""))"
-        ]
-        guard (try? process.run()) != nil else {
-            return
-        }
-        process.waitUntilExit()
     }
 }
 

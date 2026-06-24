@@ -46,7 +46,7 @@ func viewerStartupRegistersDaemonAndLoadsOverviewForDefaultRange() async throws 
 
 @MainActor
 @Test
-func viewerStartupStopsBeforeLaunchAgentRegistrationWhenTelemetrySetupFails() async throws {
+func viewerStartupWarnsAndContinuesWhenTelemetrySetupFails() async throws {
     let client = RecordingStartupOverviewClient(
         rollups: OverviewRollups(tokenRollups: [], costRollups: [], toolCallRollups: [])
     )
@@ -61,16 +61,14 @@ func viewerStartupStopsBeforeLaunchAgentRegistrationWhenTelemetrySetupFails() as
         launchAgent: DaemonLaunchAgent(registry: registry)
     )
 
-    do {
-        try await model.start()
-        Issue.record("expected telemetry setup failure")
-    } catch {
-        #expect(error.localizedDescription == "transient")
-    }
+    try await model.start()
 
-    #expect(startupEvents.events == [.configuredTelemetry])
-    #expect(registry.registeredPlistNames.isEmpty)
-    #expect(client.queries.isEmpty)
+    #expect(startupEvents.events == [.configuredTelemetry, .registeredLaunchAgent])
+    #expect(model.setupWarningMessage == "transient")
+    #expect(model.launchAgentOutcome == .registered)
+    #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(client.queries.count == 1)
+    #expect(model.overviewSnapshot?.totals == .init(totalTokens: 0, costUsdNanos: 0, toolCalls: 0))
 }
 
 @MainActor
@@ -139,17 +137,44 @@ func viewerStartupRefreshesDaemonRegistrationAndRetriesWhenInitialOverviewFails(
     let registry = RecordingStartupLaunchAgentRegistry(status: .enabled)
     let model = KvasirViewerModel(
         dashboard: OverviewDashboard(client: client),
-        launchAgent: DaemonLaunchAgent(registry: registry)
+        launchAgent: DaemonLaunchAgent(registry: registry),
+        shouldRefreshLaunchAgentAfterStartupOverviewError: { _ in true }
     )
 
     try await model.start()
 
     #expect(model.launchAgentOutcome == .registered)
-    #expect(registry.terminatedPlistNames == [DaemonLaunchAgent.plistName])
     #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(client.queries.count == 2)
     #expect(model.overviewSnapshot?.totals.totalTokens == 12)
+}
+
+@MainActor
+@Test
+func viewerStartupDoesNotRefreshDaemonRegistrationForNonRecoverableOverviewFailure() async throws {
+    let client = RecordingResultOverviewClient(
+        results: [
+            .failure(StartupTestError.transient)
+        ]
+    )
+    let registry = RecordingStartupLaunchAgentRegistry(status: .enabled)
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: registry)
+    )
+
+    do {
+        try await model.start()
+        Issue.record("expected startup overview failure")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    #expect(model.launchAgentOutcome == .alreadyRegistered)
+    #expect(registry.unregisteredPlistNames.isEmpty)
+    #expect(registry.registeredPlistNames.isEmpty)
+    #expect(client.queries.count == 1)
 }
 
 @MainActor
@@ -358,7 +383,6 @@ private final class RecordingStartupLaunchAgentRegistry: LaunchAgentRegistry {
     private let events: StartupEventRecorder?
     private(set) var registeredPlistNames: [String] = []
     private(set) var unregisteredPlistNames: [String] = []
-    private(set) var terminatedPlistNames: [String] = []
 
     init(status: LaunchAgentStatus, events: StartupEventRecorder? = nil) {
         self.launchAgentStatus = status
@@ -376,10 +400,6 @@ private final class RecordingStartupLaunchAgentRegistry: LaunchAgentRegistry {
 
     func unregister(plistName: String) throws {
         unregisteredPlistNames.append(plistName)
-    }
-
-    func terminate(plistName: String) {
-        terminatedPlistNames.append(plistName)
     }
 }
 

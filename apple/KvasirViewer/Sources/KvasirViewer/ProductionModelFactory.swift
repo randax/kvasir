@@ -11,7 +11,8 @@ enum ProductionModelFactory {
         KvasirViewerModel(
             dashboard: OverviewDashboard(client: makeOverviewClient()),
             telemetrySetup: makeHarnessTelemetrySetup(),
-            launchAgent: DaemonLaunchAgent()
+            launchAgent: DaemonLaunchAgent(),
+            shouldRefreshLaunchAgentAfterStartupOverviewError: shouldRefreshLaunchAgentAfterStartupOverviewError
         )
     }
 
@@ -68,6 +69,17 @@ enum ProductionModelFactory {
                 .path,
             otlpEndpoint: "http://127.0.0.1:4318"
         )
+    }
+
+    private static func shouldRefreshLaunchAgentAfterStartupOverviewError(_ error: any Error) -> Bool {
+        #if canImport(kvasir_client)
+        guard let clientError = error as? KvasirClientError else {
+            return false
+        }
+        return clientError == .SocketIo
+        #else
+        return false
+        #endif
     }
 
     private static var applicationSupportDirectory: URL {

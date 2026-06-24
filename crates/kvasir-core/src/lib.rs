@@ -12,10 +12,10 @@ pub use otlp::{
 pub use pricing::{ModelTokenPrices, PriceTable};
 pub use rpc::BearerToken;
 pub use setup::{
-    ClaudeCodeSettings, CodexConfigToml, CopilotShellProfile, KeychainSetupSecretSource,
-    KvasirEndpoint, OpenCodeEnvironment, OpenCodeEnvironmentVariable,
+    ClaudeCodeSettings, CodexConfigToml, CommittedSetupConfig, CopilotShellProfile,
+    KeychainSetupSecretSource, KvasirEndpoint, OpenCodeEnvironment, OpenCodeEnvironmentVariable,
     OpenCodeEnvironmentVariableKey, OpenCodeSetup, RawBodyDirectory, SetupConfig, SetupCredential,
-    SetupError, SetupSecretSource, resolve_setup_config,
+    SetupError, SetupSecretSource, prepare_setup_config, resolve_setup_config,
 };
 pub use store::{StoreKey, StoreKeyError, UsageStore};
 pub use usage::{

@@ -14,6 +14,10 @@ pub enum KvasirClientError {
     WrongResponseType,
     #[error("harness telemetry setup failed")]
     HarnessTelemetrySetup,
+    #[error("harness telemetry setup rollback failed")]
+    HarnessTelemetryRollback,
+    #[error("harness telemetry setup state is unknown")]
+    HarnessTelemetryStateUnknown,
     #[error("filesystem operation failed")]
     Filesystem,
 }
