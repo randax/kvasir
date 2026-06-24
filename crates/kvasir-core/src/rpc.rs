@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::usage::{ContentKind, ContentText, CostUsd, RepoBucket};
 
@@ -57,16 +57,29 @@ impl ModelName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HarnessName(String);
 
 impl HarnessName {
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(canonical_harness_name(&value.into()))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+pub fn canonical_harness_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+impl<'de> Deserialize<'de> for HarnessName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
     }
 }
 
@@ -660,6 +673,28 @@ mod tests {
                 }
             })
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_request_deserialization_canonicalizes_harness_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request: RpcRequest = serde_json::from_value(json!({
+            "type": "trace",
+            "payload": {
+                "query": {
+                    "harness": " GitHub-Copilot ",
+                    "session_id": "session-12",
+                    "prompt_id": "prompt-7"
+                }
+            }
+        }))?;
+
+        let RpcRequest::Trace { query } = request else {
+            panic!("expected trace request");
+        };
+        assert_eq!(query.harness, HarnessName::new("github_copilot"));
 
         Ok(())
     }

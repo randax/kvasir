@@ -476,7 +476,9 @@ impl TryFrom<String> for KvasirHarnessName {
     type Error = KvasirClientError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        nonempty_text(value).map(Self)
+        nonempty_text(value)
+            .map(|value| kvasir_core::rpc::canonical_harness_name(&value))
+            .map(Self)
     }
 }
 
@@ -603,6 +605,15 @@ mod tests {
         assert!(debug_output.contains("<redacted>"));
         assert!(!debug_output.contains("secret-token"));
         assert!(!debug_output.contains("private prompt text"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn harness_names_are_canonicalized() -> Result<(), KvasirClientError> {
+        let harness = KvasirHarnessName::try_from(" GitHub-Copilot ".to_owned())?;
+
+        assert_eq!(String::from(harness), "github_copilot");
 
         Ok(())
     }
