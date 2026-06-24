@@ -2212,19 +2212,34 @@ fn migrate_v10_to_v11(transaction: &rusqlite::Transaction<'_>) -> Result<(), Sto
                 repo_bucket,
                 repo_name,
                 repo_path,
-                replace(lower(trim(harness)), '-', '_'),
+                harness,
                 tool_name,
                 counter_start_ms,
-                MAX(last_occurred_at_ms),
-                MAX(last_value)
-             FROM tool_call_counter_snapshots
-             GROUP BY
-                repo_bucket,
-                repo_name,
-                repo_path,
-                replace(lower(trim(harness)), '-', '_'),
-                tool_name,
-                counter_start_ms;
+                last_occurred_at_ms,
+                last_value
+             FROM (
+                SELECT
+                    repo_bucket,
+                    repo_name,
+                    repo_path,
+                    replace(lower(trim(harness)), '-', '_') AS harness,
+                    tool_name,
+                    counter_start_ms,
+                    last_occurred_at_ms,
+                    last_value,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            repo_bucket,
+                            repo_name,
+                            repo_path,
+                            replace(lower(trim(harness)), '-', '_'),
+                            tool_name,
+                            counter_start_ms
+                        ORDER BY last_occurred_at_ms DESC, last_value DESC
+                    ) AS row_number
+                FROM tool_call_counter_snapshots
+             )
+             WHERE row_number = 1;
              DROP TABLE tool_call_counter_snapshots;
              ALTER TABLE tool_call_counter_snapshots_v11 RENAME TO tool_call_counter_snapshots;",
         )?;
@@ -6318,6 +6333,18 @@ mod tests {
                 call_count INTEGER NOT NULL
             );
 
+            CREATE TABLE tool_call_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, harness, tool_name, counter_start_ms)
+            );
+
             INSERT INTO canonical_trace_spans (
                 harness,
                 session_id,
@@ -6452,6 +6479,37 @@ occurred_at_nanos=1781956803000000000
                 1
             );
 
+            INSERT INTO tool_call_counter_snapshots (
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name,
+                counter_start_ms,
+                last_occurred_at_ms,
+                last_value
+            ) VALUES
+            (
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'GitHub-Copilot',
+                'Read',
+                1781956700000,
+                1781956804000,
+                2
+            ),
+            (
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'github_copilot',
+                'Read',
+                1781956700000,
+                1781956805000,
+                1
+            );
+
             PRAGMA user_version = 10;",
         )?;
         drop(connection);
@@ -6499,6 +6557,16 @@ occurred_at_nanos=1781956803000000000
         )?;
         assert!(tool_call_event_key.contains("harness=github_copilot\n"));
         assert!(!tool_call_event_key.contains("harness=GitHub-Copilot\n"));
+        let migrated_snapshot: (String, i64, i64) = store.connection.query_row(
+            "SELECT harness, last_occurred_at_ms, last_value
+             FROM tool_call_counter_snapshots",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            migrated_snapshot,
+            ("github_copilot".to_owned(), 1_781_956_805_000, 1)
+        );
 
         store.ingest_usage(&UsageRecords {
             token_usage: Vec::new(),
