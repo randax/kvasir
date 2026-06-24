@@ -14,11 +14,29 @@ public struct OverviewQuery: Equatable, Sendable {
     public var start: Date
     public var end: Date
     public var repo: OverviewRepoBucket?
+    public var model: OverviewModelName?
 
-    public init(start: Date, end: Date, repo: OverviewRepoBucket? = nil) {
+    public init(start: Date, end: Date, repo: OverviewRepoBucket? = nil, model: OverviewModelName? = nil) {
         self.start = start
         self.end = end
         self.repo = repo
+        self.model = model
+    }
+}
+
+public struct OverviewModelName: Hashable, Comparable, Sendable {
+    private let value: String
+
+    public init(_ value: String) {
+        self.value = value
+    }
+
+    public func displayName() -> String {
+        value
+    }
+
+    public static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.value < rhs.value
     }
 }
 
@@ -142,18 +160,24 @@ public struct OverviewSnapshot: Equatable, Sendable {
     public var totals: OverviewTotals
     public var series: [OverviewSeriesPoint]
     public var repoBreakdown: [OverviewRepoSummary]
+    public var modelBreakdown: [OverviewModelSummary]
     public var selectedRepo: OverviewRepoBucket?
+    public var selectedModel: OverviewModelName?
 
     public init(
         totals: OverviewTotals,
         series: [OverviewSeriesPoint],
         repoBreakdown: [OverviewRepoSummary],
-        selectedRepo: OverviewRepoBucket?
+        modelBreakdown: [OverviewModelSummary] = [],
+        selectedRepo: OverviewRepoBucket?,
+        selectedModel: OverviewModelName? = nil
     ) {
         self.totals = totals
         self.series = series
         self.repoBreakdown = repoBreakdown
+        self.modelBreakdown = modelBreakdown
         self.selectedRepo = selectedRepo
+        self.selectedModel = selectedModel
     }
 }
 
@@ -163,6 +187,16 @@ public struct OverviewRepoSummary: Equatable, Sendable {
 
     public init(repo: OverviewRepoBucket, totals: OverviewTotals) {
         self.repo = repo
+        self.totals = totals
+    }
+}
+
+public struct OverviewModelSummary: Equatable, Sendable {
+    public var model: OverviewModelName
+    public var totals: OverviewTotals
+
+    public init(model: OverviewModelName, totals: OverviewTotals) {
+        self.model = model
         self.totals = totals
     }
 }
@@ -178,8 +212,12 @@ public struct OverviewDashboard: Sendable {
         self.client = client
     }
 
-    public func load(range: OverviewTimeRange, repo: OverviewRepoBucket? = nil) async throws -> OverviewSnapshot {
-        let query = OverviewQuery(start: range.start, end: range.end, repo: repo)
+    public func load(
+        range: OverviewTimeRange,
+        repo: OverviewRepoBucket? = nil,
+        model: OverviewModelName? = nil
+    ) async throws -> OverviewSnapshot {
+        let query = OverviewQuery(start: range.start, end: range.end, repo: repo, model: model)
         return try await client.loadOverviewSnapshot(query: query)
     }
 }

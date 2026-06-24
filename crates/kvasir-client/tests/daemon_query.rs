@@ -11,13 +11,14 @@ use kvasir_client::{
     KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
     KvasirContentKind, KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
     KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
-    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewRepoSummary,
-    KvasirOverviewRollup, KvasirOverviewSeriesPoint, KvasirOverviewSnapshot, KvasirOverviewTotals,
-    KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
-    KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId,
-    KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate,
-    KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId,
-    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewModelSummary,
+    KvasirOverviewRepoSummary, KvasirOverviewRollup, KvasirOverviewSeriesPoint,
+    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
+    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
+    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
+    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
+    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
+    KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::{BearerToken, RpcResponse};
@@ -60,6 +61,7 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: None,
+        model: None,
     };
     let rollups = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1067,6 +1069,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        model: None,
     };
     let (overview, snapshot) = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1225,7 +1228,137 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     tool_calls: 3,
                 },
             }],
+            model_breakdown: vec![
+                KvasirOverviewModelSummary {
+                    model: model("claude-sonnet-4-20250514"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 3_300,
+                        cost_usd_nanos: 218_015_000,
+                        tool_calls: 0,
+                    },
+                },
+                KvasirOverviewModelSummary {
+                    model: model("claude-opus-4-20250514"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 1_700,
+                        cost_usd_nanos: 1_750_000_000,
+                        tool_calls: 0,
+                    },
+                },
+            ],
             selected_repo: Some(kvasir_repo()),
+            selected_model: None,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+    let http_client = reqwest::Client::new();
+
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(native_cost_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    http_client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_tool_result_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let selected_model = model("claude-sonnet-4-20250514");
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: Some(kvasir_repo()),
+        model: Some(selected_model.clone()),
+    };
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.overview_snapshot(query)
+    })
+    .await??;
+
+    assert_eq!(
+        snapshot,
+        KvasirOverviewSnapshot {
+            totals: KvasirOverviewTotals {
+                total_tokens: 3_300,
+                cost_usd_nanos: 218_015_000,
+                tool_calls: 0,
+            },
+            series: vec![
+                KvasirOverviewSeriesPoint {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    total_tokens: 450,
+                    cost_usd_nanos: 200_000_000,
+                    tool_calls: 0,
+                },
+                KvasirOverviewSeriesPoint {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 21,
+                    },
+                    total_tokens: 2_850,
+                    cost_usd_nanos: 18_015_000,
+                    tool_calls: 0,
+                },
+            ],
+            repo_breakdown: vec![KvasirOverviewRepoSummary {
+                repo: kvasir_repo(),
+                totals: KvasirOverviewTotals {
+                    total_tokens: 3_300,
+                    cost_usd_nanos: 218_015_000,
+                    tool_calls: 0,
+                },
+            }],
+            model_breakdown: vec![KvasirOverviewModelSummary {
+                model: selected_model.clone(),
+                totals: KvasirOverviewTotals {
+                    total_tokens: 3_300,
+                    cost_usd_nanos: 218_015_000,
+                    tool_calls: 0,
+                },
+            }],
+            selected_repo: Some(kvasir_repo()),
+            selected_model: Some(selected_model),
         }
     );
 
@@ -1252,6 +1385,7 @@ async fn client_subscription_delivers_live_token_rollup_updates() -> anyhow::Res
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        model: None,
     };
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
     let (first_update_sender, first_update_receiver) = tokio::sync::oneshot::channel();
@@ -1384,6 +1518,7 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        model: None,
     };
     let rollups = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1461,6 +1596,7 @@ async fn client_queries_tool_call_rollups_through_daemon_socket() -> anyhow::Res
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        model: None,
     };
     let rollups = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1555,6 +1691,7 @@ async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyho
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: None,
+        model: None,
     };
     let error = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;

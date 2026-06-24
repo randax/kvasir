@@ -32,6 +32,9 @@ impl TryFrom<KvasirRollupQuery> for RollupQuery {
         if let Some(repo) = query.repo {
             core_query = core_query.with_repo(repo.try_into()?);
         }
+        if let Some(model) = query.model {
+            core_query = core_query.with_model(model.into_core());
+        }
         Ok(core_query)
     }
 }
@@ -47,6 +50,9 @@ impl TryFrom<KvasirRollupQuery> for CostRollupQuery {
         if let Some(repo) = query.repo {
             core_query = core_query.with_repo(repo.try_into()?);
         }
+        if let Some(model) = query.model {
+            core_query = core_query.with_model(model.into_core());
+        }
         Ok(core_query)
     }
 }
@@ -61,6 +67,9 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
         );
         if let Some(repo) = query.repo {
             core_query = core_query.with_repo(repo.try_into()?);
+        }
+        if let Some(model) = query.model {
+            core_query = core_query.with_model(model.into_core());
         }
         Ok(core_query)
     }

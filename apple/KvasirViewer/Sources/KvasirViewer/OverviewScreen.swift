@@ -79,9 +79,10 @@ struct OverviewScreen: View {
                     if let errorMessage = model.errorMessage {
                         errorBanner(errorMessage)
                     }
-                    totals(snapshot.totals)
-                    repoDashboard(snapshot.repoBreakdown)
-                    charts(snapshot.series)
+                    totals(snapshot.totals, showsToolCalls: snapshot.selectedModel == nil)
+                    modelDashboard(snapshot.modelBreakdown)
+                    repoDashboard(snapshot.repoBreakdown, showsToolCalls: snapshot.selectedModel == nil)
+                    charts(snapshot.series, showsToolCalls: snapshot.selectedModel == nil)
                 }
                 .padding(24)
             }
@@ -103,15 +104,17 @@ struct OverviewScreen: View {
         }
     }
 
-    private func totals(_ totals: OverviewTotals) -> some View {
+    private func totals(_ totals: OverviewTotals, showsToolCalls: Bool) -> some View {
         HStack(spacing: 12) {
             TotalTile(title: "Tokens", value: totals.totalTokens.formatted(), systemImage: "sum")
             TotalTile(title: "Cost", value: usd(totals.costUsdNanos), systemImage: "dollarsign")
-            TotalTile(title: "Tool calls", value: totals.toolCalls.formatted(), systemImage: "hammer")
+            if showsToolCalls {
+                TotalTile(title: "Tool calls", value: totals.toolCalls.formatted(), systemImage: "hammer")
+            }
         }
     }
 
-    private func repoDashboard(_ repos: [OverviewRepoSummary]) -> some View {
+    private func repoDashboard(_ repos: [OverviewRepoSummary], showsToolCalls: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 Text("Repos")
@@ -138,11 +141,12 @@ struct OverviewScreen: View {
                 if repos.isEmpty {
                     RepoEmptyRow()
                 } else {
-                    RepoHeaderRow()
+                    RepoHeaderRow(showsToolCalls: showsToolCalls)
                     ForEach(repos, id: \.repo) { summary in
                         RepoSummaryRow(
                             summary: summary,
                             isSelected: model.selectedRepo == summary.repo,
+                            showsToolCalls: showsToolCalls,
                             costFormatter: usd
                         ) {
                             selectRepo(summary.repo)
@@ -159,15 +163,67 @@ struct OverviewScreen: View {
         }
     }
 
-    private func charts(_ series: [OverviewSeriesPoint]) -> some View {
+    private func modelDashboard(_ models: [OverviewModelSummary]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Text("Models")
+                    .font(.headline)
+
+                if let selectedModel = model.selectedModel {
+                    Text(selectedModel.displayName())
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(selectedModel.displayName())
+                }
+
+                Spacer()
+
+                Button {
+                    selectModel(nil)
+                } label: {
+                    Label("All models", systemImage: "cpu")
+                }
+                .disabled(model.selectedModel == nil)
+            }
+
+            VStack(spacing: 0) {
+                if models.isEmpty {
+                    ModelEmptyRow()
+                } else {
+                    ModelHeaderRow()
+                    ForEach(models, id: \.model) { summary in
+                        ModelSummaryRow(
+                            summary: summary,
+                            isSelected: model.selectedModel == summary.model,
+                            costFormatter: usd
+                        ) {
+                            selectModel(summary.model)
+                        }
+                        Divider()
+                    }
+                }
+            }
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+            )
+        }
+    }
+
+    private func charts(_ series: [OverviewSeriesPoint], showsToolCalls: Bool) -> some View {
         Grid(horizontalSpacing: 16, verticalSpacing: 16) {
             GridRow {
                 MetricChart(title: "Tokens", series: series, color: .teal) { $0.totalTokens }
                 MetricChart(title: "Cost", series: series, color: .indigo) { $0.costUsdNanos }
             }
-            GridRow {
-                MetricChart(title: "Tool calls", series: series, color: .orange) { $0.toolCalls }
-                    .gridCellColumns(2)
+            if showsToolCalls {
+                GridRow {
+                    MetricChart(title: "Tool calls", series: series, color: .orange) { $0.toolCalls }
+                        .gridCellColumns(2)
+                }
             }
         }
     }
@@ -176,6 +232,16 @@ struct OverviewScreen: View {
         Task {
             do {
                 try await model.selectRepo(repo)
+            } catch {
+                model.record(error: error)
+            }
+        }
+    }
+
+    private func selectModel(_ selectedModel: OverviewModelName?) {
+        Task {
+            do {
+                try await model.selectModel(selectedModel)
             } catch {
                 model.record(error: error)
             }
@@ -231,7 +297,18 @@ private struct RepoEmptyRow: View {
     }
 }
 
+private struct ModelEmptyRow: View {
+    var body: some View {
+        Label("No model data for this range", systemImage: "tray")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+    }
+}
+
 private struct RepoHeaderRow: View {
+    let showsToolCalls: Bool
+
     var body: some View {
         HStack(spacing: 12) {
             Text("Repo")
@@ -240,7 +317,26 @@ private struct RepoHeaderRow: View {
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
                 .frame(width: 110, alignment: .trailing)
-            Text("Tool calls")
+            if showsToolCalls {
+                Text("Tool calls")
+                    .frame(width: 110, alignment: .trailing)
+            }
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct ModelHeaderRow: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Model")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Tokens")
+                .frame(width: 110, alignment: .trailing)
+            Text("Cost")
                 .frame(width: 110, alignment: .trailing)
         }
         .font(.caption.weight(.medium))
@@ -253,6 +349,7 @@ private struct RepoHeaderRow: View {
 private struct RepoSummaryRow: View {
     let summary: OverviewRepoSummary
     let isSelected: Bool
+    let showsToolCalls: Bool
     let costFormatter: (UInt64) -> String
     let action: () -> Void
 
@@ -282,7 +379,44 @@ private struct RepoSummaryRow: View {
                 Text(costFormatter(summary.totals.costUsdNanos))
                     .monospacedDigit()
                     .frame(width: 110, alignment: .trailing)
-                Text(summary.totals.toolCalls.formatted())
+                if showsToolCalls {
+                    Text(summary.totals.toolCalls.formatted())
+                        .monospacedDigit()
+                        .frame(width: 110, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ModelSummaryRow: View {
+    let summary: OverviewModelSummary
+    let isSelected: Bool
+    let costFormatter: (UInt64) -> String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "cpu")
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    Text(summary.model.displayName())
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(summary.totals.totalTokens.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                Text(costFormatter(summary.totals.costUsdNanos))
                     .monospacedDigit()
                     .frame(width: 110, alignment: .trailing)
             }
@@ -292,6 +426,7 @@ private struct RepoSummaryRow: View {
             .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
         }
         .buttonStyle(.plain)
+        .help(summary.model.displayName())
     }
 }
 

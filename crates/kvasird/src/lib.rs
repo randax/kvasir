@@ -816,11 +816,13 @@ fn overview_rollups(
             start: query.start,
             end: query.end,
             repo: query.repo.clone(),
+            model: query.model.clone(),
         })?,
         tool_call_rollups: store.tool_call_rollups(ToolCallRollupQuery {
             start: query.start,
             end: query.end,
             repo: query.repo,
+            model: query.model,
         })?,
     })
 }

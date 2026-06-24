@@ -272,6 +272,97 @@ func selectingRepoReloadsOverviewForCurrentRange() async throws {
 
 @MainActor
 @Test
+func selectingModelReloadsOverviewForCurrentRange() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let selectedModel = OverviewModelName("claude-sonnet-4-20250514")
+    let client = RecordingStartupOverviewClient(
+        snapshot: overviewSnapshot(totalTokens: 13, costUsdNanos: 12, selectedModel: selectedModel)
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.selectModel(selectedModel)
+
+    #expect(model.selectedModel == selectedModel)
+    #expect(model.overviewSnapshot?.selectedModel == selectedModel)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(model: selectedModel)
+    ])
+}
+
+@MainActor
+@Test
+func selectingModelKeepsActiveRepoScope() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let repo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("kvasir"),
+            path: OverviewRepoPath("/repos/kvasir")
+        )!
+    )
+    let selectedModel = OverviewModelName("claude-sonnet-4-20250514")
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 21, selectedRepo: repo)),
+            .success(overviewSnapshot(totalTokens: 13, selectedRepo: repo, selectedModel: selectedModel))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.selectRepo(repo)
+    try await model.selectModel(selectedModel)
+
+    #expect(model.selectedRepo == repo)
+    #expect(model.selectedModel == selectedModel)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(repo: repo),
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(repo: repo, model: selectedModel)
+    ])
+}
+
+@MainActor
+@Test
+func selectingRepoKeepsActiveModelScope() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let repo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("kvasir"),
+            path: OverviewRepoPath("/repos/kvasir")
+        )!
+    )
+    let selectedModel = OverviewModelName("claude-sonnet-4-20250514")
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 21, selectedModel: selectedModel)),
+            .success(overviewSnapshot(totalTokens: 13, selectedRepo: repo, selectedModel: selectedModel))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.selectModel(selectedModel)
+    try await model.selectRepo(repo)
+
+    #expect(model.selectedRepo == repo)
+    #expect(model.selectedModel == selectedModel)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(model: selectedModel),
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(repo: repo, model: selectedModel)
+    ])
+}
+
+@MainActor
+@Test
 func failedRepoSelectionKeepsPreviousRepoAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let kvasirRepo = OverviewRepoBucket.repo(
@@ -587,7 +678,8 @@ private func overviewSnapshot(
     totalTokens: UInt64 = 0,
     costUsdNanos: UInt64 = 0,
     toolCalls: UInt64 = 0,
-    selectedRepo: OverviewRepoBucket? = nil
+    selectedRepo: OverviewRepoBucket? = nil,
+    selectedModel: OverviewModelName? = nil
 ) -> OverviewSnapshot {
     OverviewSnapshot(
         totals: OverviewTotals(
@@ -606,7 +698,18 @@ private func overviewSnapshot(
                 )
             )]
         } ?? [],
-        selectedRepo: selectedRepo
+        modelBreakdown: selectedModel.map {
+            [OverviewModelSummary(
+                model: $0,
+                totals: OverviewTotals(
+                    totalTokens: totalTokens,
+                    costUsdNanos: costUsdNanos,
+                    toolCalls: toolCalls
+                )
+            )]
+        } ?? [],
+        selectedRepo: selectedRepo,
+        selectedModel: selectedModel
     )
 }
 
@@ -617,6 +720,14 @@ private extension OverviewTimeRange {
 
     func query(repo: OverviewRepoBucket?) -> OverviewQuery {
         OverviewQuery(start: start, end: end, repo: repo)
+    }
+
+    func query(model: OverviewModelName?) -> OverviewQuery {
+        OverviewQuery(start: start, end: end, model: model)
+    }
+
+    func query(repo: OverviewRepoBucket?, model: OverviewModelName?) -> OverviewQuery {
+        OverviewQuery(start: start, end: end, repo: repo, model: model)
     }
 }
 

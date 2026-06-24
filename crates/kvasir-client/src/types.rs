@@ -5,7 +5,7 @@ use crate::error::KvasirClientError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirSocketPath(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KvasirModelName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +85,7 @@ pub struct KvasirRollupQuery {
     pub start: KvasirTimestampMillis,
     pub end: KvasirTimestampMillis,
     pub repo: Option<KvasirRepoBucket>,
+    pub model: Option<KvasirModelName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -168,11 +169,19 @@ pub struct KvasirOverviewRepoSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewModelSummary {
+    pub model: KvasirModelName,
+    pub totals: KvasirOverviewTotals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirOverviewSnapshot {
     pub totals: KvasirOverviewTotals,
     pub series: Vec<KvasirOverviewSeriesPoint>,
     pub repo_breakdown: Vec<KvasirOverviewRepoSummary>,
+    pub model_breakdown: Vec<KvasirOverviewModelSummary>,
     pub selected_repo: Option<KvasirRepoBucket>,
+    pub selected_model: Option<KvasirModelName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -273,6 +282,10 @@ impl KvasirModelName {
     pub(crate) fn from_core(value: kvasir_core::rpc::ModelName) -> Self {
         Self(value.as_str().to_owned())
     }
+
+    pub(crate) fn into_core(self) -> kvasir_core::rpc::ModelName {
+        kvasir_core::rpc::ModelName::new(self.0)
+    }
 }
 
 impl KvasirHarnessName {
@@ -365,40 +378,61 @@ impl KvasirOverviewSnapshot {
     pub(crate) fn from_rollup(
         rollup: KvasirOverviewRollup,
         selected_repo: Option<KvasirRepoBucket>,
+        selected_model: Option<KvasirModelName>,
     ) -> Self {
         let mut totals = KvasirOverviewTotals::zero();
         let mut points_by_day: HashMap<KvasirRollupDay, KvasirOverviewSeriesPoint> = HashMap::new();
         let mut totals_by_repo: HashMap<KvasirRepoBucket, KvasirOverviewTotals> = HashMap::new();
+        let mut totals_by_model: HashMap<KvasirModelName, KvasirOverviewTotals> = HashMap::new();
 
         for token_rollup in rollup.token_rollups {
-            let tokens = token_rollup.total_tokens();
+            let KvasirTokenRollup {
+                day,
+                repo,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_tokens,
+            } = token_rollup;
+            let tokens = input_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(cache_tokens);
             totals.total_tokens = totals.total_tokens.saturating_add(tokens);
             let point = points_by_day
-                .entry(token_rollup.day.clone())
-                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(token_rollup.day));
+                .entry(day.clone())
+                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(day));
             point.total_tokens = point.total_tokens.saturating_add(tokens);
             let repo_totals = totals_by_repo
-                .entry(token_rollup.repo)
+                .entry(repo)
                 .or_insert_with(KvasirOverviewTotals::zero);
             repo_totals.total_tokens = repo_totals.total_tokens.saturating_add(tokens);
+            let model_totals = totals_by_model
+                .entry(model)
+                .or_insert_with(KvasirOverviewTotals::zero);
+            model_totals.total_tokens = model_totals.total_tokens.saturating_add(tokens);
         }
 
         for cost_rollup in rollup.cost_rollups {
-            totals.cost_usd_nanos = totals
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+            let KvasirCostRollup {
+                day,
+                repo,
+                model,
+                cost_usd,
+            } = cost_rollup;
+            totals.cost_usd_nanos = totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
             let point = points_by_day
-                .entry(cost_rollup.day.clone())
-                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(cost_rollup.day));
-            point.cost_usd_nanos = point
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+                .entry(day.clone())
+                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(day));
+            point.cost_usd_nanos = point.cost_usd_nanos.saturating_add(cost_usd.nanos);
             let repo_totals = totals_by_repo
-                .entry(cost_rollup.repo)
+                .entry(repo)
                 .or_insert_with(KvasirOverviewTotals::zero);
-            repo_totals.cost_usd_nanos = repo_totals
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+            repo_totals.cost_usd_nanos = repo_totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
+            let model_totals = totals_by_model
+                .entry(model)
+                .or_insert_with(KvasirOverviewTotals::zero);
+            model_totals.cost_usd_nanos =
+                model_totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
         }
 
         for tool_call_rollup in rollup.tool_call_rollups {
@@ -418,7 +452,7 @@ impl KvasirOverviewSnapshot {
         }
 
         let mut series = points_by_day.into_values().collect::<Vec<_>>();
-        series.sort_by_key(|point| point.day.clone());
+        series.sort_by(|lhs, rhs| lhs.day.cmp(&rhs.day));
 
         let mut repo_breakdown = totals_by_repo
             .into_iter()
@@ -426,11 +460,19 @@ impl KvasirOverviewSnapshot {
             .collect::<Vec<_>>();
         repo_breakdown.sort_by(repo_summary_order);
 
+        let mut model_breakdown = totals_by_model
+            .into_iter()
+            .map(|(model, totals)| KvasirOverviewModelSummary { model, totals })
+            .collect::<Vec<_>>();
+        model_breakdown.sort_by(model_summary_order);
+
         Self {
             totals,
             series,
             repo_breakdown,
+            model_breakdown,
             selected_repo,
+            selected_model,
         }
     }
 }
@@ -456,14 +498,6 @@ impl KvasirOverviewSeriesPoint {
     }
 }
 
-impl KvasirTokenRollup {
-    fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_tokens)
-    }
-}
-
 fn repo_summary_order(
     lhs: &KvasirOverviewRepoSummary,
     rhs: &KvasirOverviewRepoSummary,
@@ -474,6 +508,17 @@ fn repo_summary_order(
         .then_with(|| rhs.totals.cost_usd_nanos.cmp(&lhs.totals.cost_usd_nanos))
         .then_with(|| rhs.totals.tool_calls.cmp(&lhs.totals.tool_calls))
         .then_with(|| repo_sort_key(&lhs.repo).cmp(&repo_sort_key(&rhs.repo)))
+}
+
+fn model_summary_order(
+    lhs: &KvasirOverviewModelSummary,
+    rhs: &KvasirOverviewModelSummary,
+) -> std::cmp::Ordering {
+    rhs.totals
+        .total_tokens
+        .cmp(&lhs.totals.total_tokens)
+        .then_with(|| rhs.totals.cost_usd_nanos.cmp(&lhs.totals.cost_usd_nanos))
+        .then_with(|| lhs.model.cmp(&rhs.model))
 }
 
 fn repo_sort_key(repo: &KvasirRepoBucket) -> (u8, String, String) {
@@ -863,6 +908,7 @@ mod tests {
                 ],
             },
             Some(selected_repo.clone()),
+            None,
         );
 
         assert_eq!(
@@ -911,7 +957,29 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            snapshot.model_breakdown,
+            vec![
+                KvasirOverviewModelSummary {
+                    model: KvasirModelName::try_from("claude-sonnet-4".to_owned())?,
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 3_300,
+                        cost_usd_nanos: 2_075_000_000,
+                        tool_calls: 0,
+                    },
+                },
+                KvasirOverviewModelSummary {
+                    model: KvasirModelName::try_from("claude-opus-4".to_owned())?,
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 1_750,
+                        cost_usd_nanos: 1_250_000_000,
+                        tool_calls: 0,
+                    },
+                },
+            ]
+        );
         assert_eq!(snapshot.selected_repo, Some(selected_repo));
+        assert_eq!(snapshot.selected_model, None);
 
         Ok(())
     }

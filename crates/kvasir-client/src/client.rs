@@ -74,8 +74,10 @@ impl KvasirClient {
         query: KvasirRollupQuery,
     ) -> Result<KvasirOverviewSnapshot, KvasirClientError> {
         let selected_repo = query.repo.clone();
-        self.overview_rollups(query)
-            .map(|rollup| KvasirOverviewSnapshot::from_rollup(rollup, selected_repo))
+        let selected_model = query.model.clone();
+        self.overview_rollups(query).map(|rollup| {
+            KvasirOverviewSnapshot::from_rollup(rollup, selected_repo, selected_model)
+        })
     }
 
     pub fn cost_rollups(
