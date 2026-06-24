@@ -88,7 +88,8 @@ cp "$PACKAGE_DIR/LaunchAgents/dev.kvasir.kvasird.plist" \
 
 DAEMON_FINGERPRINT="$(shasum -a 256 "$MACOS_DIR/kvasird" | awk '{print $1}')"
 PLIST_FINGERPRINT="$(shasum -a 256 "$LAUNCH_AGENTS_DIR/dev.kvasir.kvasird.plist" | awk '{print $1}')"
-LAUNCH_AGENT_FINGERPRINT="$(printf '%s\n%s\n' "$DAEMON_FINGERPRINT" "$PLIST_FINGERPRINT" | shasum -a 256 | awk '{print $1}')"
+LAUNCH_AGENT_REGISTRATION_POLICY_VERSION="2"
+LAUNCH_AGENT_FINGERPRINT="$(printf '%s\n%s\n%s\n' "$DAEMON_FINGERPRINT" "$PLIST_FINGERPRINT" "$LAUNCH_AGENT_REGISTRATION_POLICY_VERSION" | shasum -a 256 | awk '{print $1}')"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

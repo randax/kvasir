@@ -682,7 +682,9 @@ async fn serve_rpc(listener: UnixListener, state: DaemonState, shutdown: broadca
         };
         let connection_state = state.clone();
         tokio::spawn(async move {
-            let _ = handle_rpc_connection(stream, connection_state).await;
+            if let Err(err) = handle_rpc_connection(stream, connection_state).await {
+                eprintln!("kvasird rpc connection failed: {err:#}");
+            }
         });
     }
 }

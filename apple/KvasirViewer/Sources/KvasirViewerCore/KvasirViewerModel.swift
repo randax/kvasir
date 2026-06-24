@@ -67,7 +67,15 @@ public final class KvasirViewerModel: ObservableObject {
     public func start() async throws {
         try await telemetrySetup.ensureConfigured()
         launchAgentOutcome = try launchAgent.ensureRegistered()
-        try await refreshOverview()
+        do {
+            try await refreshOverview()
+        } catch {
+            guard launchAgentOutcome != .requiresApproval else {
+                throw error
+            }
+            launchAgentOutcome = try launchAgent.refreshRegistration()
+            try await refreshOverview()
+        }
     }
 
     public func selectRangePreset(_ preset: OverviewRangePreset) async throws {

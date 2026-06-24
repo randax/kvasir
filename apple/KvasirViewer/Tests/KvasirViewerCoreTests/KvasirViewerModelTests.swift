@@ -121,6 +121,39 @@ func viewerStartupSurfacesLaunchAgentApprovalAndStillLoadsOverview() async throw
 
 @MainActor
 @Test
+func viewerStartupRefreshesDaemonRegistrationAndRetriesWhenInitialOverviewFails() async throws {
+    let client = RecordingResultOverviewClient(
+        results: [
+            .failure(StartupTestError.transient),
+            .success(
+                OverviewRollups(
+                    tokenRollups: [
+                        .init(day: .init(year: 2026, month: 6, day: 21), inputTokens: 7, outputTokens: 5, cacheTokens: 0)
+                    ],
+                    costRollups: [],
+                    toolCallRollups: []
+                )
+            )
+        ]
+    )
+    let registry = RecordingStartupLaunchAgentRegistry(status: .enabled)
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: registry)
+    )
+
+    try await model.start()
+
+    #expect(model.launchAgentOutcome == .registered)
+    #expect(registry.terminatedPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(client.queries.count == 2)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 12)
+}
+
+@MainActor
+@Test
 func successfulOverviewRefreshClearsPreviousError() async throws {
     let client = RecordingStartupOverviewClient(
         rollups: OverviewRollups(tokenRollups: [], costRollups: [], toolCallRollups: [])
@@ -166,16 +199,16 @@ func staleOverviewLoadsCannotOverwriteNewerRangeSelection() async throws {
         calendar: calendar
     )
 
-    async let older: Void = model.selectRangePreset(.today)
-    async let newer: Void = model.selectRangePreset(.lastThirtyDays)
-
+    let older = Task { try await model.selectRangePreset(.today) }
+    await client.waitForPendingLoads(count: 1)
+    let newer = Task { try await model.selectRangePreset(.lastThirtyDays) }
     await client.waitForPendingLoads(count: 2)
     client.completeLoad(at: 1)
-    try await newer
+    try await newer.value
     #expect(model.overviewSnapshot?.totals.totalTokens == 2)
 
     client.completeLoad(at: 0)
-    try await older
+    try await older.value
     #expect(model.selectedRangePreset == .lastThirtyDays)
     #expect(model.overviewSnapshot?.totals.totalTokens == 2)
 }
@@ -233,6 +266,20 @@ private final class RecordingStartupOverviewClient: OverviewClient, @unchecked S
     func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
         queries.append(query)
         return rollups
+    }
+}
+
+private final class RecordingResultOverviewClient: OverviewClient, @unchecked Sendable {
+    private let results: [Result<OverviewRollups, any Error>]
+    private(set) var queries: [OverviewQuery] = []
+
+    init(results: [Result<OverviewRollups, any Error>]) {
+        self.results = results
+    }
+
+    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+        queries.append(query)
+        return try results[queries.count - 1].get()
     }
 }
 
@@ -311,6 +358,7 @@ private final class RecordingStartupLaunchAgentRegistry: LaunchAgentRegistry {
     private let events: StartupEventRecorder?
     private(set) var registeredPlistNames: [String] = []
     private(set) var unregisteredPlistNames: [String] = []
+    private(set) var terminatedPlistNames: [String] = []
 
     init(status: LaunchAgentStatus, events: StartupEventRecorder? = nil) {
         self.launchAgentStatus = status
@@ -328,6 +376,10 @@ private final class RecordingStartupLaunchAgentRegistry: LaunchAgentRegistry {
 
     func unregister(plistName: String) throws {
         unregisteredPlistNames.append(plistName)
+    }
+
+    func terminate(plistName: String) {
+        terminatedPlistNames.append(plistName)
     }
 }
 

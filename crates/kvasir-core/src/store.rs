@@ -395,7 +395,7 @@ impl UsageStore {
                     })?,
                     repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
                     harness: HarnessName::new(harness),
-                    tool_name: ToolName::new(tool_name),
+                    tool_name: tool_name_from_storage(tool_name),
                     call_count: unsigned_token_column(row, 6)?,
                 })
             },
@@ -454,7 +454,7 @@ impl UsageStore {
                     })?,
                     repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
                     harness: HarnessName::new(harness),
-                    tool_name: ToolName::new(tool_name),
+                    tool_name: tool_name_from_storage(tool_name),
                     call_count: unsigned_token_column(row, 6)?,
                 })
             },
@@ -500,7 +500,7 @@ impl UsageStore {
                             started_at: TimestampMillis::from_millis(row.get(5)?),
                             ended_at: TimestampMillis::from_millis(row.get(6)?),
                             duration_ms: unsigned_token_column(row, 7)?,
-                            tool_name: tool_name.map(ToolName::new),
+                            tool_name: tool_name.map(tool_name_from_storage),
                         },
                     })
                 },
@@ -2659,6 +2659,10 @@ fn non_empty_storage_value(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+fn tool_name_from_storage(value: String) -> ToolName {
+    ToolName::try_new(value).unwrap_or_else(ToolName::unknown)
+}
+
 fn unsigned_token_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(index)?;
     u64::try_from(value).map_err(|err| {
@@ -3248,6 +3252,56 @@ mod tests {
                 repo,
                 harness: HarnessName::new("claude_code"),
                 tool_name: ToolName::new("Write"),
+                call_count: 1,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_rollups_map_invalid_stored_tool_names_to_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        store.connection.execute(
+            "INSERT INTO canonical_tool_calls (
+                event_key,
+                occurred_at_ms,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name,
+                call_count
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "invalid-tool-name",
+                1_781_956_800_000_i64,
+                "2026-06-20",
+                NO_REPO_BUCKET,
+                NO_REPO_STORAGE_VALUE,
+                NO_REPO_STORAGE_VALUE,
+                "codex",
+                "invalid tool name",
+                1_i64,
+            ],
+        )?;
+
+        let rollups = store.tool_call_rollups(ToolCallRollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        ))?;
+
+        assert_eq!(
+            rollups,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: RepoBucket::no_repo(),
+                harness: HarnessName::new("codex"),
+                tool_name: ToolName::unknown(),
                 call_count: 1,
             }]
         );

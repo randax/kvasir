@@ -29,6 +29,7 @@ func daemonLaunchAgentDoesNotRegisterAgainWhenAlreadyEnabled() throws {
     #expect(outcome == .alreadyRegistered)
     #expect(registry.registeredPlistNames.isEmpty)
     #expect(registry.unregisteredPlistNames.isEmpty)
+    #expect(registry.terminatedPlistNames.isEmpty)
 }
 
 @Test
@@ -44,9 +45,29 @@ func daemonLaunchAgentRefreshesRegistrationWhenPackagedHelperChanged() throws {
     let outcome = try launchAgent.ensureRegistered()
 
     #expect(outcome == .registered)
+    #expect(registry.terminatedPlistNames == [DaemonLaunchAgent.plistName])
     #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(registrationStore.savedFingerprints == ["new-fingerprint"])
+}
+
+@Test
+func daemonLaunchAgentCanForceRefreshRegistration() throws {
+    let registry = RecordingLaunchAgentRegistry(status: .enabled)
+    let registrationStore = RecordingLaunchAgentRegistrationStore(storedFingerprint: "current-fingerprint")
+    let launchAgent = DaemonLaunchAgent(
+        registry: registry,
+        fingerprintProvider: StaticLaunchAgentFingerprintProvider(fingerprint: "current-fingerprint"),
+        registrationStore: registrationStore
+    )
+
+    let outcome = try launchAgent.refreshRegistration()
+
+    #expect(outcome == .registered)
+    #expect(registry.terminatedPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registrationStore.savedFingerprints == ["current-fingerprint"])
 }
 
 @Test
@@ -65,6 +86,7 @@ private final class RecordingLaunchAgentRegistry: LaunchAgentRegistry {
     private let status: LaunchAgentStatus
     private(set) var registeredPlistNames: [String] = []
     private(set) var unregisteredPlistNames: [String] = []
+    private(set) var terminatedPlistNames: [String] = []
 
     init(status: LaunchAgentStatus) {
         self.status = status
@@ -80,6 +102,10 @@ private final class RecordingLaunchAgentRegistry: LaunchAgentRegistry {
 
     func unregister(plistName: String) throws {
         unregisteredPlistNames.append(plistName)
+    }
+
+    func terminate(plistName: String) {
+        terminatedPlistNames.append(plistName)
     }
 }
 

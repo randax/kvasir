@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import ServiceManagement
 
 public enum LaunchAgentStatus: Equatable, Sendable {
@@ -19,6 +20,7 @@ public protocol LaunchAgentRegistry {
     func status(plistName: String) -> LaunchAgentStatus
     func register(plistName: String) throws
     func unregister(plistName: String) throws
+    func terminate(plistName: String)
 }
 
 public protocol LaunchAgentFingerprintProvider {
@@ -51,10 +53,7 @@ public struct DaemonLaunchAgent {
         switch registry.status(plistName: Self.plistName) {
         case .enabled:
             if registrationNeedsRefresh(plistName: Self.plistName) {
-                try registry.unregister(plistName: Self.plistName)
-                try registry.register(plistName: Self.plistName)
-                saveCurrentFingerprint(plistName: Self.plistName)
-                return .registered
+                return try refreshRegistration()
             }
             return .alreadyRegistered
         case .requiresApproval:
@@ -64,6 +63,14 @@ public struct DaemonLaunchAgent {
             saveCurrentFingerprint(plistName: Self.plistName)
             return .registered
         }
+    }
+
+    public func refreshRegistration() throws -> LaunchAgentRegistrationOutcome {
+        try registry.unregister(plistName: Self.plistName)
+        registry.terminate(plistName: Self.plistName)
+        try registry.register(plistName: Self.plistName)
+        saveCurrentFingerprint(plistName: Self.plistName)
+        return .registered
     }
 
     private func registrationNeedsRefresh(plistName: String) -> Bool {
@@ -105,6 +112,20 @@ public struct ServiceManagementLaunchAgentRegistry: LaunchAgentRegistry {
 
     public func unregister(plistName: String) throws {
         try SMAppService.agent(plistName: plistName).unregister()
+    }
+
+    public func terminate(plistName: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = [
+            "kill",
+            "TERM",
+            "gui/\(getuid())/\(plistName.replacingOccurrences(of: ".plist", with: ""))"
+        ]
+        guard (try? process.run()) != nil else {
+            return
+        }
+        process.waitUntilExit()
     }
 }
 
