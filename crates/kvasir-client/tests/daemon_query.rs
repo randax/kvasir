@@ -1,5 +1,8 @@
 use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
@@ -16,7 +19,7 @@ use kvasir_client::{
     KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
-use kvasir_core::rpc::BearerToken;
+use kvasir_core::rpc::{BearerToken, RpcResponse};
 use kvasird::{DaemonConfig, StoreKeySource, start_with_store_key_source};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
@@ -522,6 +525,121 @@ async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result
             },
         }
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_rpc_queries_canonicalize_hyphenated_mixed_case_harnesses() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{
+                "resourceSpans": [{
+                    "resource": {
+                        "attributes": [
+                            { "key": "service.name", "value": { "stringValue": "GitHub-Copilot" } },
+                            { "key": "session.id", "value": { "stringValue": "session-12" } },
+                            { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                        ]
+                    },
+                    "scopeSpans": [{
+                        "spans": [{
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "1111111111111111",
+                            "name": "github.copilot.interaction",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956801000000000",
+                            "attributes": [
+                                { "key": "span.kind", "value": { "stringValue": "interaction" } }
+                            ]
+                        }]
+                    }]
+                }]
+            }"#,
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{
+                "resourceLogs": [{
+                    "resource": {
+                        "attributes": [
+                            { "key": "service.name", "value": { "stringValue": "GitHub-Copilot" } },
+                            { "key": "session.id", "value": { "stringValue": "session-12" } },
+                            { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                        ]
+                    },
+                    "scopeLogs": [{
+                        "logRecords": [{
+                            "timeUnixNano": "1781956802000000000",
+                            "eventName": "github.copilot.content",
+                            "body": { "stringValue": "stored copilot text" },
+                            "attributes": [
+                                { "key": "content.opt_in", "value": { "boolValue": true } },
+                                { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                            ]
+                        }]
+                    }]
+                }]
+            }"#,
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let trace_socket_path = rpc_socket_path.clone();
+    let trace_response = tokio::task::spawn_blocking(move || {
+        raw_rpc_request(
+            &trace_socket_path,
+            r#"{"type":"trace","payload":{"query":{"harness":" GitHub-Copilot ","session_id":"session-12","prompt_id":"prompt-7"}}}"#,
+        )
+    })
+    .await??;
+    let content_response = tokio::task::spawn_blocking(move || {
+        raw_rpc_request(
+            &rpc_socket_path,
+            r#"{"type":"content","payload":{"query":{"harness":" GitHub-Copilot ","session_id":"session-12","prompt_id":"prompt-7"},"bearer_token":"test-token"}}"#,
+        )
+    })
+    .await??;
+
+    let RpcResponse::Trace { traces } = trace_response else {
+        panic!("expected trace response");
+    };
+    assert_eq!(traces.len(), 1);
+    assert_eq!(
+        traces[0].spans[0].name.as_str(),
+        "github.copilot.interaction"
+    );
+
+    let RpcResponse::Content { replay } = content_response else {
+        panic!("expected content response");
+    };
+    assert_eq!(replay.items.len(), 1);
+    assert_eq!(replay.items[0].harness.as_str(), "github_copilot");
+    assert_eq!(replay.items[0].content.as_str(), "stored copilot text");
 
     Ok(())
 }
@@ -1416,6 +1534,17 @@ fn kvasir_repo() -> KvasirRepoBucket {
 
 fn socket_path(path: std::path::PathBuf) -> KvasirSocketPath {
     KvasirSocketPath::try_from(path.to_string_lossy().into_owned()).unwrap()
+}
+
+fn raw_rpc_request(socket_path: &Path, request: &str) -> anyhow::Result<RpcResponse> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    Ok(serde_json::from_str(&response)?)
 }
 
 fn timestamp(year: i32, month: u32, day: u32) -> KvasirTimestampMillis {

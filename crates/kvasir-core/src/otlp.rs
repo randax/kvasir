@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::rpc::{
     HarnessName, ModelName, PromptId, SessionId, SpanId, SpanName, TimestampMillis, ToolName,
-    TraceId, TraceSpanKind,
+    TraceId, TraceSpanKind, canonical_harness_name,
 };
 use crate::usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
@@ -1102,12 +1102,8 @@ fn tool_call_metric_harness(metric_name: &str, resource_harness: Option<&str>) -
         return HarnessName::new("github_copilot");
     }
     resource_harness
-        .map(canonical_harness_name)
+        .map(HarnessName::new)
         .unwrap_or_else(|| HarnessName::new("unknown"))
-}
-
-fn canonical_harness_name(value: &str) -> HarnessName {
-    HarnessName::new(value.trim().replace('-', "_"))
 }
 
 fn is_codex_token_metric(metric: &Value) -> bool {
@@ -2733,7 +2729,7 @@ fn matches_tool_result(value: Option<&str>) -> bool {
 fn canonical_harness(resource_harness: Option<&str>) -> Option<String> {
     resource_harness
         .and_then(|value| meaningful_attribute(Some(value.to_owned())))
-        .map(|value| value.replace('-', "_"))
+        .map(|value| canonical_harness_name(&value))
 }
 
 fn content_record_harness(resource_harness: Option<&str>) -> Option<String> {
@@ -4993,7 +4989,7 @@ mod tests {
             "resourceLogs": [{
                 "resource": {
                     "attributes": [
-                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "service.name", "value": { "stringValue": "OpenCode" } },
                         { "key": "repo.name", "value": { "stringValue": "kvasir" } },
                         { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } },
                         { "key": "session.id", "value": { "stringValue": "session-12" } },
