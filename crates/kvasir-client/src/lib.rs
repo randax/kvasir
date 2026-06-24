@@ -17,13 +17,13 @@ pub use types::{
     KvasirBearerToken, KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
     KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem, KvasirContentText,
     KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostUsd, KvasirHarnessName,
-    KvasirModelName, KvasirOverviewRepoSummary, KvasirOverviewRollup, KvasirOverviewSeriesPoint,
-    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
-    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
-    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
-    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTrace,
-    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind,
+    KvasirModelName, KvasirOverviewModelSummary, KvasirOverviewRepoSummary, KvasirOverviewRollup,
+    KvasirOverviewSeriesPoint, KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
+    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
+    KvasirToolName, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery,
+    KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 uniffi::setup_scaffolding!();

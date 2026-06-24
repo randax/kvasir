@@ -172,6 +172,7 @@ impl UsageStore {
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
         let input_signal = TokenUsageSignal::authoritative_for(TokenMeasure::Input).storage_name();
         let output_signal =
             TokenUsageSignal::authoritative_for(TokenMeasure::Output).storage_name();
@@ -198,6 +199,7 @@ impl UsageStore {
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?10 IS NULL OR model = ?10)
                 AND (
                     (measure = 'input' AND token_signal IN (?6, ?9))
                     OR (measure = 'output' AND token_signal IN (?7, ?9))
@@ -217,6 +219,7 @@ impl UsageStore {
                 output_signal,
                 cache_signal,
                 opencode_trace_signal,
+                model_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -280,6 +283,7 @@ impl UsageStore {
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
         let mut statement = self.connection.prepare(
             "SELECT
                 day,
@@ -297,6 +301,7 @@ impl UsageStore {
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?7 IS NULL OR model = ?7)
              GROUP BY day, repo_bucket, repo_name, repo_path, model
              ORDER BY day, repo_bucket, repo_name, repo_path, model",
         )?;
@@ -308,6 +313,7 @@ impl UsageStore {
                 repo_path_filter,
                 repo_bucket_filter,
                 MIXED_COST_SOURCE,
+                model_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -338,6 +344,9 @@ impl UsageStore {
         &self,
         query: ToolCallRollupQuery,
     ) -> Result<Vec<ToolCallRollup>, StoreError> {
+        if query.model.is_some() {
+            return Ok(Vec::new());
+        }
         if is_day_aligned(query.start) && is_day_aligned(query.end) {
             return self.persisted_tool_call_rollups(query);
         }

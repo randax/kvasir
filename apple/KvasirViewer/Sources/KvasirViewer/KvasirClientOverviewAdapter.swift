@@ -19,7 +19,8 @@ func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
     KvasirRollupQuery(
         start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),
         end: KvasirTimestampMillis(value: Int64(query.end.timeIntervalSince1970 * 1_000)),
-        repo: query.repo?.kvasirRepoBucket
+        repo: query.repo?.kvasirRepoBucket,
+        model: query.model?.rawValue
     )
 }
 
@@ -68,7 +69,9 @@ private extension KvasirOverviewSnapshot {
             totals: totals.overviewTotals,
             series: series.map { $0.overviewSeriesPoint },
             repoBreakdown: repoBreakdown.map { $0.overviewRepoSummary },
-            selectedRepo: selectedRepo?.overviewRepo
+            modelBreakdown: modelBreakdown.map { $0.overviewModelSummary },
+            selectedRepo: selectedRepo?.overviewRepo,
+            selectedModel: selectedModel.map(OverviewModelName.init)
         )
     }
 }
@@ -97,6 +100,12 @@ private extension KvasirOverviewSeriesPoint {
 private extension KvasirOverviewRepoSummary {
     var overviewRepoSummary: OverviewRepoSummary {
         OverviewRepoSummary(repo: repo.overviewRepo, totals: totals.overviewTotals)
+    }
+}
+
+private extension KvasirOverviewModelSummary {
+    var overviewModelSummary: OverviewModelSummary {
+        OverviewModelSummary(model: OverviewModelName(model), totals: totals.overviewTotals)
     }
 }
 

@@ -28,6 +28,7 @@ func productionViewerTargetBuildsOverviewScreenAndFactoryModel() async throws {
 @Test
 func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
     let repo = KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir")
+    let model = "claude-sonnet-4-20250514"
     let mapped = overviewSnapshotFromKvasir(
         KvasirOverviewSnapshot(
             totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3),
@@ -45,7 +46,14 @@ func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
                     totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3)
                 )
             ],
-            selectedRepo: repo
+            modelBreakdown: [
+                KvasirOverviewModelSummary(
+                    model: model,
+                    totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 0)
+                )
+            ],
+            selectedRepo: repo,
+            selectedModel: model
         )
     )
     let expectedRepo = OverviewRepoBucket.repo(
@@ -71,7 +79,14 @@ func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
                 totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3)
             )
         ],
-        selectedRepo: expectedRepo
+        modelBreakdown: [
+            OverviewModelSummary(
+                model: OverviewModelName(model),
+                totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 0)
+            )
+        ],
+        selectedRepo: expectedRepo,
+        selectedModel: OverviewModelName(model)
     ))
 }
 
@@ -88,7 +103,9 @@ func kvasirOverviewSnapshotMappingNormalizesInvalidRepoBuckets() {
                     totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, toolCalls: 3)
                 )
             ],
-            selectedRepo: invalidRepo
+            modelBreakdown: [],
+            selectedRepo: invalidRepo,
+            selectedModel: nil
         )
     )
 

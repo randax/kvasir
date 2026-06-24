@@ -273,6 +273,8 @@ pub struct RollupQuery {
     pub start: TimestampMillis,
     pub end: TimestampMillis,
     pub repo: Option<RepoBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelName>,
 }
 
 impl RollupQuery {
@@ -281,12 +283,20 @@ impl RollupQuery {
             start,
             end,
             repo: None,
+            model: None,
         }
     }
 
     pub fn with_repo(self, repo: RepoBucket) -> Self {
         Self {
             repo: Some(repo),
+            ..self
+        }
+    }
+
+    pub fn with_model(self, model: ModelName) -> Self {
+        Self {
+            model: Some(model),
             ..self
         }
     }
@@ -297,6 +307,8 @@ pub struct CostRollupQuery {
     pub start: TimestampMillis,
     pub end: TimestampMillis,
     pub repo: Option<RepoBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +316,8 @@ pub struct ToolCallRollupQuery {
     pub start: TimestampMillis,
     pub end: TimestampMillis,
     pub repo: Option<RepoBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,12 +340,20 @@ impl ToolCallRollupQuery {
             start,
             end,
             repo: None,
+            model: None,
         }
     }
 
     pub fn with_repo(self, repo: RepoBucket) -> Self {
         Self {
             repo: Some(repo),
+            ..self
+        }
+    }
+
+    pub fn with_model(self, model: ModelName) -> Self {
+        Self {
+            model: Some(model),
             ..self
         }
     }
@@ -343,12 +365,20 @@ impl CostRollupQuery {
             start,
             end,
             repo: None,
+            model: None,
         }
     }
 
     pub fn with_repo(self, repo: RepoBucket) -> Self {
         Self {
             repo: Some(repo),
+            ..self
+        }
+    }
+
+    pub fn with_model(self, model: ModelName) -> Self {
+        Self {
+            model: Some(model),
             ..self
         }
     }

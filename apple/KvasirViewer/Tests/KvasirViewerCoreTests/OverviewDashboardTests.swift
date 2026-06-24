@@ -63,6 +63,37 @@ func overviewForwardsScopedRepoQuery() async throws {
 }
 
 @Test
+@MainActor
+func overviewForwardsScopedModelQuery() async throws {
+    let selectedModel = OverviewModelName("claude-sonnet-4-20250514")
+    let snapshot = OverviewSnapshot(
+        totals: .init(totalTokens: 3_300, costUsdNanos: 218_015_000, toolCalls: 0),
+        series: [
+            .init(day: .init(year: 2026, month: 6, day: 21), totalTokens: 2_850, costUsdNanos: 18_015_000, toolCalls: 0)
+        ],
+        repoBreakdown: [],
+        modelBreakdown: [
+            .init(model: selectedModel, totals: .init(totalTokens: 3_300, costUsdNanos: 218_015_000, toolCalls: 0))
+        ],
+        selectedRepo: nil,
+        selectedModel: selectedModel
+    )
+    let client = RecordingOverviewClient(snapshot: snapshot)
+    let range = OverviewTimeRange(
+        start: Date(timeIntervalSince1970: 1_782_000_000),
+        end: Date(timeIntervalSince1970: 1_782_259_200)
+    )
+    let dashboard = OverviewDashboard(client: client)
+
+    let loaded = try await dashboard.load(range: range, model: selectedModel)
+
+    #expect(client.queries == [
+        .init(start: range.start, end: range.end, model: selectedModel)
+    ])
+    #expect(loaded == snapshot)
+}
+
+@Test
 func overviewRepoIdentityRejectsEmptyIdentity() {
     #expect(OverviewRepoIdentity(name: nil, path: nil) == nil)
     #expect(OverviewRepoIdentity(name: OverviewRepoName("kvasir"), path: nil) != nil)
