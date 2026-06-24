@@ -25,14 +25,18 @@ public struct OverviewQuery: Equatable, Sendable {
 }
 
 public struct OverviewModelName: Hashable, Comparable, Sendable {
-    public var rawValue: String
+    private let value: String
 
-    public init(_ rawValue: String) {
-        self.rawValue = rawValue
+    public init(_ value: String) {
+        self.value = value
+    }
+
+    public func displayName() -> String {
+        value
     }
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
-        lhs.rawValue < rhs.rawValue
+        lhs.value < rhs.value
     }
 }
 

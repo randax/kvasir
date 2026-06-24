@@ -20,7 +20,7 @@ func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
         start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),
         end: KvasirTimestampMillis(value: Int64(query.end.timeIntervalSince1970 * 1_000)),
         repo: query.repo?.kvasirRepoBucket,
-        model: query.model?.rawValue
+        model: query.model?.displayName()
     )
 }
 

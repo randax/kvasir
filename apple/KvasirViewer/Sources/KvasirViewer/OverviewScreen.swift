@@ -170,12 +170,12 @@ struct OverviewScreen: View {
                     .font(.headline)
 
                 if let selectedModel = model.selectedModel {
-                    Text(selectedModel.rawValue)
+                    Text(selectedModel.displayName())
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .help(selectedModel.rawValue)
+                        .help(selectedModel.displayName())
                 }
 
                 Spacer()
@@ -406,7 +406,7 @@ private struct ModelSummaryRow: View {
                 HStack(spacing: 6) {
                     Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "cpu")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                    Text(summary.model.rawValue)
+                    Text(summary.model.displayName())
                         .font(.body.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -426,7 +426,7 @@ private struct ModelSummaryRow: View {
             .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
         }
         .buttonStyle(.plain)
-        .help(summary.model.rawValue)
+        .help(summary.model.displayName())
     }
 }
 

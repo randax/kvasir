@@ -386,44 +386,53 @@ impl KvasirOverviewSnapshot {
         let mut totals_by_model: HashMap<KvasirModelName, KvasirOverviewTotals> = HashMap::new();
 
         for token_rollup in rollup.token_rollups {
-            let tokens = token_rollup.total_tokens();
+            let KvasirTokenRollup {
+                day,
+                repo,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_tokens,
+            } = token_rollup;
+            let tokens = input_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(cache_tokens);
             totals.total_tokens = totals.total_tokens.saturating_add(tokens);
             let point = points_by_day
-                .entry(token_rollup.day.clone())
-                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(token_rollup.day));
+                .entry(day.clone())
+                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(day));
             point.total_tokens = point.total_tokens.saturating_add(tokens);
             let repo_totals = totals_by_repo
-                .entry(token_rollup.repo.clone())
+                .entry(repo)
                 .or_insert_with(KvasirOverviewTotals::zero);
             repo_totals.total_tokens = repo_totals.total_tokens.saturating_add(tokens);
             let model_totals = totals_by_model
-                .entry(token_rollup.model)
+                .entry(model)
                 .or_insert_with(KvasirOverviewTotals::zero);
             model_totals.total_tokens = model_totals.total_tokens.saturating_add(tokens);
         }
 
         for cost_rollup in rollup.cost_rollups {
-            totals.cost_usd_nanos = totals
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+            let KvasirCostRollup {
+                day,
+                repo,
+                model,
+                cost_usd,
+            } = cost_rollup;
+            totals.cost_usd_nanos = totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
             let point = points_by_day
-                .entry(cost_rollup.day.clone())
-                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(cost_rollup.day));
-            point.cost_usd_nanos = point
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+                .entry(day.clone())
+                .or_insert_with(|| KvasirOverviewSeriesPoint::empty(day));
+            point.cost_usd_nanos = point.cost_usd_nanos.saturating_add(cost_usd.nanos);
             let repo_totals = totals_by_repo
-                .entry(cost_rollup.repo.clone())
+                .entry(repo)
                 .or_insert_with(KvasirOverviewTotals::zero);
-            repo_totals.cost_usd_nanos = repo_totals
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+            repo_totals.cost_usd_nanos = repo_totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
             let model_totals = totals_by_model
-                .entry(cost_rollup.model)
+                .entry(model)
                 .or_insert_with(KvasirOverviewTotals::zero);
-            model_totals.cost_usd_nanos = model_totals
-                .cost_usd_nanos
-                .saturating_add(cost_rollup.cost_usd.nanos);
+            model_totals.cost_usd_nanos =
+                model_totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
         }
 
         for tool_call_rollup in rollup.tool_call_rollups {
@@ -443,7 +452,7 @@ impl KvasirOverviewSnapshot {
         }
 
         let mut series = points_by_day.into_values().collect::<Vec<_>>();
-        series.sort_by_key(|point| point.day.clone());
+        series.sort_by(|lhs, rhs| lhs.day.cmp(&rhs.day));
 
         let mut repo_breakdown = totals_by_repo
             .into_iter()
@@ -486,14 +495,6 @@ impl KvasirOverviewSeriesPoint {
             cost_usd_nanos: 0,
             tool_calls: 0,
         }
-    }
-}
-
-impl KvasirTokenRollup {
-    fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_tokens)
     }
 }
 
