@@ -231,7 +231,7 @@ struct KvasirClientHarnessTelemetrySetup: HarnessTelemetrySetup {
 #endif
 
 private struct MissingKvasirClient: OverviewClient {
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         throw MissingKvasirClientError()
     }
 }

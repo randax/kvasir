@@ -9,8 +9,8 @@ use crate::error::KvasirClientError;
 use crate::transport::{connect_with_retries, read_rpc_stream_event, send_rpc_request};
 use crate::types::{
     KvasirContentQuery, KvasirContentReplay, KvasirCostRollup, KvasirOverviewRollup,
-    KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup, KvasirTokenRollupUpdate,
-    KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
+    KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
+    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
 };
 
 #[derive(Debug, uniffi::Object)]
@@ -67,6 +67,15 @@ impl KvasirClient {
             RpcResponse::Error { error } => Err(error.into()),
             _ => Err(KvasirClientError::WrongResponseType),
         }
+    }
+
+    pub fn overview_snapshot(
+        &self,
+        query: KvasirRollupQuery,
+    ) -> Result<KvasirOverviewSnapshot, KvasirClientError> {
+        let selected_repo = query.repo.clone();
+        self.overview_rollups(query)
+            .map(|rollup| KvasirOverviewSnapshot::from_rollup(rollup, selected_repo))
     }
 
     pub fn cost_rollups(

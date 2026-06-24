@@ -80,6 +80,7 @@ struct OverviewScreen: View {
                         errorBanner(errorMessage)
                     }
                     totals(snapshot.totals)
+                    repoDashboard(snapshot.repoBreakdown)
                     charts(snapshot.series)
                 }
                 .padding(24)
@@ -110,6 +111,54 @@ struct OverviewScreen: View {
         }
     }
 
+    private func repoDashboard(_ repos: [OverviewRepoSummary]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Text("Repos")
+                    .font(.headline)
+
+                if let selectedRepo = model.selectedRepo {
+                    Text(selectedRepo.displayName)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    selectRepo(nil)
+                } label: {
+                    Label("All repos", systemImage: "square.grid.2x2")
+                }
+                .disabled(model.selectedRepo == nil)
+            }
+
+            VStack(spacing: 0) {
+                if repos.isEmpty {
+                    RepoEmptyRow()
+                } else {
+                    RepoHeaderRow()
+                    ForEach(repos, id: \.repo) { summary in
+                        RepoSummaryRow(
+                            summary: summary,
+                            isSelected: model.selectedRepo == summary.repo,
+                            costFormatter: usd
+                        ) {
+                            selectRepo(summary.repo)
+                        }
+                        Divider()
+                    }
+                }
+            }
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+            )
+        }
+    }
+
     private func charts(_ series: [OverviewSeriesPoint]) -> some View {
         Grid(horizontalSpacing: 16, verticalSpacing: 16) {
             GridRow {
@@ -119,6 +168,16 @@ struct OverviewScreen: View {
             GridRow {
                 MetricChart(title: "Tool calls", series: series, color: .orange) { $0.toolCalls }
                     .gridCellColumns(2)
+            }
+        }
+    }
+
+    private func selectRepo(_ repo: OverviewRepoBucket?) {
+        Task {
+            do {
+                try await model.selectRepo(repo)
+            } catch {
+                model.record(error: error)
             }
         }
     }
@@ -160,6 +219,79 @@ struct OverviewScreen: View {
                 model.record(error: error)
             }
         }
+    }
+}
+
+private struct RepoEmptyRow: View {
+    var body: some View {
+        Label("No repo data for this range", systemImage: "tray")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+    }
+}
+
+private struct RepoHeaderRow: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Repo")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Tokens")
+                .frame(width: 110, alignment: .trailing)
+            Text("Cost")
+                .frame(width: 110, alignment: .trailing)
+            Text("Tool calls")
+                .frame(width: 110, alignment: .trailing)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct RepoSummaryRow: View {
+    let summary: OverviewRepoSummary
+    let isSelected: Bool
+    let costFormatter: (UInt64) -> String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "folder")
+                            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        Text(summary.repo.displayName)
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
+                    }
+                    if let subtitle = summary.repo.subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(summary.totals.totalTokens.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                Text(costFormatter(summary.totals.costUsdNanos))
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                Text(summary.totals.toolCalls.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -222,5 +354,16 @@ private struct MetricChart: View {
 private extension OverviewRollupDay {
     var shortLabel: String {
         "\(month)/\(day)"
+    }
+}
+
+private extension OverviewRepoBucket {
+    var subtitle: String? {
+        switch self {
+        case .noRepo:
+            return "No repo attribute"
+        case .repo(let identity):
+            return identity.path?.rawValue
+        }
     }
 }

@@ -1,5 +1,5 @@
 public protocol OverviewRollupSource: Sendable {
-    func overviewRollups(query: OverviewQuery) async throws -> OverviewRollups
+    func overviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot
 }
 
 public struct OverviewSocketClient: OverviewClient, Sendable {
@@ -9,7 +9,7 @@ public struct OverviewSocketClient: OverviewClient, Sendable {
         self.source = source
     }
 
-    public func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
-        try await source.overviewRollups(query: query)
+    public func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
+        try await source.overviewSnapshot(query: query)
     }
 }

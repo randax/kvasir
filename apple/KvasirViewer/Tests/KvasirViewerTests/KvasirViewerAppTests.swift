@@ -24,6 +24,84 @@ func productionViewerTargetBuildsOverviewScreenAndFactoryModel() async throws {
     #endif
 }
 
+#if canImport(kvasir_client)
+@Test
+func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
+    let repo = KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir")
+    let mapped = overviewSnapshotFromKvasir(
+        KvasirOverviewSnapshot(
+            totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3),
+            series: [
+                KvasirOverviewSeriesPoint(
+                    day: KvasirRollupDay(year: 2026, month: 6, day: 24),
+                    totalTokens: 13,
+                    costUsdNanos: 21,
+                    toolCalls: 3
+                )
+            ],
+            repoBreakdown: [
+                KvasirOverviewRepoSummary(
+                    repo: repo,
+                    totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3)
+                )
+            ],
+            selectedRepo: repo
+        )
+    )
+    let expectedRepo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("kvasir"),
+            path: OverviewRepoPath("/repos/kvasir")
+        )!
+    )
+
+    #expect(mapped == OverviewSnapshot(
+        totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3),
+        series: [
+            OverviewSeriesPoint(
+                day: OverviewRollupDay(year: 2026, month: 6, day: 24),
+                totalTokens: 13,
+                costUsdNanos: 21,
+                toolCalls: 3
+            )
+        ],
+        repoBreakdown: [
+            OverviewRepoSummary(
+                repo: expectedRepo,
+                totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3)
+            )
+        ],
+        selectedRepo: expectedRepo
+    ))
+}
+
+@Test
+func kvasirOverviewSnapshotMappingNormalizesInvalidRepoBuckets() {
+    let invalidRepo = KvasirRepoBucket(kind: .repo, name: nil, path: nil)
+    let mapped = overviewSnapshotFromKvasir(
+        KvasirOverviewSnapshot(
+            totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, toolCalls: 3),
+            series: [],
+            repoBreakdown: [
+                KvasirOverviewRepoSummary(
+                    repo: invalidRepo,
+                    totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, toolCalls: 3)
+                )
+            ],
+            selectedRepo: invalidRepo
+        )
+    )
+
+    #expect(mapped.selectedRepo == .noRepo)
+    #expect(mapped.repoBreakdown == [
+        OverviewRepoSummary(
+            repo: .noRepo,
+            totals: OverviewTotals(totalTokens: 1, costUsdNanos: 2, toolCalls: 3)
+        )
+    ])
+}
+#endif
+
 @Test
 func harnessTelemetrySetupConfigUsesProductionDefaultsWhenDaemonOverridesAreEmpty() {
     let home = FileManager.default.homeDirectoryForCurrentUser
@@ -70,13 +148,7 @@ func harnessTelemetrySetupConfigHonorsDaemonEnvironmentOverrides() {
 
 @Test
 func daemonFallbackOverviewClientStartsDaemonAndRetriesRecoverableFailure() async throws {
-    let expected = OverviewRollups(
-        tokenRollups: [
-            .init(day: .init(year: 2026, month: 6, day: 24), inputTokens: 1, outputTokens: 2, cacheTokens: 3)
-        ],
-        costRollups: [],
-        toolCallRollups: []
-    )
+    let expected = overviewSnapshot(totalTokens: 6)
     let primary = SequenceOverviewClient(results: [
         .failure(DaemonFallbackTestError.recoverable),
         .success(expected),
@@ -90,24 +162,18 @@ func daemonFallbackOverviewClientStartsDaemonAndRetriesRecoverableFailure() asyn
         }
     )
 
-    let rollups = try await client.loadOverviewRollups(
+    let snapshot = try await client.loadOverviewSnapshot(
         query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
     )
 
-    #expect(rollups == expected)
+    #expect(snapshot == expected)
     #expect(await primary.loadCount == 2)
     #expect(starter.startCount == 1)
 }
 
 @Test
 func daemonFallbackOverviewClientRetriesRecoverableFailuresWhileSpawnedDaemonBecomesReady() async throws {
-    let expected = OverviewRollups(
-        tokenRollups: [
-            .init(day: .init(year: 2026, month: 6, day: 24), inputTokens: 5, outputTokens: 8, cacheTokens: 13)
-        ],
-        costRollups: [],
-        toolCallRollups: []
-    )
+    let expected = overviewSnapshot(totalTokens: 26)
     let primary = SequenceOverviewClient(results: [
         .failure(DaemonFallbackTestError.recoverable),
         .failure(DaemonFallbackTestError.recoverable),
@@ -125,11 +191,11 @@ func daemonFallbackOverviewClientRetriesRecoverableFailuresWhileSpawnedDaemonBec
         retryDelay: retryDelay.sleep
     )
 
-    let rollups = try await client.loadOverviewRollups(
+    let snapshot = try await client.loadOverviewSnapshot(
         query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
     )
 
-    #expect(rollups == expected)
+    #expect(snapshot == expected)
     #expect(await primary.loadCount == 3)
     #expect(starter.startCount == 1)
     #expect(await retryDelay.attempts == [1])
@@ -150,7 +216,7 @@ func daemonFallbackOverviewClientDoesNotStartDaemonForNonrecoverableFailure() as
     )
 
     do {
-        _ = try await client.loadOverviewRollups(
+        _ = try await client.loadOverviewSnapshot(
             query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
         )
         Issue.record("expected nonrecoverable error")
@@ -168,13 +234,7 @@ func productionFactoryWiresDaemonFallbackAfterStartupGateOpens() async throws {
     let primary = SequenceOverviewClient(results: [
         .failure(DaemonFallbackTestError.recoverable),
         .success(
-            OverviewRollups(
-                tokenRollups: [
-                    .init(day: .init(year: 2026, month: 6, day: 24), inputTokens: 7, outputTokens: 11, cacheTokens: 13)
-                ],
-                costRollups: [],
-                toolCallRollups: []
-            )
+            overviewSnapshot(totalTokens: 31)
         ),
     ])
     let starter = RecordingDaemonProcessStarter()
@@ -200,23 +260,11 @@ func productionFactoryWiresDaemonFallbackAfterStartupGateOpens() async throws {
 func productionFactoryOpensDaemonFallbackAfterSuccessfulStartupForLaterRefreshFailures() async throws {
     let primary = SequenceOverviewClient(results: [
         .success(
-            OverviewRollups(
-                tokenRollups: [
-                    .init(day: .init(year: 2026, month: 6, day: 23), inputTokens: 1, outputTokens: 1, cacheTokens: 1)
-                ],
-                costRollups: [],
-                toolCallRollups: []
-            )
+            overviewSnapshot(totalTokens: 3)
         ),
         .failure(DaemonFallbackTestError.recoverable),
         .success(
-            OverviewRollups(
-                tokenRollups: [
-                    .init(day: .init(year: 2026, month: 6, day: 24), inputTokens: 13, outputTokens: 21, cacheTokens: 34)
-                ],
-                costRollups: [],
-                toolCallRollups: []
-            )
+            overviewSnapshot(totalTokens: 68)
         ),
     ])
     let starter = RecordingDaemonProcessStarter()
@@ -287,7 +335,7 @@ func daemonFallbackOverviewClientStopsRetryingAfterBoundedRecoverableFailures() 
     )
 
     do {
-        _ = try await client.loadOverviewRollups(
+        _ = try await client.loadOverviewSnapshot(
             query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
         )
         Issue.record("expected bounded recoverable failure")
@@ -307,13 +355,7 @@ func productionFactoryStartsBundledDaemonForSocketIoAfterStartupGateOpens() asyn
     let primary = SequenceOverviewClient(results: [
         .failure(KvasirClientError.SocketIo),
         .success(
-            OverviewRollups(
-                tokenRollups: [
-                    .init(day: .init(year: 2026, month: 6, day: 24), inputTokens: 3, outputTokens: 5, cacheTokens: 8)
-                ],
-                costRollups: [],
-                toolCallRollups: []
-            )
+            overviewSnapshot(totalTokens: 16)
         ),
     ])
     let starter = RecordingDaemonProcessStarter()
@@ -385,20 +427,29 @@ private enum DaemonFallbackTestError: Error, Equatable {
 }
 
 private actor SequenceOverviewClient: OverviewClient {
-    private var results: [Result<OverviewRollups, any Error>]
+    private var results: [Result<OverviewSnapshot, any Error>]
     private(set) var loadCount = 0
 
-    init(results: [Result<OverviewRollups, any Error>]) {
+    init(results: [Result<OverviewSnapshot, any Error>]) {
         self.results = results
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         loadCount += 1
         guard !results.isEmpty else {
             throw DaemonFallbackTestError.nonrecoverable
         }
         return try results.removeFirst().get()
     }
+}
+
+private func overviewSnapshot(totalTokens: UInt64 = 0) -> OverviewSnapshot {
+    OverviewSnapshot(
+        totals: OverviewTotals(totalTokens: totalTokens, costUsdNanos: 0, toolCalls: 0),
+        series: [],
+        repoBreakdown: [],
+        selectedRepo: nil
+    )
 }
 
 private final class RecordingDaemonProcessStarter: DaemonProcessStarter, @unchecked Sendable {
