@@ -272,6 +272,99 @@ func successfulOverviewRefreshClearsPreviousError() async throws {
 
 @MainActor
 @Test
+func selectingRepoReloadsOverviewForCurrentRange() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let repo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("kvasir"),
+            path: OverviewRepoPath("/repos/kvasir")
+        )
+    )
+    let client = RecordingStartupOverviewClient(
+        rollups: OverviewRollups(
+            tokenRollups: [
+                .init(day: .init(year: 2026, month: 6, day: 21), repo: repo, inputTokens: 8, outputTokens: 5, cacheTokens: 0)
+            ],
+            costRollups: [
+                .init(day: .init(year: 2026, month: 6, day: 21), repo: repo, costUsdNanos: 12)
+            ],
+            toolCallRollups: [
+                .init(day: .init(year: 2026, month: 6, day: 21), repo: repo, callCount: 3)
+            ]
+        )
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.selectRepo(repo)
+
+    #expect(model.selectedRepo == repo)
+    #expect(model.overviewSnapshot?.selectedRepo == repo)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(repo: repo)
+    ])
+}
+
+@MainActor
+@Test
+func failedRepoSelectionKeepsPreviousRepoAndSnapshot() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let kvasirRepo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("kvasir"),
+            path: OverviewRepoPath("/repos/kvasir")
+        )
+    )
+    let otherRepo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("other"),
+            path: OverviewRepoPath("/repos/other")
+        )
+    )
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(
+                OverviewRollups(
+                    tokenRollups: [
+                        .init(day: .init(year: 2026, month: 6, day: 21), repo: kvasirRepo, inputTokens: 8, outputTokens: 5, cacheTokens: 0)
+                    ],
+                    costRollups: [],
+                    toolCallRollups: []
+                )
+            ),
+            .failure(StartupTestError.transient)
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.selectRepo(kvasirRepo)
+    let previousSnapshot = model.overviewSnapshot
+
+    do {
+        try await model.selectRepo(otherRepo)
+        Issue.record("expected failed repo selection")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    #expect(model.selectedRepo == kvasirRepo)
+    #expect(model.overviewSnapshot == previousSnapshot)
+    #expect(model.overviewSnapshot?.selectedRepo == kvasirRepo)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(repo: kvasirRepo),
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query(repo: otherRepo)
+    ])
+}
+
+@MainActor
+@Test
 func staleOverviewLoadsCannotOverwriteNewerRangeSelection() async throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -555,6 +648,10 @@ private enum StartupEvent: Equatable {
 private extension OverviewTimeRange {
     var query: OverviewQuery {
         OverviewQuery(start: start, end: end)
+    }
+
+    func query(repo: OverviewRepoBucket?) -> OverviewQuery {
+        OverviewQuery(start: start, end: end, repo: repo)
     }
 }
 

@@ -40,6 +40,7 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var launchAgentOutcome: LaunchAgentRegistrationOutcome?
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var setupWarningMessage: String?
+    @Published public private(set) var selectedRepo: OverviewRepoBucket?
     @Published public var selectedRangePreset: OverviewRangePreset
 
     private let dashboard: OverviewDashboard
@@ -98,16 +99,31 @@ public final class KvasirViewerModel: ObservableObject {
         try await refreshOverview()
     }
 
+    public func selectRepo(_ repo: OverviewRepoBucket?) async throws {
+        try await refreshOverview(repo: repo) {
+            selectedRepo = repo
+        }
+    }
+
     public func refreshOverview() async throws {
+        try await refreshOverview(repo: selectedRepo)
+    }
+
+    private func refreshOverview(
+        repo: OverviewRepoBucket?,
+        beforeCommit: () -> Void = {}
+    ) async throws {
         overviewLoadID += 1
         let loadID = overviewLoadID
         do {
             let snapshot = try await dashboard.load(
-                range: selectedRangePreset.range(containing: now(), calendar: calendar)
+                range: selectedRangePreset.range(containing: now(), calendar: calendar),
+                repo: repo
             )
             guard loadID == overviewLoadID else {
                 return
             }
+            beforeCommit()
             overviewSnapshot = snapshot
             errorMessage = nil
         } catch {
