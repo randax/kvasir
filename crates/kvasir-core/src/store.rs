@@ -1989,17 +1989,103 @@ fn migrate_v9_to_v10(transaction: &rusqlite::Transaction<'_>) -> Result<(), Stor
 
 fn migrate_v10_to_v11(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     if table_exists(transaction, "canonical_tool_calls")? {
-        transaction.execute(
-            "UPDATE canonical_tool_calls
-             SET harness = replace(lower(trim(harness)), '-', '_')",
-            [],
+        transaction.execute_batch(
+            "CREATE TABLE canonical_tool_calls_v11 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                call_count INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO canonical_tool_calls_v11 (
+                id,
+                event_key,
+                occurred_at_ms,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name,
+                call_count
+             )
+             SELECT
+                id,
+                replace(
+                    event_key,
+                    'harness=' || harness || char(10),
+                    'harness=' || replace(lower(trim(harness)), '-', '_') || char(10)
+                ),
+                occurred_at_ms,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                replace(lower(trim(harness)), '-', '_'),
+                tool_name,
+                call_count
+             FROM canonical_tool_calls
+             ORDER BY id;
+             DROP TABLE canonical_tool_calls;
+             ALTER TABLE canonical_tool_calls_v11 RENAME TO canonical_tool_calls;",
         )?;
     }
     if table_exists(transaction, "canonical_content_records")? {
-        transaction.execute(
-            "UPDATE canonical_content_records
-             SET harness = replace(lower(trim(harness)), '-', '_')",
-            [],
+        transaction.execute_batch(
+            "CREATE TABLE canonical_content_records_v11 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                content TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO canonical_content_records_v11 (
+                id,
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                content
+             )
+             SELECT
+                id,
+                replace(
+                    event_key,
+                    'harness=' || harness || char(10),
+                    'harness=' || replace(lower(trim(harness)), '-', '_') || char(10)
+                ),
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                replace(lower(trim(harness)), '-', '_'),
+                content_kind,
+                content
+             FROM canonical_content_records
+             ORDER BY id;
+             DROP TABLE canonical_content_records;
+             ALTER TABLE canonical_content_records_v11 RENAME TO canonical_content_records;",
         )?;
     }
     if table_exists(transaction, "canonical_trace_spans")? {
@@ -2611,7 +2697,8 @@ mod tests {
     use crate::rpc::TimestampMillis;
     use crate::usage::{
         ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsd, RepoIdentity, RepoName,
-        RepoPath, TokenCount, TokenUsageEventKey, TokenUsageSignal, ToolCallEventKey,
+        RepoPath, TokenCount, TokenUsageEventKey, TokenUsageSignal, ToolCallCount,
+        ToolCallEventKey,
     };
 
     #[test]
@@ -6218,6 +6305,19 @@ mod tests {
                 content TEXT NOT NULL
             );
 
+            CREATE TABLE canonical_tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                call_count INTEGER NOT NULL
+            );
+
             INSERT INTO canonical_trace_spans (
                 harness,
                 session_id,
@@ -6254,8 +6354,20 @@ mod tests {
                 harness,
                 content_kind,
                 content
-            ) VALUES (
-                'legacy-copilot-content',
+            ) VALUES
+            (
+                'otlp-log-content
+repo_bucket=repo
+repo_name=kvasir
+repo_path=/repos/kvasir
+harness=GitHub-Copilot
+session_id=session-12
+prompt_id=prompt-7
+kind=assistant_message
+occurred_at_nanos=1781956802000000000
+content_len=14
+content_fingerprint=legacy-fingerprint
+',
                 1781956802000,
                 'session-12',
                 'prompt-7',
@@ -6266,13 +6378,85 @@ mod tests {
                 'GitHub-Copilot',
                 'assistant_message',
                 'legacy content'
+            ),
+            (
+                'otlp-log-content
+repo_bucket=repo
+repo_name=kvasir
+repo_path=/repos/kvasir
+harness=github_copilot
+session_id=session-12
+prompt_id=prompt-7
+kind=assistant_message
+occurred_at_nanos=1781956802000000000
+content_len=14
+content_fingerprint=legacy-fingerprint
+',
+                1781956802000,
+                'session-12',
+                'prompt-7',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'github_copilot',
+                'assistant_message',
+                'legacy content'
+            );
+
+            INSERT INTO canonical_tool_calls (
+                event_key,
+                occurred_at_ms,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                tool_name,
+                call_count
+            ) VALUES
+            (
+                'otlp-log-tool-result
+repo_bucket=repo
+repo_name=kvasir
+repo_path=/repos/kvasir
+harness=GitHub-Copilot
+tool_name=Read
+occurred_at_nanos=1781956803000000000
+',
+                1781956803000,
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'GitHub-Copilot',
+                'Read',
+                1
+            ),
+            (
+                'otlp-log-tool-result
+repo_bucket=repo
+repo_name=kvasir
+repo_path=/repos/kvasir
+harness=github_copilot
+tool_name=Read
+occurred_at_nanos=1781956803000000000
+',
+                1781956803000,
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'github_copilot',
+                'Read',
+                1
             );
 
             PRAGMA user_version = 10;",
         )?;
         drop(connection);
 
-        let store = open_test_store(&database_path)?;
+        let mut store = open_test_store(&database_path)?;
         let query = TraceQuery {
             harness: HarnessName::new("github-copilot"),
             session_id: crate::rpc::SessionId::new("session-12"),
@@ -6288,6 +6472,70 @@ mod tests {
         assert_eq!(replay.items.len(), 1);
         assert_eq!(replay.items[0].harness, HarnessName::new("github_copilot"));
         assert_eq!(replay.items[0].content.as_str(), "legacy content");
+        let content_row_count: i64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM canonical_content_records",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(content_row_count, 1);
+        let content_event_key: String = store.connection.query_row(
+            "SELECT event_key FROM canonical_content_records",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(content_event_key.contains("harness=github_copilot\n"));
+        assert!(!content_event_key.contains("harness=GitHub-Copilot\n"));
+        let tool_call_row_count: i64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM canonical_tool_calls", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(tool_call_row_count, 1);
+        let tool_call_event_key: String = store.connection.query_row(
+            "SELECT event_key FROM canonical_tool_calls",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(tool_call_event_key.contains("harness=github_copilot\n"));
+        assert!(!tool_call_event_key.contains("harness=GitHub-Copilot\n"));
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: vec![ToolCallRecord::new_counted(
+                ToolCallEventKey::new(tool_call_event_key),
+                TimestampMillis::new_for_test(1_781_956_803_000),
+                kvasir_repo("/repos/kvasir"),
+                HarnessName::new("github-copilot"),
+                ToolName::new("Read"),
+                ToolCallCount::new(1),
+            )],
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new(content_event_key),
+                occurred_at: TimestampMillis::new_for_test(1_781_956_802_000),
+                session_id: crate::rpc::SessionId::new("session-12"),
+                prompt_id: crate::rpc::PromptId::new("prompt-7"),
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("github-copilot"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("legacy content").unwrap(),
+            }],
+        })?;
+        let content_row_count_after_reingest: i64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM canonical_content_records",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(content_row_count_after_reingest, 1);
+        let tool_call_row_count_after_reingest: i64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM canonical_tool_calls", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(tool_call_row_count_after_reingest, 1);
 
         Ok(())
     }
