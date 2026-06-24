@@ -197,6 +197,50 @@ func productionFactoryWiresDaemonFallbackAfterStartupGateOpens() async throws {
 
 @MainActor
 @Test
+func productionFactoryOpensDaemonFallbackAfterSuccessfulStartupForLaterRefreshFailures() async throws {
+    let primary = SequenceOverviewClient(results: [
+        .success(
+            OverviewRollups(
+                tokenRollups: [
+                    .init(day: .init(year: 2026, month: 6, day: 23), inputTokens: 1, outputTokens: 1, cacheTokens: 1)
+                ],
+                costRollups: [],
+                toolCallRollups: []
+            )
+        ),
+        .failure(DaemonFallbackTestError.recoverable),
+        .success(
+            OverviewRollups(
+                tokenRollups: [
+                    .init(day: .init(year: 2026, month: 6, day: 24), inputTokens: 13, outputTokens: 21, cacheTokens: 34)
+                ],
+                costRollups: [],
+                toolCallRollups: []
+            )
+        ),
+    ])
+    let starter = RecordingDaemonProcessStarter()
+    let model = ProductionModelFactory.make(
+        overviewClient: primary,
+        daemonStarter: starter,
+        launchAgent: DaemonLaunchAgent(registry: RecordingLaunchAgentRegistry(status: .enabled)),
+        shouldStartBundledDaemonAfterOverviewError: { error in
+            error as? DaemonFallbackTestError == .recoverable
+        }
+    )
+
+    try await model.start()
+    #expect(model.overviewSnapshot?.totals.totalTokens == 3)
+
+    try await model.refreshOverview()
+
+    #expect(await primary.loadCount == 3)
+    #expect(starter.startCount == 1)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 68)
+}
+
+@MainActor
+@Test
 func productionFactoryDoesNotStartBundledDaemonBeforeStartupGateOpens() async throws {
     let primary = SequenceOverviewClient(results: [
         .failure(DaemonFallbackTestError.recoverable),
@@ -220,6 +264,40 @@ func productionFactoryDoesNotStartBundledDaemonBeforeStartupGateOpens() async th
 
     #expect(await primary.loadCount == 1)
     #expect(starter.startCount == 0)
+}
+
+@Test
+func daemonFallbackOverviewClientStopsRetryingAfterBoundedRecoverableFailures() async throws {
+    let primary = SequenceOverviewClient(results: [
+        .failure(DaemonFallbackTestError.recoverable),
+        .failure(DaemonFallbackTestError.recoverable),
+        .failure(DaemonFallbackTestError.recoverable),
+        .failure(DaemonFallbackTestError.recoverable),
+    ])
+    let starter = RecordingDaemonProcessStarter()
+    let retryDelay = RecordingRetryDelay()
+    let client = DaemonFallbackOverviewClient(
+        primary: primary,
+        starter: starter,
+        shouldStartDaemonAfterError: { error in
+            error as? DaemonFallbackTestError == .recoverable
+        },
+        maximumRetryCount: 2,
+        retryDelay: retryDelay.sleep
+    )
+
+    do {
+        _ = try await client.loadOverviewRollups(
+            query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
+        )
+        Issue.record("expected bounded recoverable failure")
+    } catch {
+        #expect(error as? DaemonFallbackTestError == .recoverable)
+    }
+
+    #expect(await primary.loadCount == 4)
+    #expect(starter.startCount == 1)
+    #expect(await retryDelay.attempts == [1, 2])
 }
 
 #if canImport(kvasir_client)
@@ -338,6 +416,22 @@ private final class RecordingDaemonProcessStarter: DaemonProcessStarter, @unchec
         defer { lock.unlock() }
         starts += 1
     }
+}
+
+private final class RecordingLaunchAgentRegistry: LaunchAgentRegistry {
+    private let launchAgentStatus: LaunchAgentStatus
+
+    init(status: LaunchAgentStatus) {
+        self.launchAgentStatus = status
+    }
+
+    func status(plistName: String) -> LaunchAgentStatus {
+        launchAgentStatus
+    }
+
+    func register(plistName: String) throws {}
+
+    func unregister(plistName: String) throws {}
 }
 
 private actor RecordingRetryDelay {

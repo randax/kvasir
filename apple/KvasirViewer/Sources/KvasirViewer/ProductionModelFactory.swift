@@ -11,6 +11,7 @@ enum ProductionModelFactory {
         overviewClient: (any OverviewClient)? = nil,
         daemonStarter: any DaemonProcessStarter = BundledDaemonProcess.shared,
         daemonFallbackGate: DaemonFallbackGate = DaemonFallbackGate(),
+        launchAgent: DaemonLaunchAgent = DaemonLaunchAgent(),
         shouldStartBundledDaemonAfterOverviewError: @escaping @Sendable (any Error) -> Bool =
             ProductionModelFactory.shouldStartBundledDaemonAfterOverviewError
     ) -> KvasirViewerModel {
@@ -25,7 +26,7 @@ enum ProductionModelFactory {
                 )
             ),
             telemetrySetup: makeHarnessTelemetrySetup(),
-            launchAgent: DaemonLaunchAgent(),
+            launchAgent: launchAgent,
             shouldRefreshLaunchAgentAfterStartupOverviewError: shouldRefreshLaunchAgentAfterStartupOverviewError,
             enablePostStartupOverviewRecovery: {
                 daemonFallbackGate.enable()
