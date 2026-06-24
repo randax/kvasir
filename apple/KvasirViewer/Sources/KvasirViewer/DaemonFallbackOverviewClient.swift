@@ -30,9 +30,9 @@ struct DaemonFallbackOverviewClient: OverviewClient {
         self.retryDelay = retryDelay
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         do {
-            return try await primary.loadOverviewRollups(query: query)
+            return try await primary.loadOverviewSnapshot(query: query)
         } catch {
             guard shouldStartDaemonAfterError(error) else {
                 throw error
@@ -42,11 +42,11 @@ struct DaemonFallbackOverviewClient: OverviewClient {
         }
     }
 
-    private func loadAfterDaemonStart(query: OverviewQuery) async throws -> OverviewRollups {
+    private func loadAfterDaemonStart(query: OverviewQuery) async throws -> OverviewSnapshot {
         var retry = 0
         while true {
             do {
-                return try await primary.loadOverviewRollups(query: query)
+                return try await primary.loadOverviewSnapshot(query: query)
             } catch {
                 guard retry < maximumRetryCount, shouldStartDaemonAfterError(error) else {
                     throw error

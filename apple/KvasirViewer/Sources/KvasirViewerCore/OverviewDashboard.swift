@@ -47,10 +47,13 @@ public struct OverviewRepoPath: Hashable, Comparable, Sendable {
 }
 
 public struct OverviewRepoIdentity: Hashable, Comparable, Sendable {
-    public var name: OverviewRepoName?
-    public var path: OverviewRepoPath?
+    public let name: OverviewRepoName?
+    public let path: OverviewRepoPath?
 
-    public init(name: OverviewRepoName?, path: OverviewRepoPath?) {
+    public init?(name: OverviewRepoName?, path: OverviewRepoPath?) {
+        guard name != nil || path != nil else {
+            return nil
+        }
         self.name = name
         self.path = path
     }
@@ -101,72 +104,6 @@ public struct OverviewRollupDay: Comparable, Hashable, Sendable {
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
         (lhs.year, lhs.month, lhs.day) < (rhs.year, rhs.month, rhs.day)
-    }
-}
-
-public struct OverviewTokenRollup: Equatable, Sendable {
-    public var day: OverviewRollupDay
-    public var repo: OverviewRepoBucket
-    public var inputTokens: UInt64
-    public var outputTokens: UInt64
-    public var cacheTokens: UInt64
-
-    public init(
-        day: OverviewRollupDay,
-        repo: OverviewRepoBucket = .noRepo,
-        inputTokens: UInt64,
-        outputTokens: UInt64,
-        cacheTokens: UInt64
-    ) {
-        self.day = day
-        self.repo = repo
-        self.inputTokens = inputTokens
-        self.outputTokens = outputTokens
-        self.cacheTokens = cacheTokens
-    }
-
-    public var totalTokens: UInt64 {
-        inputTokens + outputTokens + cacheTokens
-    }
-}
-
-public struct OverviewCostRollup: Equatable, Sendable {
-    public var day: OverviewRollupDay
-    public var repo: OverviewRepoBucket
-    public var costUsdNanos: UInt64
-
-    public init(day: OverviewRollupDay, repo: OverviewRepoBucket = .noRepo, costUsdNanos: UInt64) {
-        self.day = day
-        self.repo = repo
-        self.costUsdNanos = costUsdNanos
-    }
-}
-
-public struct OverviewToolCallRollup: Equatable, Sendable {
-    public var day: OverviewRollupDay
-    public var repo: OverviewRepoBucket
-    public var callCount: UInt64
-
-    public init(day: OverviewRollupDay, repo: OverviewRepoBucket = .noRepo, callCount: UInt64) {
-        self.day = day
-        self.repo = repo
-        self.callCount = callCount
-    }
-}
-
-public struct OverviewRollups: Equatable, Sendable {
-    public var tokenRollups: [OverviewTokenRollup]
-    public var costRollups: [OverviewCostRollup]
-    public var toolCallRollups: [OverviewToolCallRollup]
-
-    public init(
-        tokenRollups: [OverviewTokenRollup],
-        costRollups: [OverviewCostRollup],
-        toolCallRollups: [OverviewToolCallRollup]
-    ) {
-        self.tokenRollups = tokenRollups
-        self.costRollups = costRollups
-        self.toolCallRollups = toolCallRollups
     }
 }
 
@@ -231,7 +168,7 @@ public struct OverviewRepoSummary: Equatable, Sendable {
 }
 
 public protocol OverviewClient: Sendable {
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot
 }
 
 public struct OverviewDashboard: Sendable {
@@ -243,73 +180,6 @@ public struct OverviewDashboard: Sendable {
 
     public func load(range: OverviewTimeRange, repo: OverviewRepoBucket? = nil) async throws -> OverviewSnapshot {
         let query = OverviewQuery(start: range.start, end: range.end, repo: repo)
-        let rollups = try await client.loadOverviewRollups(query: query)
-        return Self.snapshot(from: rollups, selectedRepo: repo)
-    }
-
-    private static func snapshot(from rollups: OverviewRollups, selectedRepo: OverviewRepoBucket?) -> OverviewSnapshot {
-        var totalTokens: UInt64 = 0
-        var totalCostUsdNanos: UInt64 = 0
-        var totalToolCalls: UInt64 = 0
-        var pointsByDay: [OverviewRollupDay: OverviewSeriesPoint] = [:]
-        var totalsByRepo: [OverviewRepoBucket: OverviewTotals] = [:]
-
-        for rollup in rollups.tokenRollups {
-            totalTokens += rollup.totalTokens
-            pointsByDay[rollup.day, default: .empty(day: rollup.day)].totalTokens += rollup.totalTokens
-            totalsByRepo[rollup.repo, default: .zero].totalTokens += rollup.totalTokens
-        }
-
-        for rollup in rollups.costRollups {
-            totalCostUsdNanos += rollup.costUsdNanos
-            pointsByDay[rollup.day, default: .empty(day: rollup.day)].costUsdNanos += rollup.costUsdNanos
-            totalsByRepo[rollup.repo, default: .zero].costUsdNanos += rollup.costUsdNanos
-        }
-
-        for rollup in rollups.toolCallRollups {
-            totalToolCalls += rollup.callCount
-            pointsByDay[rollup.day, default: .empty(day: rollup.day)].toolCalls += rollup.callCount
-            totalsByRepo[rollup.repo, default: .zero].toolCalls += rollup.callCount
-        }
-
-        return OverviewSnapshot(
-            totals: OverviewTotals(
-                totalTokens: totalTokens,
-                costUsdNanos: totalCostUsdNanos,
-                toolCalls: totalToolCalls
-            ),
-            series: pointsByDay.values.sorted { $0.day < $1.day },
-            repoBreakdown: repoBreakdown(from: totalsByRepo),
-            selectedRepo: selectedRepo
-        )
-    }
-
-    private static func repoBreakdown(from totalsByRepo: [OverviewRepoBucket: OverviewTotals]) -> [OverviewRepoSummary] {
-        totalsByRepo
-            .map { OverviewRepoSummary(repo: $0.key, totals: $0.value) }
-            .sorted { lhs, rhs in
-                if lhs.totals.totalTokens != rhs.totals.totalTokens {
-                    return lhs.totals.totalTokens > rhs.totals.totalTokens
-                }
-                if lhs.totals.costUsdNanos != rhs.totals.costUsdNanos {
-                    return lhs.totals.costUsdNanos > rhs.totals.costUsdNanos
-                }
-                if lhs.totals.toolCalls != rhs.totals.toolCalls {
-                    return lhs.totals.toolCalls > rhs.totals.toolCalls
-                }
-                return lhs.repo < rhs.repo
-            }
-    }
-}
-
-private extension OverviewTotals {
-    static var zero: Self {
-        Self(totalTokens: 0, costUsdNanos: 0, toolCalls: 0)
-    }
-}
-
-private extension OverviewSeriesPoint {
-    static func empty(day: OverviewRollupDay) -> Self {
-        Self(day: day, totalTokens: 0, costUsdNanos: 0, toolCalls: 0)
+        return try await client.loadOverviewSnapshot(query: query)
     }
 }

@@ -10,17 +10,7 @@ func viewerStartupRegistersDaemonAndLoadsOverviewForDefaultRange() async throws 
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let client = RecordingStartupOverviewClient(
-        rollups: OverviewRollups(
-            tokenRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), inputTokens: 20, outputTokens: 10, cacheTokens: 5)
-            ],
-            costRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), costUsdNanos: 42)
-            ],
-            toolCallRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), callCount: 3)
-            ]
-        )
+        snapshot: overviewSnapshot(totalTokens: 35, costUsdNanos: 42, toolCalls: 3)
     )
     let startupEvents = StartupEventRecorder()
     let telemetrySetup = RecordingHarnessTelemetrySetup(events: startupEvents)
@@ -48,7 +38,7 @@ func viewerStartupRegistersDaemonAndLoadsOverviewForDefaultRange() async throws 
 @Test
 func viewerStartupWarnsAndContinuesWhenTelemetrySetupFails() async throws {
     let client = RecordingStartupOverviewClient(
-        rollups: OverviewRollups(tokenRollups: [], costRollups: [], toolCallRollups: [])
+        snapshot: overviewSnapshot()
     )
     let startupEvents = StartupEventRecorder()
     let registry = RecordingStartupLaunchAgentRegistry(status: .notRegistered, events: startupEvents)
@@ -76,7 +66,7 @@ func viewerStartupWarnsAndContinuesWhenTelemetrySetupFails() async throws {
 func viewerDefaultRangeUsesUtcDaysToMatchDaemonRollupBuckets() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let client = RecordingStartupOverviewClient(
-        rollups: OverviewRollups(tokenRollups: [], costRollups: [], toolCallRollups: [])
+        snapshot: overviewSnapshot()
     )
     let model = KvasirViewerModel(
         dashboard: OverviewDashboard(client: client),
@@ -96,13 +86,7 @@ func viewerDefaultRangeUsesUtcDaysToMatchDaemonRollupBuckets() async throws {
 @Test
 func viewerStartupSurfacesLaunchAgentApprovalAndStillLoadsOverview() async throws {
     let client = RecordingStartupOverviewClient(
-        rollups: OverviewRollups(
-            tokenRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), inputTokens: 2, outputTokens: 3, cacheTokens: 5)
-            ],
-            costRollups: [],
-            toolCallRollups: []
-        )
+        snapshot: overviewSnapshot(totalTokens: 10)
     )
     let registry = RecordingStartupLaunchAgentRegistry(status: .requiresApproval)
     let model = KvasirViewerModel(
@@ -164,13 +148,7 @@ func viewerStartupRefreshesDaemonRegistrationAndRetriesWhenInitialOverviewFails(
         results: [
             .failure(StartupTestError.transient),
             .success(
-                OverviewRollups(
-                    tokenRollups: [
-                        .init(day: .init(year: 2026, month: 6, day: 21), inputTokens: 7, outputTokens: 5, cacheTokens: 0)
-                    ],
-                    costRollups: [],
-                    toolCallRollups: []
-                )
+                overviewSnapshot(totalTokens: 12)
             )
         ]
     )
@@ -198,13 +176,7 @@ func viewerStartupOpensPostStartupOverviewRecoveryBeforeRetryAfterLaunchAgentRef
         results: [
             .failure(StartupTestError.transient),
             .success(
-                OverviewRollups(
-                    tokenRollups: [
-                        .init(day: .init(year: 2026, month: 6, day: 21), inputTokens: 3, outputTokens: 4, cacheTokens: 5)
-                    ],
-                    costRollups: [],
-                    toolCallRollups: []
-                )
+                overviewSnapshot(totalTokens: 12)
             )
         ],
         isGateEnabled: { recoveryGate.isEnabled }
@@ -257,7 +229,7 @@ func viewerStartupDoesNotRefreshDaemonRegistrationForNonRecoverableOverviewFailu
 @Test
 func successfulOverviewRefreshClearsPreviousError() async throws {
     let client = RecordingStartupOverviewClient(
-        rollups: OverviewRollups(tokenRollups: [], costRollups: [], toolCallRollups: [])
+        snapshot: overviewSnapshot()
     )
     let model = KvasirViewerModel(
         dashboard: OverviewDashboard(client: client),
@@ -278,20 +250,10 @@ func selectingRepoReloadsOverviewForCurrentRange() async throws {
         OverviewRepoIdentity(
             name: OverviewRepoName("kvasir"),
             path: OverviewRepoPath("/repos/kvasir")
-        )
+        )!
     )
     let client = RecordingStartupOverviewClient(
-        rollups: OverviewRollups(
-            tokenRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), repo: repo, inputTokens: 8, outputTokens: 5, cacheTokens: 0)
-            ],
-            costRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), repo: repo, costUsdNanos: 12)
-            ],
-            toolCallRollups: [
-                .init(day: .init(year: 2026, month: 6, day: 21), repo: repo, callCount: 3)
-            ]
-        )
+        snapshot: overviewSnapshot(totalTokens: 13, costUsdNanos: 12, toolCalls: 3, selectedRepo: repo)
     )
     let model = KvasirViewerModel(
         dashboard: OverviewDashboard(client: client),
@@ -316,24 +278,18 @@ func failedRepoSelectionKeepsPreviousRepoAndSnapshot() async throws {
         OverviewRepoIdentity(
             name: OverviewRepoName("kvasir"),
             path: OverviewRepoPath("/repos/kvasir")
-        )
+        )!
     )
     let otherRepo = OverviewRepoBucket.repo(
         OverviewRepoIdentity(
             name: OverviewRepoName("other"),
             path: OverviewRepoPath("/repos/other")
-        )
+        )!
     )
     let client = RecordingResultOverviewClient(
         results: [
             .success(
-                OverviewRollups(
-                    tokenRollups: [
-                        .init(day: .init(year: 2026, month: 6, day: 21), repo: kvasirRepo, inputTokens: 8, outputTokens: 5, cacheTokens: 0)
-                    ],
-                    costRollups: [],
-                    toolCallRollups: []
-                )
+                overviewSnapshot(totalTokens: 13, selectedRepo: kvasirRepo)
             ),
             .failure(StartupTestError.transient)
         ]
@@ -370,20 +326,8 @@ func staleOverviewLoadsCannotOverwriteNewerRangeSelection() async throws {
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
     let client = OrderedOverviewClient(
         responses: [
-            .init(
-                tokenRollups: [
-                    .init(day: .init(year: 2026, month: 6, day: 1), inputTokens: 1, outputTokens: 0, cacheTokens: 0)
-                ],
-                costRollups: [],
-                toolCallRollups: []
-            ),
-            .init(
-                tokenRollups: [
-                    .init(day: .init(year: 2026, month: 6, day: 2), inputTokens: 2, outputTokens: 0, cacheTokens: 0)
-                ],
-                costRollups: [],
-                toolCallRollups: []
-            )
+            overviewSnapshot(totalTokens: 1),
+            overviewSnapshot(totalTokens: 2)
         ]
     )
     let model = KvasirViewerModel(
@@ -416,13 +360,7 @@ func staleOverviewFailuresCannotOverwriteNewerSuccessfulRangeSelection() async t
         results: [
             .failure(StartupTestError.transient),
             .success(
-                OverviewRollups(
-                    tokenRollups: [
-                        .init(day: .init(year: 2026, month: 6, day: 2), inputTokens: 2, outputTokens: 0, cacheTokens: 0)
-                    ],
-                    costRollups: [],
-                    toolCallRollups: []
-                )
+                overviewSnapshot(totalTokens: 2)
             )
         ]
     )
@@ -450,48 +388,48 @@ func staleOverviewFailuresCannotOverwriteNewerSuccessfulRangeSelection() async t
 }
 
 private final class RecordingStartupOverviewClient: OverviewClient, @unchecked Sendable {
-    private let rollups: OverviewRollups
+    private let snapshot: OverviewSnapshot
     private(set) var queries: [OverviewQuery] = []
 
-    init(rollups: OverviewRollups) {
-        self.rollups = rollups
+    init(snapshot: OverviewSnapshot) {
+        self.snapshot = snapshot
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         queries.append(query)
-        return rollups
+        return snapshot
     }
 }
 
 private final class RecordingResultOverviewClient: OverviewClient, @unchecked Sendable {
-    private let results: [Result<OverviewRollups, any Error>]
+    private let results: [Result<OverviewSnapshot, any Error>]
     private(set) var queries: [OverviewQuery] = []
 
-    init(results: [Result<OverviewRollups, any Error>]) {
+    init(results: [Result<OverviewSnapshot, any Error>]) {
         self.results = results
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         queries.append(query)
         return try results[queries.count - 1].get()
     }
 }
 
 private final class GateRecordingResultOverviewClient: OverviewClient, @unchecked Sendable {
-    private let results: [Result<OverviewRollups, any Error>]
+    private let results: [Result<OverviewSnapshot, any Error>]
     private let isGateEnabled: @Sendable () -> Bool
     private(set) var queries: [OverviewQuery] = []
     private(set) var gateStates: [Bool] = []
 
     init(
-        results: [Result<OverviewRollups, any Error>],
+        results: [Result<OverviewSnapshot, any Error>],
         isGateEnabled: @escaping @Sendable () -> Bool
     ) {
         self.results = results
         self.isGateEnabled = isGateEnabled
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         queries.append(query)
         gateStates.append(isGateEnabled())
         return try results[queries.count - 1].get()
@@ -500,14 +438,14 @@ private final class GateRecordingResultOverviewClient: OverviewClient, @unchecke
 
 private final class OrderedOverviewClient: OverviewClient, @unchecked Sendable {
     private let lock = NSLock()
-    private let responses: [OverviewRollups]
+    private let responses: [OverviewSnapshot]
     private var pendingContinuations: [CheckedContinuation<Void, Never>?] = []
 
-    init(responses: [OverviewRollups]) {
+    init(responses: [OverviewSnapshot]) {
         self.responses = responses
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         let index = lock.withLock {
             let index = pendingContinuations.count
             pendingContinuations.append(nil)
@@ -535,14 +473,14 @@ private final class OrderedOverviewClient: OverviewClient, @unchecked Sendable {
 
 private final class OrderedOverviewResultClient: OverviewClient, @unchecked Sendable {
     private let lock = NSLock()
-    private let results: [Result<OverviewRollups, any Error>]
+    private let results: [Result<OverviewSnapshot, any Error>]
     private var pendingContinuations: [CheckedContinuation<Void, Never>?] = []
 
-    init(results: [Result<OverviewRollups, any Error>]) {
+    init(results: [Result<OverviewSnapshot, any Error>]) {
         self.results = results
     }
 
-    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         let index = lock.withLock {
             let index = pendingContinuations.count
             pendingContinuations.append(nil)
@@ -643,6 +581,33 @@ private final class RecordingOverviewRecoveryGate: @unchecked Sendable {
 private enum StartupEvent: Equatable {
     case configuredTelemetry
     case registeredLaunchAgent
+}
+
+private func overviewSnapshot(
+    totalTokens: UInt64 = 0,
+    costUsdNanos: UInt64 = 0,
+    toolCalls: UInt64 = 0,
+    selectedRepo: OverviewRepoBucket? = nil
+) -> OverviewSnapshot {
+    OverviewSnapshot(
+        totals: OverviewTotals(
+            totalTokens: totalTokens,
+            costUsdNanos: costUsdNanos,
+            toolCalls: toolCalls
+        ),
+        series: [],
+        repoBreakdown: selectedRepo.map {
+            [OverviewRepoSummary(
+                repo: $0,
+                totals: OverviewTotals(
+                    totalTokens: totalTokens,
+                    costUsdNanos: costUsdNanos,
+                    toolCalls: toolCalls
+                )
+            )]
+        } ?? [],
+        selectedRepo: selectedRepo
+    )
 }
 
 private extension OverviewTimeRange {

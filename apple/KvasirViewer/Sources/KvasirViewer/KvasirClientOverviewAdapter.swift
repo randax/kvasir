@@ -5,55 +5,37 @@ import KvasirViewerCore
 struct KvasirClientRollupSource: OverviewRollupSource {
     let socketPath: String
 
-    func overviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+    func overviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         try await Task.detached(priority: .userInitiated) { [self] in
             let client = try KvasirClient.connect(socketPath: socketPath)
-            let rollups = try client.overviewRollups(query: query.kvasirRollupQuery)
-            return OverviewRollups(
-                tokenRollups: rollups.tokenRollups.map { rollup in
-                    OverviewTokenRollup(
-                        day: rollup.day.overviewDay,
-                        repo: rollup.repo.overviewRepo,
-                        inputTokens: rollup.inputTokens,
-                        outputTokens: rollup.outputTokens,
-                        cacheTokens: rollup.cacheTokens
-                    )
-                },
-                costRollups: rollups.costRollups.map { rollup in
-                    OverviewCostRollup(
-                        day: rollup.day.overviewDay,
-                        repo: rollup.repo.overviewRepo,
-                        costUsdNanos: rollup.costUsd.nanos
-                    )
-                },
-                toolCallRollups: rollups.toolCallRollups.map { rollup in
-                    OverviewToolCallRollup(
-                        day: rollup.day.overviewDay,
-                        repo: rollup.repo.overviewRepo,
-                        callCount: rollup.callCount
-                    )
-                }
+            return try overviewSnapshotFromKvasir(
+                client.overviewSnapshot(query: kvasirRollupQuery(from: query))
             )
         }.value
     }
 }
 
-private extension OverviewQuery {
-    var kvasirRollupQuery: KvasirRollupQuery {
-        KvasirRollupQuery(
-            start: KvasirTimestampMillis(value: Int64(start.timeIntervalSince1970 * 1_000)),
-            end: KvasirTimestampMillis(value: Int64(end.timeIntervalSince1970 * 1_000)),
-            repo: repo?.kvasirRepoBucket
-        )
-    }
+func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
+    KvasirRollupQuery(
+        start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),
+        end: KvasirTimestampMillis(value: Int64(query.end.timeIntervalSince1970 * 1_000)),
+        repo: query.repo?.kvasirRepoBucket
+    )
+}
+
+func overviewSnapshotFromKvasir(_ snapshot: KvasirOverviewSnapshot) -> OverviewSnapshot {
+    snapshot.overviewSnapshot
 }
 
 private extension OverviewRepoBucket {
-    var kvasirRepoBucket: KvasirRepoBucket {
+    var kvasirRepoBucket: KvasirRepoBucket? {
         switch self {
         case .noRepo:
             return KvasirRepoBucket(kind: .noRepo, name: nil, path: nil)
         case .repo(let identity):
+            guard identity.name != nil || identity.path != nil else {
+                return nil
+            }
             return KvasirRepoBucket(
                 kind: .repo,
                 name: identity.name?.rawValue,
@@ -69,13 +51,52 @@ private extension KvasirRepoBucket {
         case .noRepo:
             return .noRepo
         case .repo:
-            return .repo(
-                OverviewRepoIdentity(
-                    name: name.map(OverviewRepoName.init),
-                    path: path.map(OverviewRepoPath.init)
-                )
-            )
+            guard let identity = OverviewRepoIdentity(
+                name: name.map(OverviewRepoName.init),
+                path: path.map(OverviewRepoPath.init)
+            ) else {
+                return .noRepo
+            }
+            return .repo(identity)
         }
+    }
+}
+
+private extension KvasirOverviewSnapshot {
+    var overviewSnapshot: OverviewSnapshot {
+        OverviewSnapshot(
+            totals: totals.overviewTotals,
+            series: series.map { $0.overviewSeriesPoint },
+            repoBreakdown: repoBreakdown.map { $0.overviewRepoSummary },
+            selectedRepo: selectedRepo?.overviewRepo
+        )
+    }
+}
+
+private extension KvasirOverviewTotals {
+    var overviewTotals: OverviewTotals {
+        OverviewTotals(
+            totalTokens: totalTokens,
+            costUsdNanos: costUsdNanos,
+            toolCalls: toolCalls
+        )
+    }
+}
+
+private extension KvasirOverviewSeriesPoint {
+    var overviewSeriesPoint: OverviewSeriesPoint {
+        OverviewSeriesPoint(
+            day: day.overviewDay,
+            totalTokens: totalTokens,
+            costUsdNanos: costUsdNanos,
+            toolCalls: toolCalls
+        )
+    }
+}
+
+private extension KvasirOverviewRepoSummary {
+    var overviewRepoSummary: OverviewRepoSummary {
+        OverviewRepoSummary(repo: repo.overviewRepo, totals: totals.overviewTotals)
     }
 }
 

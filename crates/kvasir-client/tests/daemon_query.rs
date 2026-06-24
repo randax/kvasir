@@ -11,12 +11,13 @@ use kvasir_client::{
     KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
     KvasirContentKind, KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
     KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
-    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewRollup, KvasirPromptId,
-    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
-    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
-    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
-    KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind,
+    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewRepoSummary,
+    KvasirOverviewRollup, KvasirOverviewSeriesPoint, KvasirOverviewSnapshot, KvasirOverviewTotals,
+    KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
+    KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId,
+    KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate,
+    KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId,
+    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::{BearerToken, RpcResponse};
@@ -1067,9 +1068,11 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
     };
-    let overview = tokio::task::spawn_blocking(move || {
+    let (overview, snapshot) = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.overview_rollups(query)
+        let overview = client.overview_rollups(query.clone())?;
+        let snapshot = client.overview_snapshot(query)?;
+        Ok::<_, KvasirClientError>((overview, snapshot))
     })
     .await??;
 
@@ -1182,6 +1185,47 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     call_count: 2,
                 },
             ],
+        }
+    );
+    assert_eq!(
+        snapshot,
+        KvasirOverviewSnapshot {
+            totals: KvasirOverviewTotals {
+                total_tokens: 5_000,
+                cost_usd_nanos: 1_968_015_000,
+                tool_calls: 3,
+            },
+            series: vec![
+                KvasirOverviewSeriesPoint {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    total_tokens: 2_150,
+                    cost_usd_nanos: 1_450_000_000,
+                    tool_calls: 3,
+                },
+                KvasirOverviewSeriesPoint {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 21,
+                    },
+                    total_tokens: 2_850,
+                    cost_usd_nanos: 518_015_000,
+                    tool_calls: 0,
+                },
+            ],
+            repo_breakdown: vec![KvasirOverviewRepoSummary {
+                repo: kvasir_repo(),
+                totals: KvasirOverviewTotals {
+                    total_tokens: 5_000,
+                    cost_usd_nanos: 1_968_015_000,
+                    tool_calls: 3,
+                },
+            }],
+            selected_repo: Some(kvasir_repo()),
         }
     );
 
