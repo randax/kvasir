@@ -119,6 +119,46 @@ func viewerStartupSurfacesLaunchAgentApprovalAndStillLoadsOverview() async throw
 
 @MainActor
 @Test
+func viewerStartupKeepsPostStartupOverviewRecoveryClosedWhenLaunchAgentRequiresApprovalAndOverviewFails() async throws {
+    let recoveryGate = RecordingOverviewRecoveryGate()
+    let client = GateRecordingResultOverviewClient(
+        results: [
+            .failure(StartupTestError.transient),
+            .failure(StartupTestError.transient),
+        ],
+        isGateEnabled: { recoveryGate.isEnabled }
+    )
+    let registry = RecordingStartupLaunchAgentRegistry(status: .requiresApproval)
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: registry),
+        shouldRefreshLaunchAgentAfterStartupOverviewError: { _ in true },
+        enablePostStartupOverviewRecovery: recoveryGate.enable
+    )
+
+    do {
+        try await model.start()
+        Issue.record("expected startup overview failure")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    do {
+        try await model.refreshOverview()
+        Issue.record("expected later overview failure")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    #expect(model.launchAgentOutcome == .requiresApproval)
+    #expect(registry.unregisteredPlistNames.isEmpty)
+    #expect(registry.registeredPlistNames.isEmpty)
+    #expect(client.gateStates == [false, false])
+    #expect(recoveryGate.enableCount == 0)
+}
+
+@MainActor
+@Test
 func viewerStartupRefreshesDaemonRegistrationAndRetriesWhenInitialOverviewFails() async throws {
     let client = RecordingResultOverviewClient(
         results: [
@@ -147,6 +187,42 @@ func viewerStartupRefreshesDaemonRegistrationAndRetriesWhenInitialOverviewFails(
     #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
     #expect(client.queries.count == 2)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 12)
+}
+
+@MainActor
+@Test
+func viewerStartupOpensPostStartupOverviewRecoveryBeforeRetryAfterLaunchAgentRefresh() async throws {
+    let recoveryGate = RecordingOverviewRecoveryGate()
+    let client = GateRecordingResultOverviewClient(
+        results: [
+            .failure(StartupTestError.transient),
+            .success(
+                OverviewRollups(
+                    tokenRollups: [
+                        .init(day: .init(year: 2026, month: 6, day: 21), inputTokens: 3, outputTokens: 4, cacheTokens: 5)
+                    ],
+                    costRollups: [],
+                    toolCallRollups: []
+                )
+            )
+        ],
+        isGateEnabled: { recoveryGate.isEnabled }
+    )
+    let registry = RecordingStartupLaunchAgentRegistry(status: .enabled)
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: registry),
+        shouldRefreshLaunchAgentAfterStartupOverviewError: { _ in true },
+        enablePostStartupOverviewRecovery: recoveryGate.enable
+    )
+
+    try await model.start()
+
+    #expect(registry.unregisteredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(registry.registeredPlistNames == [DaemonLaunchAgent.plistName])
+    #expect(client.gateStates == [false, true])
+    #expect(recoveryGate.enableCount == 1)
     #expect(model.overviewSnapshot?.totals.totalTokens == 12)
 }
 
@@ -308,6 +384,27 @@ private final class RecordingResultOverviewClient: OverviewClient, @unchecked Se
     }
 }
 
+private final class GateRecordingResultOverviewClient: OverviewClient, @unchecked Sendable {
+    private let results: [Result<OverviewRollups, any Error>]
+    private let isGateEnabled: @Sendable () -> Bool
+    private(set) var queries: [OverviewQuery] = []
+    private(set) var gateStates: [Bool] = []
+
+    init(
+        results: [Result<OverviewRollups, any Error>],
+        isGateEnabled: @escaping @Sendable () -> Bool
+    ) {
+        self.results = results
+        self.isGateEnabled = isGateEnabled
+    }
+
+    func loadOverviewRollups(query: OverviewQuery) async throws -> OverviewRollups {
+        queries.append(query)
+        gateStates.append(isGateEnabled())
+        return try results[queries.count - 1].get()
+    }
+}
+
 private final class OrderedOverviewClient: OverviewClient, @unchecked Sendable {
     private let lock = NSLock()
     private let responses: [OverviewRollups]
@@ -427,6 +524,25 @@ private final class StartupEventRecorder: @unchecked Sendable {
     func append(_ event: StartupEvent) {
         lock.withLock {
             events.append(event)
+        }
+    }
+}
+
+private final class RecordingOverviewRecoveryGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enabled = false
+    private(set) var enableCount = 0
+
+    var isEnabled: Bool {
+        lock.withLock {
+            enabled
+        }
+    }
+
+    func enable() {
+        lock.withLock {
+            enabled = true
+            enableCount += 1
         }
     }
 }

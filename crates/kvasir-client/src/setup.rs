@@ -16,22 +16,39 @@ use crate::error::KvasirClientError;
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirHarnessTelemetrySetup {
-    pub codex_config_path: String,
-    pub claude_settings_path: String,
-    pub raw_body_directory: String,
-    pub otlp_endpoint: String,
+    pub codex_config_path: KvasirCodexConfigPath,
+    pub claude_settings_path: KvasirClaudeSettingsPath,
+    pub raw_body_directory: KvasirRawBodyDirectory,
+    pub otlp_endpoint: KvasirOtlpEndpoint,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirCodexConfigPath(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirClaudeSettingsPath(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirRawBodyDirectory(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirOtlpEndpoint(String);
+
+uniffi::custom_type!(KvasirCodexConfigPath, String);
+uniffi::custom_type!(KvasirClaudeSettingsPath, String);
+uniffi::custom_type!(KvasirRawBodyDirectory, String);
+uniffi::custom_type!(KvasirOtlpEndpoint, String);
 
 #[uniffi::export]
 pub fn configure_kvasir_harness_telemetry(
     config: KvasirHarnessTelemetrySetup,
 ) -> Result<(), KvasirClientError> {
     let setup_secret_source =
-        SetupSecretSource::claude_code_keychain(&PathBuf::from(&config.claude_settings_path));
+        SetupSecretSource::claude_code_keychain(config.claude_settings_path.as_path());
     let pending_setup_config = setup_secret_source
         .prepare(
-            KvasirEndpoint::new(&config.otlp_endpoint),
-            RawBodyDirectory::new(PathBuf::from(&config.raw_body_directory)),
+            config.otlp_endpoint.to_core(),
+            config.raw_body_directory.to_core(),
         )
         .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
     let prepared_config = prepare_codex_telemetry_config(config, pending_setup_config.config())?;
@@ -68,8 +85,8 @@ fn configure_kvasir_harness_telemetry_with_credential_and_install_hook(
 ) -> Result<(), KvasirClientError> {
     let pending_setup_config = prepare_setup_config(
         credential,
-        KvasirEndpoint::new(&config.otlp_endpoint),
-        RawBodyDirectory::new(PathBuf::from(&config.raw_body_directory)),
+        config.otlp_endpoint.to_core(),
+        config.raw_body_directory.to_core(),
     )
     .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
     let prepared_config = prepare_codex_telemetry_config(config, pending_setup_config.config())?;
@@ -174,7 +191,7 @@ fn prepare_codex_telemetry_config(
     config: KvasirHarnessTelemetrySetup,
     setup_config: &SetupConfig,
 ) -> Result<PreparedCodexTelemetryConfig, KvasirClientError> {
-    let codex_config_path = PathBuf::from(config.codex_config_path);
+    let codex_config_path = config.codex_config_path.into_path_buf();
     if let Some(parent) = codex_config_path.parent() {
         fs::create_dir_all(parent).map_err(|_| KvasirClientError::Filesystem)?;
     }
@@ -205,6 +222,89 @@ fn prepare_codex_telemetry_config(
         temp_path,
         previous_config: existing_config,
     })
+}
+
+impl KvasirCodexConfigPath {
+    fn into_path_buf(self) -> PathBuf {
+        PathBuf::from(self.0)
+    }
+
+    #[cfg(test)]
+    fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl From<String> for KvasirCodexConfigPath {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<KvasirCodexConfigPath> for String {
+    fn from(value: KvasirCodexConfigPath) -> Self {
+        value.0
+    }
+}
+
+impl AsRef<Path> for KvasirCodexConfigPath {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl KvasirClaudeSettingsPath {
+    fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl From<String> for KvasirClaudeSettingsPath {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<KvasirClaudeSettingsPath> for String {
+    fn from(value: KvasirClaudeSettingsPath) -> Self {
+        value.0
+    }
+}
+
+impl KvasirRawBodyDirectory {
+    fn to_core(&self) -> RawBodyDirectory {
+        RawBodyDirectory::new(PathBuf::from(&self.0))
+    }
+}
+
+impl From<String> for KvasirRawBodyDirectory {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<KvasirRawBodyDirectory> for String {
+    fn from(value: KvasirRawBodyDirectory) -> Self {
+        value.0
+    }
+}
+
+impl KvasirOtlpEndpoint {
+    fn to_core(&self) -> KvasirEndpoint {
+        KvasirEndpoint::new(self.0.clone())
+    }
+}
+
+impl From<String> for KvasirOtlpEndpoint {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<KvasirOtlpEndpoint> for String {
+    fn from(value: KvasirOtlpEndpoint) -> Self {
+        value.0
+    }
 }
 
 impl PreviousCodexConfig {
@@ -365,18 +465,14 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::default();
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: temp.path().join(".codex/config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(temp.path().join(".codex/config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
 
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
-        let generated = fs::read_to_string(&config.codex_config_path)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
 
         assert!(generated.contains("[otel]"));
         assert!(generated.contains("http://127.0.0.1:4318/v1/metrics"));
@@ -393,7 +489,10 @@ mod tests {
         assert!(generated.contains(&format!("Bearer {token}")));
 
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
-        assert_eq!(fs::read_to_string(&config.codex_config_path)?, generated);
+        assert_eq!(
+            fs::read_to_string(config.codex_config_path.as_path())?,
+            generated
+        );
 
         Ok(())
     }
@@ -404,18 +503,14 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::default();
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: temp.path().join(".codex/config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(temp.path().join(".codex/config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
         fs::create_dir_all(temp.path().join(".codex"))?;
         fs::write(
-            &config.codex_config_path,
+            config.codex_config_path.as_path(),
             r#"  # BEGIN KVASIR MANAGED CODEX OTEL
 [otel]
 metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", protocol = "binary" } }
@@ -439,16 +534,12 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::default();
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: temp.path().join(".codex").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(temp.path().join(".codex")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
-        fs::create_dir(&config.codex_config_path)?;
+        fs::create_dir(config.codex_config_path.as_path())?;
 
         let error =
             configure_kvasir_harness_telemetry_with_credential(config, &credential).unwrap_err();
@@ -468,24 +559,20 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let codex_dir = temp.path().join(".codex");
         fs::create_dir_all(&codex_dir)?;
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: codex_dir.join("config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(codex_dir.join("config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
         let existing_config = "model = \"gpt-5\"\n";
-        fs::write(&config.codex_config_path, existing_config)?;
+        fs::write(config.codex_config_path.as_path(), existing_config)?;
 
         let error = configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)
             .unwrap_err();
 
         assert!(matches!(error, KvasirClientError::HarnessTelemetrySetup));
         assert_eq!(
-            fs::read_to_string(&config.codex_config_path)?,
+            fs::read_to_string(config.codex_config_path.as_path())?,
             existing_config
         );
         assert_eq!(*credential.write_count.borrow(), 1);
@@ -501,21 +588,17 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::default();
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: temp.path().join(".codex/config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(temp.path().join(".codex/config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
         let previous_password = credential.password.borrow().clone();
-        let previous_config = fs::read_to_string(&config.codex_config_path)?;
+        let previous_config = fs::read_to_string(config.codex_config_path.as_path())?;
 
         let updated_config = KvasirHarnessTelemetrySetup {
-            otlp_endpoint: "http://127.0.0.1:9999".to_owned(),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:9999"),
             ..config.clone()
         };
         let error = configure_kvasir_harness_telemetry_with_credential_and_install_hook(
@@ -534,7 +617,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         assert!(matches!(error, KvasirClientError::Filesystem));
         assert_eq!(*credential.password.borrow(), previous_password);
         assert_eq!(
-            fs::read_to_string(&config.codex_config_path)?,
+            fs::read_to_string(config.codex_config_path.as_path())?,
             previous_config
         );
 
@@ -547,19 +630,15 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::failing_on_write_number(3);
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: temp.path().join(".codex/config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(temp.path().join(".codex/config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
 
         let updated_config = KvasirHarnessTelemetrySetup {
-            otlp_endpoint: "http://127.0.0.1:9999".to_owned(),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:9999"),
             ..config
         };
         let error = configure_kvasir_harness_telemetry_with_credential_and_install_hook(
@@ -606,20 +685,16 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let codex_dir = temp.path().join(".codex");
         fs::create_dir_all(&codex_dir)?;
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: codex_dir.join("config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(codex_dir.join("config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
-        fs::write(&config.codex_config_path, "model = \"gpt-5\"\n")?;
+        fs::write(config.codex_config_path.as_path(), "model = \"gpt-5\"\n")?;
 
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
 
-        let generated = fs::read_to_string(&config.codex_config_path)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
         assert!(generated.contains("model = \"gpt-5\""));
         assert!(generated.contains("[otel]"));
         assert_eq!(temporary_file_count(&codex_dir)?, 0);
@@ -635,19 +710,15 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::default();
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: temp.path().join(".codex/config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(temp.path().join(".codex/config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
 
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
 
-        let mode = fs::metadata(&config.codex_config_path)?
+        let mode = fs::metadata(config.codex_config_path.as_path())?
             .permissions()
             .mode()
             & 0o777;
@@ -665,27 +736,42 @@ metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", p
         let codex_dir = temp.path().join(".codex");
         fs::create_dir_all(&codex_dir)?;
         let config = KvasirHarnessTelemetrySetup {
-            codex_config_path: codex_dir.join("config.toml").display().to_string(),
-            claude_settings_path: temp
-                .path()
-                .join(".claude/settings.json")
-                .display()
-                .to_string(),
-            raw_body_directory: temp.path().join("raw-bodies").display().to_string(),
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            codex_config_path: codex_config_path(codex_dir.join("config.toml")),
+            claude_settings_path: claude_settings_path(temp.path().join(".claude/settings.json")),
+            raw_body_directory: raw_body_directory(temp.path().join("raw-bodies")),
+            otlp_endpoint: otlp_endpoint("http://127.0.0.1:4318"),
         };
-        fs::write(&config.codex_config_path, "model = \"gpt-5\"\n")?;
-        fs::set_permissions(&config.codex_config_path, fs::Permissions::from_mode(0o600))?;
+        fs::write(config.codex_config_path.as_path(), "model = \"gpt-5\"\n")?;
+        fs::set_permissions(
+            config.codex_config_path.as_path(),
+            fs::Permissions::from_mode(0o600),
+        )?;
 
         configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
 
-        let mode = fs::metadata(&config.codex_config_path)?
+        let mode = fs::metadata(config.codex_config_path.as_path())?
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
 
         Ok(())
+    }
+
+    fn codex_config_path(path: impl AsRef<Path>) -> KvasirCodexConfigPath {
+        KvasirCodexConfigPath(path.as_ref().display().to_string())
+    }
+
+    fn claude_settings_path(path: impl AsRef<Path>) -> KvasirClaudeSettingsPath {
+        KvasirClaudeSettingsPath(path.as_ref().display().to_string())
+    }
+
+    fn raw_body_directory(path: impl AsRef<Path>) -> KvasirRawBodyDirectory {
+        KvasirRawBodyDirectory(path.as_ref().display().to_string())
+    }
+
+    fn otlp_endpoint(endpoint: &str) -> KvasirOtlpEndpoint {
+        KvasirOtlpEndpoint(endpoint.to_owned())
     }
 
     fn temporary_file_count(directory: &Path) -> Result<usize, Box<dyn std::error::Error>> {

@@ -7,22 +7,55 @@ import kvasir_client
 
 enum ProductionModelFactory {
     @MainActor
-    static func make() -> KvasirViewerModel {
+    static func make(
+        overviewClient: (any OverviewClient)? = nil,
+        daemonStarter: any DaemonProcessStarter = BundledDaemonProcess.shared,
+        daemonFallbackGate: DaemonFallbackGate = DaemonFallbackGate(),
+        shouldStartBundledDaemonAfterOverviewError: @escaping @Sendable (any Error) -> Bool =
+            ProductionModelFactory.shouldStartBundledDaemonAfterOverviewError
+    ) -> KvasirViewerModel {
         KvasirViewerModel(
-            dashboard: OverviewDashboard(client: makeOverviewClient()),
+            dashboard: OverviewDashboard(
+                client: makeOverviewClient(
+                    primary: overviewClient,
+                    starter: daemonStarter,
+                    shouldStartDaemonAfterError: { error in
+                        daemonFallbackGate.isEnabled && shouldStartBundledDaemonAfterOverviewError(error)
+                    }
+                )
+            ),
             telemetrySetup: makeHarnessTelemetrySetup(),
             launchAgent: DaemonLaunchAgent(),
-            shouldRefreshLaunchAgentAfterStartupOverviewError: shouldRefreshLaunchAgentAfterStartupOverviewError
+            shouldRefreshLaunchAgentAfterStartupOverviewError: shouldRefreshLaunchAgentAfterStartupOverviewError,
+            enablePostStartupOverviewRecovery: {
+                daemonFallbackGate.enable()
+            }
         )
     }
 
     @MainActor
-    private static func makeOverviewClient() -> any OverviewClient {
+    private static func makeOverviewClient(
+        primary: (any OverviewClient)?,
+        starter: any DaemonProcessStarter,
+        shouldStartDaemonAfterError: @escaping @Sendable (any Error) -> Bool
+    ) -> any OverviewClient {
+        if let primary {
+            return DaemonFallbackOverviewClient(
+                primary: primary,
+                starter: starter,
+                shouldStartDaemonAfterError: shouldStartDaemonAfterError
+            )
+        }
         #if canImport(kvasir_client)
-        return OverviewSocketClient(
+        let socketClient = OverviewSocketClient(
             source: KvasirClientRollupSource(
                 socketPath: rpcSocketPath
             )
+        )
+        return DaemonFallbackOverviewClient(
+            primary: socketClient,
+            starter: starter,
+            shouldStartDaemonAfterError: shouldStartDaemonAfterError
         )
         #else
         return MissingKvasirClient()
@@ -53,25 +86,70 @@ enum ProductionModelFactory {
     }
 
     private static var harnessTelemetrySetupConfig: HarnessTelemetrySetupConfig {
+        resolvedHarnessTelemetrySetupConfig(environment: ProcessInfo.processInfo.environment)
+    }
+
+    static func resolvedHarnessTelemetrySetupConfig(
+        environment: [String: String]
+    ) -> HarnessTelemetrySetupConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return HarnessTelemetrySetupConfig(
             codexConfigPath: home
                 .appendingPathComponent(".codex", isDirectory: true)
                 .appendingPathComponent("config.toml")
                 .path,
-            claudeSettingsPath: home
-                .appendingPathComponent(".claude", isDirectory: true)
-                .appendingPathComponent("settings.json")
-                .path,
-            rawBodyDirectory: applicationSupportDirectory
-                .appendingPathComponent("dev.kvasir", isDirectory: true)
-                .appendingPathComponent("raw-bodies", isDirectory: true)
-                .path,
-            otlpEndpoint: "http://127.0.0.1:4318"
+            claudeSettingsPath: claudeSettingsPath(environment: environment, home: home),
+            rawBodyDirectory: rawBodyDirectory(environment: environment).path,
+            otlpEndpoint: otlpEndpoint(environment: environment)
         )
     }
 
+    private static func claudeSettingsPath(environment: [String: String], home: URL) -> String {
+        if let settingsPath = nonEmptyEnvironmentValue("KVASIR_SETUP_SETTINGS", in: environment) {
+            return URL(fileURLWithPath: settingsPath).path
+        }
+        return home
+            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent("settings.json")
+            .path
+    }
+
+    private static func rawBodyDirectory(environment: [String: String]) -> URL {
+        if let dataDirectory = nonEmptyEnvironmentValue("KVASIR_DATA_DIR", in: environment) {
+            return URL(fileURLWithPath: dataDirectory, isDirectory: true)
+                .appendingPathComponent("raw-bodies", isDirectory: true)
+        }
+        return applicationSupportDirectory
+            .appendingPathComponent("dev.kvasir", isDirectory: true)
+            .appendingPathComponent("raw-bodies", isDirectory: true)
+    }
+
+    private static func otlpEndpoint(environment: [String: String]) -> String {
+        if let bind = nonEmptyEnvironmentValue("KVASIR_OTLP_BIND", in: environment) {
+            return "http://\(bind)"
+        }
+        return "http://127.0.0.1:4318"
+    }
+
+    private static func nonEmptyEnvironmentValue(
+        _ name: String,
+        in environment: [String: String]
+    ) -> String? {
+        guard let value = environment[name], !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
     private static func shouldRefreshLaunchAgentAfterStartupOverviewError(_ error: any Error) -> Bool {
+        isRecoverableOverviewTransportFailure(error)
+    }
+
+    private static var shouldStartBundledDaemonAfterOverviewError: @Sendable (any Error) -> Bool {
+        { error in isRecoverableOverviewTransportFailure(error) }
+    }
+
+    private static func isRecoverableOverviewTransportFailure(_ error: any Error) -> Bool {
         #if canImport(kvasir_client)
         guard let clientError = error as? KvasirClientError else {
             return false

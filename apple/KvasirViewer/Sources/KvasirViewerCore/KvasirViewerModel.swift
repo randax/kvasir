@@ -46,6 +46,7 @@ public final class KvasirViewerModel: ObservableObject {
     private let telemetrySetup: any HarnessTelemetrySetup
     private let launchAgent: DaemonLaunchAgent
     private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
+    private let enablePostStartupOverviewRecovery: @Sendable () -> Void
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
@@ -55,6 +56,7 @@ public final class KvasirViewerModel: ObservableObject {
         telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
         launchAgent: DaemonLaunchAgent,
         shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
+        enablePostStartupOverviewRecovery: @escaping @Sendable () -> Void = {},
         selectedRangePreset: OverviewRangePreset = .lastSevenDays,
         now: @escaping () -> Date = Date.init,
         calendar: Calendar = .kvasirRollupUTC
@@ -63,6 +65,7 @@ public final class KvasirViewerModel: ObservableObject {
         self.telemetrySetup = telemetrySetup
         self.launchAgent = launchAgent
         self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
+        self.enablePostStartupOverviewRecovery = enablePostStartupOverviewRecovery
         self.selectedRangePreset = selectedRangePreset
         self.now = now
         self.calendar = calendar
@@ -78,12 +81,14 @@ public final class KvasirViewerModel: ObservableObject {
         launchAgentOutcome = try launchAgent.ensureRegistered()
         do {
             try await refreshOverview()
+            enablePostStartupOverviewRecovery()
         } catch {
             guard launchAgentOutcome != .requiresApproval,
                   shouldRefreshLaunchAgentAfterStartupOverviewError(error) else {
                 throw error
             }
             launchAgentOutcome = try launchAgent.refreshRegistration()
+            enablePostStartupOverviewRecovery()
             try await refreshOverview()
         }
     }
