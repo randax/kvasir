@@ -286,6 +286,12 @@ impl PendingSetupConfig {
         &self.config
     }
 
+    pub fn credential_is_unchanged(&self) -> bool {
+        self.previous_encoded_secrets
+            .as_deref()
+            .is_some_and(|previous| previous == self.encoded_secrets.as_str())
+    }
+
     pub fn commit(
         self,
         credential: &dyn SetupCredential,

@@ -9,7 +9,9 @@ pub use client::{KvasirClient, KvasirTokenRollupSubscription};
 pub use error::KvasirClientError;
 pub use setup::{
     KvasirClaudeSettingsPath, KvasirCodexConfigPath, KvasirHarnessTelemetrySetup,
-    KvasirOtlpEndpoint, KvasirRawBodyDirectory, configure_kvasir_harness_telemetry,
+    KvasirOpenCodeConfigPath, KvasirOpenCodeEnvPath, KvasirOtlpEndpoint, KvasirRawBodyDirectory,
+    KvasirRepoHookPath, KvasirShellProfilePath, configure_kvasir_harness_telemetry,
+    uninstall_kvasir_harness_telemetry,
 };
 pub use types::{
     KvasirBearerToken, KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,

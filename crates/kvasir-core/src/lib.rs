@@ -14,8 +14,9 @@ pub use rpc::BearerToken;
 pub use setup::{
     ClaudeCodeSettings, CodexConfigToml, CommittedSetupConfig, CopilotShellProfile,
     KeychainSetupSecretSource, KvasirEndpoint, OpenCodeEnvironment, OpenCodeEnvironmentVariable,
-    OpenCodeEnvironmentVariableKey, OpenCodeSetup, RawBodyDirectory, SetupConfig, SetupCredential,
-    SetupError, SetupSecretSource, prepare_setup_config, resolve_setup_config,
+    OpenCodeEnvironmentVariableKey, OpenCodeSetup, RawBodyDirectory, RepoInjectionShell,
+    RepoInjectionShellHook, RepoInjectionShellProfile, SetupConfig, SetupCredential, SetupError,
+    SetupSecretSource, prepare_setup_config, resolve_setup_config,
 };
 pub use store::{StoreKey, StoreKeyError, UsageStore};
 pub use usage::{

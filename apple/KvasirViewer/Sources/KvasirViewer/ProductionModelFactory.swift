@@ -100,6 +100,27 @@ enum ProductionModelFactory {
                 .appendingPathComponent("config.toml")
                 .path,
             claudeSettingsPath: claudeSettingsPath(environment: environment, home: home),
+            copilotProfilePath: home.appendingPathComponent(".profile").path,
+            opencodeConfigPath: home
+                .appendingPathComponent(".config", isDirectory: true)
+                .appendingPathComponent("opencode", isDirectory: true)
+                .appendingPathComponent("opencode.json")
+                .path,
+            opencodeEnvPath: home
+                .appendingPathComponent(".config", isDirectory: true)
+                .appendingPathComponent("opencode", isDirectory: true)
+                .appendingPathComponent("kvasir.env")
+                .path,
+            zshProfilePath: home.appendingPathComponent(".zshrc").path,
+            bashProfilePath: home.appendingPathComponent(".bashrc").path,
+            zshRepoHookPath: home
+                .appendingPathComponent(".kvasir", isDirectory: true)
+                .appendingPathComponent("repo-hook.zsh")
+                .path,
+            bashRepoHookPath: home
+                .appendingPathComponent(".kvasir", isDirectory: true)
+                .appendingPathComponent("repo-hook.bash")
+                .path,
             rawBodyDirectory: rawBodyDirectory(environment: environment).path,
             otlpEndpoint: otlpEndpoint(environment: environment)
         )
@@ -172,6 +193,13 @@ enum ProductionModelFactory {
 struct HarnessTelemetrySetupConfig: Sendable {
     let codexConfigPath: String
     let claudeSettingsPath: String
+    let copilotProfilePath: String
+    let opencodeConfigPath: String
+    let opencodeEnvPath: String
+    let zshProfilePath: String
+    let bashProfilePath: String
+    let zshRepoHookPath: String
+    let bashRepoHookPath: String
     let rawBodyDirectory: String
     let otlpEndpoint: String
 }
@@ -186,6 +214,13 @@ struct KvasirClientHarnessTelemetrySetup: HarnessTelemetrySetup {
                 config: KvasirHarnessTelemetrySetup(
                     codexConfigPath: config.codexConfigPath,
                     claudeSettingsPath: config.claudeSettingsPath,
+                    copilotProfilePath: config.copilotProfilePath,
+                    opencodeConfigPath: config.opencodeConfigPath,
+                    opencodeEnvPath: config.opencodeEnvPath,
+                    zshProfilePath: config.zshProfilePath,
+                    bashProfilePath: config.bashProfilePath,
+                    zshRepoHookPath: config.zshRepoHookPath,
+                    bashRepoHookPath: config.bashRepoHookPath,
                     rawBodyDirectory: config.rawBodyDirectory,
                     otlpEndpoint: config.otlpEndpoint
                 )

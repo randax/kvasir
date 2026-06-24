@@ -18,6 +18,8 @@ pub enum KvasirClientError {
     HarnessTelemetryRollback,
     #[error("harness telemetry setup state is unknown")]
     HarnessTelemetryStateUnknown,
+    #[error("harness telemetry uninstall would overwrite user changes")]
+    HarnessTelemetryUninstallConflict,
     #[error("filesystem operation failed")]
     Filesystem,
 }
