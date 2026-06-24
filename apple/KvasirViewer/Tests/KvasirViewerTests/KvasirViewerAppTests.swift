@@ -24,6 +24,49 @@ func productionViewerTargetBuildsOverviewScreenAndFactoryModel() async throws {
     #endif
 }
 
+@Test
+func overviewScreenCostPresentationCarriesVisibleEstimateMarkers() {
+    let snapshot = OverviewSnapshot(
+        totals: .init(totalTokens: 30, costUsdNanos: 9_000, costSource: .mixed, toolCalls: 1),
+        series: [
+            .init(
+                day: .init(year: 2026, month: 6, day: 20),
+                totalTokens: 10,
+                costUsdNanos: 2_000,
+                costSource: .native,
+                toolCalls: 0
+            ),
+            .init(
+                day: .init(year: 2026, month: 6, day: 21),
+                totalTokens: 20,
+                costUsdNanos: 7_000,
+                costSource: .estimated,
+                toolCalls: 1
+            ),
+        ],
+        repoBreakdown: [
+            .init(
+                repo: .noRepo,
+                totals: .init(totalTokens: 30, costUsdNanos: 9_000, costSource: .mixed, toolCalls: 1)
+            )
+        ],
+        modelBreakdown: [
+            .init(
+                model: OverviewModelName("claude-sonnet-4"),
+                totals: .init(totalTokens: 30, costUsdNanos: 9_000, costSource: .estimated, toolCalls: 0)
+            )
+        ],
+        selectedRepo: nil
+    )
+
+    let presentation = OverviewScreen.costDashboardPresentation(for: snapshot)
+
+    #expect(presentation.total.estimateLabel == "Partly estimated")
+    #expect(presentation.series.map(\.chartMarkerLabel) == [nil, "Est."])
+    #expect(presentation.repos.map(\.estimateLabel) == ["Partly estimated"])
+    #expect(presentation.models.map(\.estimateLabel) == ["Estimated"])
+}
+
 #if canImport(kvasir_client)
 @Test
 func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
@@ -31,25 +74,41 @@ func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
     let model = "claude-sonnet-4-20250514"
     let mapped = overviewSnapshotFromKvasir(
         KvasirOverviewSnapshot(
-            totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3),
+            totals: KvasirOverviewTotals(
+                totalTokens: 13,
+                costUsdNanos: 21,
+                costSource: .estimated,
+                toolCalls: 3
+            ),
             series: [
                 KvasirOverviewSeriesPoint(
                     day: KvasirRollupDay(year: 2026, month: 6, day: 24),
                     totalTokens: 13,
                     costUsdNanos: 21,
+                    costSource: .estimated,
                     toolCalls: 3
                 )
             ],
             repoBreakdown: [
                 KvasirOverviewRepoSummary(
                     repo: repo,
-                    totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3)
+                    totals: KvasirOverviewTotals(
+                        totalTokens: 13,
+                        costUsdNanos: 21,
+                        costSource: .estimated,
+                        toolCalls: 3
+                    )
                 )
             ],
             modelBreakdown: [
                 KvasirOverviewModelSummary(
                     model: model,
-                    totals: KvasirOverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 0)
+                    totals: KvasirOverviewTotals(
+                        totalTokens: 13,
+                        costUsdNanos: 21,
+                        costSource: .estimated,
+                        toolCalls: 0
+                    )
                 )
             ],
             selectedRepo: repo,
@@ -64,25 +123,41 @@ func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
     )
 
     #expect(mapped == OverviewSnapshot(
-        totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3),
+        totals: OverviewTotals(
+            totalTokens: 13,
+            costUsdNanos: 21,
+            costSource: .estimated,
+            toolCalls: 3
+        ),
         series: [
             OverviewSeriesPoint(
                 day: OverviewRollupDay(year: 2026, month: 6, day: 24),
                 totalTokens: 13,
                 costUsdNanos: 21,
+                costSource: .estimated,
                 toolCalls: 3
             )
         ],
         repoBreakdown: [
             OverviewRepoSummary(
                 repo: expectedRepo,
-                totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 3)
+                totals: OverviewTotals(
+                    totalTokens: 13,
+                    costUsdNanos: 21,
+                    costSource: .estimated,
+                    toolCalls: 3
+                )
             )
         ],
         modelBreakdown: [
             OverviewModelSummary(
                 model: OverviewModelName(model),
-                totals: OverviewTotals(totalTokens: 13, costUsdNanos: 21, toolCalls: 0)
+                totals: OverviewTotals(
+                    totalTokens: 13,
+                    costUsdNanos: 21,
+                    costSource: .estimated,
+                    toolCalls: 0
+                )
             )
         ],
         selectedRepo: expectedRepo,
@@ -91,16 +166,104 @@ func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
 }
 
 @Test
+func kvasirOverviewSnapshotMappingPreservesCostSourceVariants() {
+    let nativeRepo = KvasirRepoBucket(kind: .repo, name: "native", path: "/repos/native")
+    let mixedRepo = KvasirRepoBucket(kind: .repo, name: "mixed", path: "/repos/mixed")
+    let mapped = overviewSnapshotFromKvasir(
+        KvasirOverviewSnapshot(
+            totals: KvasirOverviewTotals(
+                totalTokens: 30,
+                costUsdNanos: 9_000,
+                costSource: .mixed,
+                toolCalls: 1
+            ),
+            series: [
+                KvasirOverviewSeriesPoint(
+                    day: KvasirRollupDay(year: 2026, month: 6, day: 20),
+                    totalTokens: 10,
+                    costUsdNanos: 2_000,
+                    costSource: .native,
+                    toolCalls: 0
+                ),
+                KvasirOverviewSeriesPoint(
+                    day: KvasirRollupDay(year: 2026, month: 6, day: 21),
+                    totalTokens: 20,
+                    costUsdNanos: 7_000,
+                    costSource: .mixed,
+                    toolCalls: 1
+                ),
+                KvasirOverviewSeriesPoint(
+                    day: KvasirRollupDay(year: 2026, month: 6, day: 22),
+                    totalTokens: 0,
+                    costUsdNanos: 0,
+                    costSource: nil,
+                    toolCalls: 0
+                ),
+            ],
+            repoBreakdown: [
+                KvasirOverviewRepoSummary(
+                    repo: nativeRepo,
+                    totals: KvasirOverviewTotals(
+                        totalTokens: 10,
+                        costUsdNanos: 2_000,
+                        costSource: .native,
+                        toolCalls: 0
+                    )
+                ),
+                KvasirOverviewRepoSummary(
+                    repo: mixedRepo,
+                    totals: KvasirOverviewTotals(
+                        totalTokens: 20,
+                        costUsdNanos: 7_000,
+                        costSource: .mixed,
+                        toolCalls: 1
+                    )
+                ),
+            ],
+            modelBreakdown: [
+                KvasirOverviewModelSummary(
+                    model: "claude-opus-4",
+                    totals: KvasirOverviewTotals(
+                        totalTokens: 10,
+                        costUsdNanos: 2_000,
+                        costSource: .native,
+                        toolCalls: 0
+                    )
+                ),
+                KvasirOverviewModelSummary(
+                    model: "claude-sonnet-4",
+                    totals: KvasirOverviewTotals(
+                        totalTokens: 20,
+                        costUsdNanos: 7_000,
+                        costSource: nil,
+                        toolCalls: 0
+                    )
+                ),
+            ],
+            selectedRepo: mixedRepo,
+            selectedModel: "claude-sonnet-4"
+        )
+    )
+
+    #expect(mapped.totals.costSource == .mixed)
+    #expect(mapped.series.map(\.costSource) == [.native, .mixed, nil])
+    #expect(mapped.repoBreakdown.map(\.totals.costSource) == [.native, .mixed])
+    #expect(mapped.modelBreakdown.map(\.totals.costSource) == [.native, nil])
+    #expect(mapped.selectedRepo?.displayName == "mixed")
+    #expect(mapped.selectedModel == OverviewModelName("claude-sonnet-4"))
+}
+
+@Test
 func kvasirOverviewSnapshotMappingNormalizesInvalidRepoBuckets() {
     let invalidRepo = KvasirRepoBucket(kind: .repo, name: nil, path: nil)
     let mapped = overviewSnapshotFromKvasir(
         KvasirOverviewSnapshot(
-            totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, toolCalls: 3),
+            totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, costSource: nil, toolCalls: 3),
             series: [],
             repoBreakdown: [
                 KvasirOverviewRepoSummary(
                     repo: invalidRepo,
-                    totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, toolCalls: 3)
+                    totals: KvasirOverviewTotals(totalTokens: 1, costUsdNanos: 2, costSource: nil, toolCalls: 3)
                 )
             ],
             modelBreakdown: [],
