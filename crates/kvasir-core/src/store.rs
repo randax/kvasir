@@ -514,6 +514,9 @@ impl UsageStore {
     }
 
     pub fn token_rollups(&self, query: RollupQuery) -> Result<Vec<TokenRollup>, StoreError> {
+        if query.harness.is_some() || query.has_deep_scope() {
+            return Ok(Vec::new());
+        }
         let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
@@ -625,6 +628,9 @@ impl UsageStore {
     }
 
     pub fn cost_rollups(&self, query: CostRollupQuery) -> Result<Vec<CostRollup>, StoreError> {
+        if query.harness.is_some() || query.has_deep_scope() {
+            return Ok(Vec::new());
+        }
         let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
@@ -690,6 +696,9 @@ impl UsageStore {
         &self,
         query: ToolCallRollupQuery,
     ) -> Result<Vec<ToolCallRollup>, StoreError> {
+        if query.has_deep_scope() {
+            return Ok(Vec::new());
+        }
         if query.model.is_some() {
             return Ok(Vec::new());
         }
@@ -707,6 +716,7 @@ impl UsageStore {
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let start_day = query.start.day().as_date().to_string();
         let end_day = query.end.day().as_date().to_string();
         let mut statement = self.connection.prepare(
@@ -723,6 +733,7 @@ impl UsageStore {
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
              ORDER BY day, repo_bucket, repo_name, repo_path, harness, tool_name",
         )?;
         let rows = statement.query_map(
@@ -732,6 +743,7 @@ impl UsageStore {
                 repo_name_filter,
                 repo_path_filter,
                 repo_bucket_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -767,6 +779,7 @@ impl UsageStore {
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let mut statement = self.connection.prepare(
             "SELECT
                 day,
@@ -781,6 +794,7 @@ impl UsageStore {
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
              GROUP BY day, repo_bucket, repo_name, repo_path, harness, tool_name
              ORDER BY day, repo_bucket, repo_name, repo_path, harness, tool_name",
         )?;
@@ -791,6 +805,7 @@ impl UsageStore {
                 repo_name_filter,
                 repo_path_filter,
                 repo_bucket_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;

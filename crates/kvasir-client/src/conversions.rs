@@ -36,6 +36,16 @@ impl TryFrom<KvasirRollupQuery> for RollupQuery {
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
         }
+        if let Some(prompt) = query.prompt {
+            core_query = core_query
+                .with_harness(prompt.session.harness.into_core())
+                .with_session(prompt.session.session_id.into_core())
+                .with_prompt(prompt.prompt_id.into_core());
+        } else if let Some(session) = query.session {
+            core_query = core_query
+                .with_harness(session.harness.into_core())
+                .with_session(session.session_id.into_core());
+        }
         Ok(core_query)
     }
 }
@@ -54,6 +64,16 @@ impl TryFrom<KvasirRollupQuery> for CostRollupQuery {
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
         }
+        if let Some(prompt) = query.prompt {
+            core_query = core_query
+                .with_harness(prompt.session.harness.into_core())
+                .with_session(prompt.session.session_id.into_core())
+                .with_prompt(prompt.prompt_id.into_core());
+        } else if let Some(session) = query.session {
+            core_query = core_query
+                .with_harness(session.harness.into_core())
+                .with_session(session.session_id.into_core());
+        }
         Ok(core_query)
     }
 }
@@ -71,6 +91,16 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
         }
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
+        }
+        if let Some(prompt) = query.prompt {
+            core_query = core_query
+                .with_harness(prompt.session.harness.into_core())
+                .with_session(prompt.session.session_id.into_core())
+                .with_prompt(prompt.prompt_id.into_core());
+        } else if let Some(session) = query.session {
+            core_query = core_query
+                .with_harness(session.harness.into_core())
+                .with_session(session.session_id.into_core());
         }
         Ok(core_query)
     }
@@ -377,4 +407,47 @@ fn rollup_day_from_core(
         month: u8::try_from(date.month()).map_err(|_| KvasirClientError::InvalidQuery)?,
         day: u8::try_from(date.day()).map_err(|_| KvasirClientError::InvalidQuery)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        KvasirHarnessName, KvasirOverviewPromptRoute, KvasirOverviewSessionRoute, KvasirPromptId,
+        KvasirSessionId,
+    };
+
+    #[test]
+    fn overview_deep_scope_conversions_preserve_harness_identity() {
+        let session = KvasirOverviewSessionRoute {
+            harness: KvasirHarnessName::try_from("GitHub-Copilot".to_owned()).unwrap(),
+            session_id: KvasirSessionId::try_from("session-12".to_owned()).unwrap(),
+        };
+        let prompt = KvasirOverviewPromptRoute {
+            session: session.clone(),
+            prompt_id: KvasirPromptId::try_from("prompt-7".to_owned()).unwrap(),
+        };
+        let query = KvasirRollupQuery {
+            start: KvasirTimestampMillis { value: 10 },
+            end: KvasirTimestampMillis { value: 20 },
+            repo: None,
+            model: None,
+            session: Some(session),
+            prompt: Some(prompt),
+        };
+
+        let token_query = RollupQuery::try_from(query.clone()).unwrap();
+        let cost_query = CostRollupQuery::try_from(query.clone()).unwrap();
+        let tool_query = ToolCallRollupQuery::try_from(query).unwrap();
+
+        assert_eq!(token_query.harness.unwrap().as_str(), "github_copilot");
+        assert_eq!(token_query.session_id.unwrap().as_str(), "session-12");
+        assert_eq!(token_query.prompt_id.unwrap().as_str(), "prompt-7");
+        assert_eq!(cost_query.harness.unwrap().as_str(), "github_copilot");
+        assert_eq!(cost_query.session_id.unwrap().as_str(), "session-12");
+        assert_eq!(cost_query.prompt_id.unwrap().as_str(), "prompt-7");
+        assert_eq!(tool_query.harness.unwrap().as_str(), "github_copilot");
+        assert_eq!(tool_query.session_id.unwrap().as_str(), "session-12");
+        assert_eq!(tool_query.prompt_id.unwrap().as_str(), "prompt-7");
+    }
 }

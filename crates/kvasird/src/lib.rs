@@ -1000,13 +1000,19 @@ fn overview_rollups(
             start: query.start,
             end: query.end,
             repo: query.repo.clone(),
+            harness: query.harness.clone(),
             model: query.model.clone(),
+            session_id: query.session_id.clone(),
+            prompt_id: query.prompt_id.clone(),
         })?,
         tool_call_rollups: store.tool_call_rollups(ToolCallRollupQuery {
             start: query.start,
             end: query.end,
             repo: query.repo,
+            harness: query.harness,
             model: query.model,
+            session_id: query.session_id,
+            prompt_id: query.prompt_id,
         })?,
     })
 }

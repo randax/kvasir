@@ -274,7 +274,13 @@ pub struct RollupQuery {
     pub end: TimestampMillis,
     pub repo: Option<RepoBucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<PromptId>,
 }
 
 impl RollupQuery {
@@ -283,7 +289,10 @@ impl RollupQuery {
             start,
             end,
             repo: None,
+            harness: None,
             model: None,
+            session_id: None,
+            prompt_id: None,
         }
     }
 
@@ -300,6 +309,31 @@ impl RollupQuery {
             ..self
         }
     }
+
+    pub fn with_harness(self, harness: HarnessName) -> Self {
+        Self {
+            harness: Some(harness),
+            ..self
+        }
+    }
+
+    pub fn with_session(self, session_id: SessionId) -> Self {
+        Self {
+            session_id: Some(session_id),
+            ..self
+        }
+    }
+
+    pub fn with_prompt(self, prompt_id: PromptId) -> Self {
+        Self {
+            prompt_id: Some(prompt_id),
+            ..self
+        }
+    }
+
+    pub fn has_deep_scope(&self) -> bool {
+        self.session_id.is_some() || self.prompt_id.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,7 +342,13 @@ pub struct CostRollupQuery {
     pub end: TimestampMillis,
     pub repo: Option<RepoBucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<PromptId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,7 +357,13 @@ pub struct ToolCallRollupQuery {
     pub end: TimestampMillis,
     pub repo: Option<RepoBucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<PromptId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,7 +386,10 @@ impl ToolCallRollupQuery {
             start,
             end,
             repo: None,
+            harness: None,
             model: None,
+            session_id: None,
+            prompt_id: None,
         }
     }
 
@@ -356,6 +405,31 @@ impl ToolCallRollupQuery {
             model: Some(model),
             ..self
         }
+    }
+
+    pub fn with_harness(self, harness: HarnessName) -> Self {
+        Self {
+            harness: Some(harness),
+            ..self
+        }
+    }
+
+    pub fn with_session(self, session_id: SessionId) -> Self {
+        Self {
+            session_id: Some(session_id),
+            ..self
+        }
+    }
+
+    pub fn with_prompt(self, prompt_id: PromptId) -> Self {
+        Self {
+            prompt_id: Some(prompt_id),
+            ..self
+        }
+    }
+
+    pub fn has_deep_scope(&self) -> bool {
+        self.session_id.is_some() || self.prompt_id.is_some()
     }
 }
 
@@ -365,7 +439,10 @@ impl CostRollupQuery {
             start,
             end,
             repo: None,
+            harness: None,
             model: None,
+            session_id: None,
+            prompt_id: None,
         }
     }
 
@@ -381,6 +458,31 @@ impl CostRollupQuery {
             model: Some(model),
             ..self
         }
+    }
+
+    pub fn with_harness(self, harness: HarnessName) -> Self {
+        Self {
+            harness: Some(harness),
+            ..self
+        }
+    }
+
+    pub fn with_session(self, session_id: SessionId) -> Self {
+        Self {
+            session_id: Some(session_id),
+            ..self
+        }
+    }
+
+    pub fn with_prompt(self, prompt_id: PromptId) -> Self {
+        Self {
+            prompt_id: Some(prompt_id),
+            ..self
+        }
+    }
+
+    pub fn has_deep_scope(&self) -> bool {
+        self.session_id.is_some() || self.prompt_id.is_some()
     }
 }
 

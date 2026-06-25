@@ -8,17 +8,20 @@ pub struct KvasirSocketPath(String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KvasirModelName(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KvasirHarnessName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirToolName(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KvasirSessionId(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KvasirPromptId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirDimensionValue(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirTraceId(String);
@@ -47,6 +50,7 @@ uniffi::custom_type!(KvasirHarnessName, String);
 uniffi::custom_type!(KvasirToolName, String);
 uniffi::custom_type!(KvasirSessionId, String);
 uniffi::custom_type!(KvasirPromptId, String);
+uniffi::custom_type!(KvasirDimensionValue, String);
 uniffi::custom_type!(KvasirTraceId, String);
 uniffi::custom_type!(KvasirSpanId, String);
 uniffi::custom_type!(KvasirSpanName, String);
@@ -86,6 +90,8 @@ pub struct KvasirRollupQuery {
     pub end: KvasirTimestampMillis,
     pub repo: Option<KvasirRepoBucket>,
     pub model: Option<KvasirModelName>,
+    pub session: Option<KvasirOverviewSessionRoute>,
+    pub prompt: Option<KvasirOverviewPromptRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -184,14 +190,62 @@ pub struct KvasirOverviewModelSummary {
     pub totals: KvasirOverviewTotals,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct KvasirOverviewSessionRoute {
+    pub harness: KvasirHarnessName,
+    pub session_id: KvasirSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct KvasirOverviewPromptRoute {
+    pub session: KvasirOverviewSessionRoute,
+    pub prompt_id: KvasirPromptId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewSessionSummary {
+    pub route: KvasirOverviewSessionRoute,
+    pub totals: KvasirOverviewTotals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewPromptSummary {
+    pub route: KvasirOverviewPromptRoute,
+    pub totals: KvasirOverviewTotals,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirOverviewDimensionKind {
+    Subagent,
+    Skill,
+    Plugin,
+    McpServer,
+    McpTool,
+    Effort,
+    Speed,
+    QuerySource,
+    AccountOrg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewDimensionFilter {
+    pub kind: KvasirOverviewDimensionKind,
+    pub value: KvasirDimensionValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirOverviewSnapshot {
     pub totals: KvasirOverviewTotals,
     pub series: Vec<KvasirOverviewSeriesPoint>,
     pub repo_breakdown: Vec<KvasirOverviewRepoSummary>,
     pub model_breakdown: Vec<KvasirOverviewModelSummary>,
+    pub session_breakdown: Vec<KvasirOverviewSessionSummary>,
+    pub prompt_breakdown: Vec<KvasirOverviewPromptSummary>,
     pub selected_repo: Option<KvasirRepoBucket>,
     pub selected_model: Option<KvasirModelName>,
+    pub selected_session: Option<KvasirOverviewSessionRoute>,
+    pub selected_prompt: Option<KvasirOverviewPromptRoute>,
+    pub dimensions: Vec<KvasirOverviewDimensionFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -391,6 +445,8 @@ impl KvasirOverviewSnapshot {
         rollup: KvasirOverviewRollup,
         selected_repo: Option<KvasirRepoBucket>,
         selected_model: Option<KvasirModelName>,
+        selected_session: Option<KvasirOverviewSessionRoute>,
+        selected_prompt: Option<KvasirOverviewPromptRoute>,
     ) -> Self {
         let mut totals = KvasirOverviewTotals::zero();
         let mut points_by_day: HashMap<KvasirRollupDay, KvasirOverviewSeriesPoint> = HashMap::new();
@@ -488,8 +544,13 @@ impl KvasirOverviewSnapshot {
             series,
             repo_breakdown,
             model_breakdown,
+            session_breakdown: Vec::new(),
+            prompt_breakdown: Vec::new(),
             selected_repo,
             selected_model,
+            selected_session,
+            selected_prompt,
+            dimensions: Vec::new(),
         }
     }
 }
@@ -655,6 +716,12 @@ impl From<KvasirPromptId> for String {
     }
 }
 
+impl From<KvasirDimensionValue> for String {
+    fn from(value: KvasirDimensionValue) -> Self {
+        value.0
+    }
+}
+
 impl From<KvasirTraceId> for String {
     fn from(value: KvasirTraceId) -> Self {
         value.0
@@ -744,6 +811,14 @@ impl TryFrom<String> for KvasirSessionId {
 }
 
 impl TryFrom<String> for KvasirPromptId {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirDimensionValue {
     type Error = KvasirClientError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -945,6 +1020,8 @@ mod tests {
             },
             Some(selected_repo.clone()),
             None,
+            None,
+            None,
         );
 
         assert_eq!(
@@ -1023,6 +1100,11 @@ mod tests {
         );
         assert_eq!(snapshot.selected_repo, Some(selected_repo));
         assert_eq!(snapshot.selected_model, None);
+        assert_eq!(snapshot.session_breakdown, Vec::new());
+        assert_eq!(snapshot.prompt_breakdown, Vec::new());
+        assert_eq!(snapshot.selected_session, None);
+        assert_eq!(snapshot.selected_prompt, None);
+        assert_eq!(snapshot.dimensions, Vec::new());
 
         Ok(())
     }
@@ -1063,6 +1145,8 @@ mod tests {
                 ],
                 tool_call_rollups: Vec::new(),
             },
+            None,
+            None,
             None,
             None,
         );
