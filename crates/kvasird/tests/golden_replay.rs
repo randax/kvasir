@@ -998,8 +998,7 @@ async fn persisted_raw_body_row_without_source_drains_import_queue() -> anyhow::
 }
 
 #[tokio::test]
-async fn unsupported_stored_raw_body_compression_does_not_delete_recoverable_source()
--> anyhow::Result<()> {
+async fn unsupported_stored_raw_body_compression_is_repaired_by_reingest() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let raw_body_dir = temp.path().join("raw-bodies");
     std::fs::create_dir_all(&raw_body_dir)?;
@@ -1010,6 +1009,7 @@ async fn unsupported_stored_raw_body_compression_does_not_delete_recoverable_sou
     initialize_test_store(&database_path)?;
     let event_key = insert_raw_body_import_queue_row(&database_path, body_ref, 1_781_956_802_180)?;
     insert_persisted_raw_body_row_for_event(&database_path, &event_key, "gzip")?;
+    delete_raw_body_import_queue_event(&database_path, &event_key)?;
 
     let daemon = start_test_daemon(DaemonConfig {
         otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -1020,16 +1020,23 @@ async fn unsupported_stored_raw_body_compression_does_not_delete_recoverable_sou
     })
     .await?;
 
-    daemon.import_available_raw_bodies_once().await?;
-
-    assert!(body_path.exists());
-    assert_eq!(
-        raw_body_import_queue_state(&database_path, body_ref)?,
-        Some((
-            "quarantined".to_owned(),
-            Some("unsupported_stored_compression".to_owned())
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw_api_body_ref_logs_fixture_with_nanos(
+            body_ref,
+            1_781_956_802_180_000_000,
         ))
-    );
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert!(!body_path.exists());
+    let raw_body_rows = persisted_raw_body_rows(&database_path)?;
+    assert_eq!(raw_body_rows.len(), 1);
+    assert_eq!(raw_body_rows[0].compression, "zstd");
+    assert!(!raw_body_import_queue_body_refs(&database_path)?.contains(&body_ref.to_owned()));
     drop(daemon);
     Ok(())
 }
@@ -3849,25 +3856,4 @@ fn delete_raw_body_import_queue_event(database_path: &Path, event_key: &str) -> 
         [event_key],
     )?;
     Ok(())
-}
-
-fn raw_body_import_queue_state(
-    database_path: &Path,
-    body_ref: &str,
-) -> anyhow::Result<Option<(String, Option<String>)>> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
-    let result = connection.query_row(
-        "SELECT state, last_failure_kind
-         FROM raw_body_import_queue
-         WHERE body_ref = ?1",
-        [body_ref],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-    );
-    match result {
-        Ok(row) => Ok(Some(row)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
 }

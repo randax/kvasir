@@ -706,7 +706,10 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
         let store = state.store.lock().await;
         store
             .raw_body_import_candidates(RAW_BODY_IMPORT_BATCH_SIZE)
-            .map_err(|_| IngestError::StoreWriteFailed)?
+            .map_err(|error| {
+                eprintln!("raw body candidate query failed: {error:?}");
+                IngestError::StoreWriteFailed
+            })?
     };
     if candidates.is_empty() {
         return Ok(false);
@@ -717,14 +720,6 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     let mut import_failures = Vec::new();
     for candidate in candidates {
         let event_key = candidate.event_key().to_owned();
-        if candidate.is_blocked_by_unsupported_compression() {
-            import_failures.push(RawBodyImportFailure {
-                event_key,
-                failure_kind: RawBodyImportFailureKind::UnsupportedStoredCompression,
-            });
-            continue;
-        }
-
         match prepare_raw_body_import_candidate(&state.raw_body_directory, candidate) {
             Ok(RawBodyImportPreparation::Prepared(prepared)) => {
                 prepared_imports.push(prepared);
@@ -757,7 +752,10 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
         let mut store = state.store.lock().await;
         store
             .commit_prepared_raw_body_imports(&prepared_imports)
-            .map_err(|_| IngestError::StoreWriteFailed)?
+            .map_err(|error| {
+                eprintln!("raw body import commit failed: {error:?}");
+                IngestError::StoreWriteFailed
+            })?
     };
     let inserted_event_keys: HashSet<String> = inserted_event_keys.into_iter().collect();
     let mut cleanup_imports = Vec::new();
@@ -789,10 +787,16 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
         let mut store = state.store.lock().await;
         store
             .complete_raw_body_imports(&completed_event_keys)
-            .map_err(|_| IngestError::StoreWriteFailed)?;
+            .map_err(|error| {
+                eprintln!("raw body import completion failed: {error:?}");
+                IngestError::StoreWriteFailed
+            })?;
         store
             .record_raw_body_import_failures(&import_failures)
-            .map_err(|_| IngestError::StoreWriteFailed)?;
+            .map_err(|error| {
+                eprintln!("raw body import failure recording failed: {error:?}");
+                IngestError::StoreWriteFailed
+            })?;
     }
 
     if stores_new_body {

@@ -67,7 +67,6 @@ struct InvalidRawBodyFileReference;
 pub struct RawBodyImportCandidate {
     record: RawBodyReferenceRecord,
     stored: bool,
-    blocked_by_unsupported_compression: bool,
 }
 
 impl RawBodyImportCandidate {
@@ -81,10 +80,6 @@ impl RawBodyImportCandidate {
 
     pub fn is_stored(&self) -> bool {
         self.stored
-    }
-
-    pub fn is_blocked_by_unsupported_compression(&self) -> bool {
-        self.blocked_by_unsupported_compression
     }
 }
 
@@ -288,7 +283,7 @@ impl UsageStore {
         let transaction = self.connection.transaction()?;
         for record in records {
             if !seen_event_keys.insert(record.event_key.as_str().to_owned())
-                || raw_body_event_exists(&transaction, record.event_key.as_str())?
+                || supported_raw_body_event_exists(&transaction, record.event_key.as_str())?
             {
                 continue;
             }
@@ -352,13 +347,7 @@ impl UsageStore {
                     FROM canonical_raw_body_records stored
                     WHERE stored.event_key = pending.event_key
                         AND stored.compression = 'zstd'
-                ) AS stored,
-                EXISTS(
-                    SELECT 1
-                    FROM canonical_raw_body_records stored
-                    WHERE stored.event_key = pending.event_key
-                        AND stored.compression != 'zstd'
-                ) AS blocked
+                ) AS stored
              FROM raw_body_import_queue pending
              WHERE pending.state = 'pending'
                 AND pending.content_kind IN ('raw_api_request', 'raw_api_response')
@@ -396,7 +385,6 @@ impl UsageStore {
                     )?,
                 },
                 stored: row.get::<_, bool>(10)?,
-                blocked_by_unsupported_compression: row.get::<_, bool>(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -437,7 +425,20 @@ impl UsageStore {
                     content_kind,
                     compression,
                     compressed_body
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'zstd', ?11)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'zstd', ?11)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    occurred_at_ms = excluded.occurred_at_ms,
+                    session_id = excluded.session_id,
+                    prompt_id = excluded.prompt_id,
+                    day = excluded.day,
+                    repo_bucket = excluded.repo_bucket,
+                    repo_name = excluded.repo_name,
+                    repo_path = excluded.repo_path,
+                    harness = excluded.harness,
+                    content_kind = excluded.content_kind,
+                    compression = excluded.compression,
+                    compressed_body = excluded.compressed_body
+                WHERE canonical_raw_body_records.compression != 'zstd'",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -2745,7 +2746,7 @@ fn raw_body_replay_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentRepl
     })
 }
 
-fn raw_body_event_exists(
+fn supported_raw_body_event_exists(
     transaction: &rusqlite::Transaction<'_>,
     event_key: &str,
 ) -> Result<bool, StoreError> {
@@ -2755,6 +2756,7 @@ fn raw_body_event_exists(
                 SELECT 1
                 FROM canonical_raw_body_records
                 WHERE event_key = ?1
+                    AND compression = 'zstd'
             )",
             params![event_key],
             |row| row.get(0),
