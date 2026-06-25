@@ -1,5 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use rusqlite::{Connection, params};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -13,12 +18,12 @@ use crate::rpc::{
     TraceQuery, TraceSpan, TraceSpanKind,
 };
 use crate::usage::{
-    ContentKind, ContentRecord, ContentText, CostUsageRecord, RepoBucket, RepoIdentity, RepoName,
-    RepoPath, TokenCount, TokenMeasure, TokenUsageKind, TokenUsageRecord, TokenUsageSignal,
-    ToolCallKind, ToolCallRecord, UsageRecords,
+    ContentKind, ContentRecord, ContentText, CostUsageRecord, RawBodyReferenceRecord, RepoBucket,
+    RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageKind, TokenUsageRecord,
+    TokenUsageSignal, ToolCallKind, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -41,6 +46,14 @@ pub enum StoreError {
         previous_value: i64,
         current_value: i64,
     },
+    #[error("raw body import failed")]
+    RawBodyIo(#[from] std::io::Error),
+    #[error("raw body reference escapes the body directory")]
+    RawBodyPathEscapesDirectory,
+    #[error("raw body reference does not point to a regular file")]
+    RawBodyNotRegularFile,
+    #[error("raw body source path changed before deletion")]
+    RawBodyPathChangedBeforeDelete,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +177,71 @@ impl UsageStore {
         Self::ingest_trace_spans_in_transaction(&transaction, &records.trace_spans)?;
         Self::ingest_content_in_transaction(&transaction, &records.content)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn ingest_raw_body_references(
+        &mut self,
+        raw_body_directory: &Path,
+        records: &[RawBodyReferenceRecord],
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut imported_sources = Vec::new();
+        let mut seen_event_keys = HashSet::new();
+        let transaction = self.connection.transaction()?;
+        for record in records {
+            if !seen_event_keys.insert(record.event_key.as_str().to_owned())
+                || raw_body_event_exists(&transaction, record.event_key.as_str())?
+            {
+                continue;
+            }
+            let raw_body_path = raw_body_path(raw_body_directory, record)?;
+            let mut raw_body = open_raw_body_source(raw_body_path)?;
+            let body = raw_body.read_all()?;
+            let compressed_body = zstd::stream::encode_all(body.as_slice(), 0)?;
+            let day = record.occurred_at.day().as_date().to_string();
+            let stored_repo = StoredRepo::from_bucket(&record.repo);
+            transaction.execute(
+                "INSERT OR IGNORE INTO canonical_raw_body_records (
+                    event_key,
+                    occurred_at_ms,
+                    session_id,
+                    prompt_id,
+                    day,
+                    repo_bucket,
+                    repo_name,
+                    repo_path,
+                    harness,
+                    content_kind,
+                    compression,
+                    compressed_body
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'zstd', ?11)",
+                params![
+                    record.event_key.as_str(),
+                    record.occurred_at.value(),
+                    record.session_id.as_str(),
+                    record.prompt_id.as_str(),
+                    day,
+                    stored_repo.bucket,
+                    stored_repo.name,
+                    stored_repo.path,
+                    record.harness.as_str(),
+                    record.kind.storage_name(),
+                    compressed_body,
+                ],
+            )?;
+            if transaction.changes() > 0 {
+                imported_sources.push(raw_body);
+            }
+        }
+        transaction.commit()?;
+
+        for imported_source in imported_sources {
+            overwrite_and_remove_imported_file(imported_source)?;
+        }
         Ok(())
     }
 
@@ -538,6 +616,9 @@ impl UsageStore {
     }
 
     pub fn content_replay(&self, query: ContentQuery) -> Result<ContentReplay, StoreError> {
+        let query_harness = query.harness.clone();
+        let query_session_id = query.session_id.clone();
+        let query_prompt_id = query.prompt_id.clone();
         let mut statement = self.connection.prepare(
             "SELECT
                 occurred_at_ms,
@@ -551,9 +632,9 @@ impl UsageStore {
         let items = statement
             .query_map(
                 params![
-                    query.harness.as_str(),
-                    query.session_id.as_str(),
-                    query.prompt_id.as_str()
+                    query_harness.as_str(),
+                    query_session_id.as_str(),
+                    query_prompt_id.as_str()
                 ],
                 |row| {
                     let content_kind: String = row.get(2)?;
@@ -575,9 +656,34 @@ impl UsageStore {
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut items = replay_items_with_order(items);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                occurred_at_ms,
+                harness,
+                content_kind,
+                compression,
+                compressed_body
+             FROM canonical_raw_body_records
+             WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
+             ORDER BY occurred_at_ms, id",
+        )?;
+        for item in statement.query_map(
+            params![
+                query_harness.as_str(),
+                query_session_id.as_str(),
+                query_prompt_id.as_str()
+            ],
+            raw_body_replay_item,
+        )? {
+            let order = items.len();
+            items.push((order, item?));
+        }
+        items.sort_by_key(|(order, item)| (item.occurred_at, *order));
+        let items: Vec<ContentReplayItem> = items.into_iter().map(|(_, item)| item).collect();
         let prompt_exists = !items.is_empty()
-            || self.prompt_exists(&query.harness, &query.session_id, &query.prompt_id)?;
-        let availability = content_availability(&query.harness, &items, prompt_exists);
+            || self.prompt_exists(&query_harness, &query_session_id, &query_prompt_id)?;
+        let availability = content_availability(&query_harness, &items, prompt_exists);
         Ok(ContentReplay {
             session_id: query.session_id,
             prompt_id: query.prompt_id,
@@ -675,6 +781,9 @@ impl UsageStore {
         }
         if schema_version < 11 {
             migrate_v10_to_v11(&transaction)?;
+        }
+        if schema_version < 12 {
+            migrate_v11_to_v12(&transaction)?;
         }
 
         transaction.execute_batch(
@@ -825,6 +934,22 @@ impl UsageStore {
                 harness TEXT NOT NULL,
                 content_kind TEXT NOT NULL,
                 content TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS canonical_raw_body_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                compression TEXT NOT NULL,
+                compressed_body BLOB NOT NULL
             );",
         )?;
         transaction.execute(
@@ -835,6 +960,11 @@ impl UsageStore {
         transaction.execute(
             "CREATE INDEX IF NOT EXISTS canonical_content_records_session_prompt
              ON canonical_content_records (session_id, prompt_id, occurred_at_ms, id)",
+            [],
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_raw_body_records_session_prompt
+             ON canonical_raw_body_records (session_id, prompt_id, occurred_at_ms, id)",
             [],
         )?;
         transaction.execute(
@@ -2293,6 +2423,63 @@ fn content_kind_from_storage(value: &str) -> rusqlite::Result<ContentKind> {
     })
 }
 
+fn replay_items_with_order(items: Vec<ContentReplayItem>) -> Vec<(usize, ContentReplayItem)> {
+    items.into_iter().enumerate().collect()
+}
+
+fn raw_body_replay_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentReplayItem> {
+    let content_kind: String = row.get(2)?;
+    let compression: String = row.get(3)?;
+    if compression != "zstd" {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "unsupported raw body compression {compression}"
+            )),
+        ));
+    }
+
+    let compressed_body: Vec<u8> = row.get(4)?;
+    let body = zstd::stream::decode_all(compressed_body.as_slice()).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Blob, Box::new(err))
+    })?;
+    let content = String::from_utf8(body).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Blob, Box::new(err))
+    })?;
+    Ok(ContentReplayItem {
+        occurred_at: TimestampMillis::from_millis(row.get(0)?),
+        harness: HarnessName::new(row.get::<_, String>(1)?),
+        kind: content_kind_from_storage(&content_kind)?,
+        content: ContentText::new(content).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Blob,
+                Box::<dyn std::error::Error + Send + Sync>::from(
+                    "raw body replay row has empty content",
+                ),
+            )
+        })?,
+    })
+}
+
+fn raw_body_event_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    event_key: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM canonical_raw_body_records
+                WHERE event_key = ?1
+            )",
+            params![event_key],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
 fn content_availability(
     harness: &HarnessName,
     items: &[ContentReplayItem],
@@ -2314,15 +2501,11 @@ fn content_availability(
     for kind in &captured {
         kinds.push(ContentKindAvailability::Captured { kind: *kind });
     }
-    for kind in ContentKind::ALL {
+    for kind in provided {
         if !captured.contains(&kind) {
             kinds.push(ContentKindAvailability::Unavailable {
                 kind,
-                reason: if provided.contains(&kind) {
-                    ContentUnavailableReason::NotCapturedForPrompt
-                } else {
-                    ContentUnavailableReason::NotProvidedByHarness
-                },
+                reason: ContentUnavailableReason::NotCapturedForPrompt,
             });
         }
     }
@@ -2334,12 +2517,116 @@ fn content_availability(
 
 fn content_kinds_provided_by(harness: &HarnessName) -> Vec<ContentKind> {
     match harness.as_str() {
-        "claude" | "claude_code" => ContentKind::ALL.to_vec(),
-        "codex" => ContentKind::ALL.to_vec(),
-        "github_copilot" => ContentKind::ALL.to_vec(),
-        "opencode" => ContentKind::ALL.to_vec(),
+        "claude_code" => ContentKind::ALL.to_vec(),
+        "claude" => inline_content_kinds().to_vec(),
+        "codex" => inline_content_kinds().to_vec(),
+        "github_copilot" => inline_content_kinds().to_vec(),
+        "opencode" => inline_content_kinds().to_vec(),
         _ => Vec::new(),
     }
+}
+
+fn inline_content_kinds() -> &'static [ContentKind] {
+    &[
+        ContentKind::UserPrompt,
+        ContentKind::AssistantMessage,
+        ContentKind::ToolInput,
+        ContentKind::ToolOutput,
+    ]
+}
+
+fn raw_body_path(
+    raw_body_directory: &Path,
+    record: &RawBodyReferenceRecord,
+) -> Result<PathBuf, StoreError> {
+    let relative_path = Path::new(record.body_ref.as_str());
+    let mut components = relative_path.components();
+    let Some(Component::Normal(file_name)) = components.next() else {
+        return Err(StoreError::RawBodyPathEscapesDirectory);
+    };
+    if relative_path.is_absolute() || components.next().is_some() {
+        return Err(StoreError::RawBodyPathEscapesDirectory);
+    }
+    Ok(raw_body_directory.join(file_name))
+}
+
+struct RawBodySource {
+    path: PathBuf,
+    file: File,
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl RawBodySource {
+    fn read_all(&mut self) -> Result<Vec<u8>, StoreError> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut body = Vec::new();
+        self.file.read_to_end(&mut body)?;
+        Ok(body)
+    }
+}
+
+fn open_raw_body_source(path: PathBuf) -> Result<RawBodySource, StoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(StoreError::RawBodyNotRegularFile);
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(StoreError::RawBodyNotRegularFile);
+    }
+
+    Ok(RawBodySource {
+        path,
+        len: metadata.len(),
+        #[cfg(unix)]
+        dev: metadata.dev(),
+        #[cfg(unix)]
+        ino: metadata.ino(),
+        file,
+    })
+}
+
+fn overwrite_and_remove_imported_file(mut source: RawBodySource) -> Result<(), StoreError> {
+    source.file.seek(SeekFrom::Start(0))?;
+    let mut remaining = source.len;
+    let zeros = [0_u8; 8192];
+    while remaining > 0 {
+        let write_len = usize::try_from(remaining.min(zeros.len() as u64)).unwrap_or(zeros.len());
+        source.file.write_all(&zeros[..write_len])?;
+        remaining -= write_len as u64;
+    }
+    source.file.sync_all()?;
+    if !raw_body_path_still_points_to_source(&source)? {
+        return Err(StoreError::RawBodyPathChangedBeforeDelete);
+    }
+    drop(source.file);
+    std::fs::remove_file(&source.path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn raw_body_path_still_points_to_source(source: &RawBodySource) -> Result<bool, StoreError> {
+    let metadata = std::fs::symlink_metadata(&source.path)?;
+    Ok(metadata.file_type().is_file()
+        && metadata.dev() == source.dev
+        && metadata.ino() == source.ino)
+}
+
+#[cfg(not(unix))]
+fn raw_body_path_still_points_to_source(source: &RawBodySource) -> Result<bool, StoreError> {
+    Ok(std::fs::symlink_metadata(&source.path)?
+        .file_type()
+        .is_file())
 }
 
 fn trace_duration_measures(spans: &[TraceSpan]) -> TraceDurationMeasures {
@@ -2426,6 +2713,29 @@ fn migrate_v3_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), Store
         WHERE cost_source IN ('native', 'estimated', 'mixed');
 
         DROP TABLE canonical_cost_usage_v3_text_source;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v11_to_v12(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS canonical_raw_body_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            occurred_at_ms INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            prompt_id TEXT NOT NULL,
+            day TEXT NOT NULL,
+            repo_bucket TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            harness TEXT NOT NULL,
+            content_kind TEXT NOT NULL,
+            compression TEXT NOT NULL,
+            compressed_body BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS canonical_raw_body_records_session_prompt
+        ON canonical_raw_body_records (session_id, prompt_id, occurred_at_ms, id);",
     )?;
     Ok(())
 }
@@ -3109,6 +3419,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         let query = CostRollupQuery::new(
@@ -3197,6 +3508,7 @@ mod tests {
             )],
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         store
             .connection
@@ -3242,6 +3554,7 @@ mod tests {
             ],
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -3430,6 +3743,7 @@ mod tests {
             )],
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         store.ingest_usage(&parse_otlp_json_usage_metrics(
             codex_tool_call_metric_json_payload("Read", 2).as_bytes(),
@@ -3766,6 +4080,7 @@ mod tests {
                 kind: ContentKind::AssistantMessage,
                 content: ContentText::new("stored assistant text").unwrap(),
             }],
+            raw_body_references: Vec::new(),
         })?;
 
         let row = store.connection.query_row(
@@ -3837,6 +4152,7 @@ mod tests {
                     content: ContentText::new("codex text").unwrap(),
                 },
             ],
+            raw_body_references: Vec::new(),
         })?;
 
         let replay = store.content_replay(ContentQuery {
@@ -4042,6 +4358,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -4095,6 +4412,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -4155,6 +4473,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -4207,6 +4526,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -4244,6 +4564,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords {
             token_usage: vec![usage_record(
@@ -4263,6 +4584,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -4524,6 +4846,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -5119,6 +5442,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords::from_token_usage(vec![
             usage_record_for_repo(
@@ -5191,6 +5515,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords::from_token_usage(vec![
             usage_record_for_repo(
@@ -5266,6 +5591,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         store.ingest_usage(&UsageRecords::from_token_usage(vec![
             usage_record_for_repo(
@@ -5351,6 +5677,7 @@ mod tests {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
 
         assert_eq!(
@@ -5928,6 +6255,7 @@ mod tests {
                 tool_name: None,
             }],
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         })?;
         assert_eq!(store.traces(trace_query)?.len(), 1);
         drop(store);
@@ -6747,6 +7075,7 @@ occurred_at_nanos=1781956803000000000
                 kind: ContentKind::AssistantMessage,
                 content: ContentText::new("legacy content").unwrap(),
             }],
+            raw_body_references: Vec::new(),
         })?;
         let content_row_count_after_reingest: i64 = store.connection.query_row(
             "SELECT COUNT(*) FROM canonical_content_records",

@@ -326,14 +326,18 @@ pub enum ContentKind {
     AssistantMessage,
     ToolInput,
     ToolOutput,
+    RawApiRequest,
+    RawApiResponse,
 }
 
 impl ContentKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::UserPrompt,
         Self::AssistantMessage,
         Self::ToolInput,
         Self::ToolOutput,
+        Self::RawApiRequest,
+        Self::RawApiResponse,
     ];
 
     pub fn from_attribute(value: &str) -> Option<Self> {
@@ -342,8 +346,14 @@ impl ContentKind {
             "assistant_message" | "assistant" => Some(Self::AssistantMessage),
             "tool_input" => Some(Self::ToolInput),
             "tool_output" | "tool_result" => Some(Self::ToolOutput),
+            "raw_api_request" | "api_request_body" => Some(Self::RawApiRequest),
+            "raw_api_response" | "api_response_body" => Some(Self::RawApiResponse),
             _ => None,
         }
+    }
+
+    pub fn from_inline_content_attribute(value: &str) -> Option<Self> {
+        Self::from_attribute(value).filter(|kind| !kind.is_raw_api_body())
     }
 
     pub fn storage_name(self) -> &'static str {
@@ -352,6 +362,8 @@ impl ContentKind {
             Self::AssistantMessage => "assistant_message",
             Self::ToolInput => "tool_input",
             Self::ToolOutput => "tool_output",
+            Self::RawApiRequest => "raw_api_request",
+            Self::RawApiResponse => "raw_api_response",
         }
     }
 
@@ -361,8 +373,14 @@ impl ContentKind {
             "assistant_message" => Some(Self::AssistantMessage),
             "tool_input" => Some(Self::ToolInput),
             "tool_output" => Some(Self::ToolOutput),
+            "raw_api_request" => Some(Self::RawApiRequest),
+            "raw_api_response" => Some(Self::RawApiResponse),
             _ => None,
         }
+    }
+
+    pub fn is_raw_api_body(self) -> bool {
+        matches!(self, Self::RawApiRequest | Self::RawApiResponse)
     }
 }
 
@@ -373,6 +391,36 @@ impl ContentText {
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         if value.is_empty() {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawBodyReferenceRecord {
+    pub event_key: ContentEventKey,
+    pub occurred_at: TimestampMillis,
+    pub session_id: SessionId,
+    pub prompt_id: PromptId,
+    pub repo: RepoBucket,
+    pub harness: HarnessName,
+    pub kind: ContentKind,
+    pub body_ref: RawBodyFileReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawBodyFileReference(String);
+
+impl RawBodyFileReference {
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        if value.trim().is_empty() {
             None
         } else {
             Some(Self(value))
@@ -534,6 +582,7 @@ pub struct UsageRecords {
     pub tool_calls: Vec<ToolCallRecord>,
     pub trace_spans: Vec<TraceSpanRecord>,
     pub content: Vec<ContentRecord>,
+    pub raw_body_references: Vec<RawBodyReferenceRecord>,
 }
 
 impl UsageRecords {
@@ -544,6 +593,7 @@ impl UsageRecords {
             tool_calls: Vec::new(),
             trace_spans: Vec::new(),
             content: Vec::new(),
+            raw_body_references: Vec::new(),
         }
     }
 
@@ -553,6 +603,7 @@ impl UsageRecords {
             && self.tool_calls.is_empty()
             && self.trace_spans.is_empty()
             && self.content.is_empty()
+            && self.raw_body_references.is_empty()
     }
 
     pub fn extend(&mut self, other: Self) {
@@ -561,6 +612,7 @@ impl UsageRecords {
         self.tool_calls.extend(other.tool_calls);
         self.trace_spans.extend(other.trace_spans);
         self.content.extend(other.content);
+        self.raw_body_references.extend(other.raw_body_references);
     }
 }
 

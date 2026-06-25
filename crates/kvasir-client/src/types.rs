@@ -254,6 +254,8 @@ pub enum KvasirContentKind {
     AssistantMessage,
     ToolInput,
     ToolOutput,
+    RawApiRequest,
+    RawApiResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]

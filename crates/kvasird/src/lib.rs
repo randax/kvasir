@@ -275,6 +275,7 @@ impl Drop for RunningDaemon {
 struct DaemonState {
     store: Arc<Mutex<UsageStore>>,
     bearer_token: BearerToken,
+    raw_body_directory: PathBuf,
     usage_updates: broadcast::Sender<()>,
     shutdown: broadcast::Sender<()>,
 }
@@ -295,11 +296,13 @@ pub async fn start_with_store_key_source(
         &store_key,
         config.price_table.clone(),
     )?;
+    let raw_body_directory = prepare_raw_body_directory(&config.database_path)?;
     let (usage_updates, _usage_update_receiver) = broadcast::channel(32);
     let (shutdown, _shutdown_receiver) = broadcast::channel(1);
     let state = DaemonState {
         store: Arc::new(Mutex::new(store)),
         bearer_token: config.bearer_token,
+        raw_body_directory,
         usage_updates,
         shutdown: shutdown.clone(),
     };
@@ -339,6 +342,31 @@ pub async fn start_with_store_key_source(
 fn bind_private_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
     require_private_socket_parent(path)?;
     UnixListener::bind(path)
+}
+
+fn raw_body_directory_for_database(database_path: &Path) -> PathBuf {
+    database_path
+        .parent()
+        .map(|parent| parent.join("raw-bodies"))
+        .unwrap_or_else(|| PathBuf::from("raw-bodies"))
+}
+
+fn prepare_raw_body_directory(database_path: &Path) -> std::io::Result<PathBuf> {
+    let raw_body_directory = raw_body_directory_for_database(database_path);
+    std::fs::create_dir_all(&raw_body_directory)?;
+    let metadata = std::fs::symlink_metadata(&raw_body_directory)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "raw body directory must be a real directory",
+        ));
+    }
+    set_private_directory_permissions(&raw_body_directory)?;
+    raw_body_directory.canonicalize()
+}
+
+fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 fn require_private_socket_parent(path: &Path) -> std::io::Result<()> {
@@ -622,14 +650,14 @@ async fn ingest_otlp(
     }
     .map_err(|_| IngestError::InvalidPayload)?;
 
-    {
-        state
-            .store
-            .lock()
-            .await
-            .ingest_usage(&records)
-            .map_err(|_| IngestError::StoreWriteFailed)?;
-    }
+    let mut store = state.store.lock().await;
+    store
+        .ingest_usage(&records)
+        .map_err(|_| IngestError::StoreWriteFailed)?;
+    store
+        .ingest_raw_body_references(&state.raw_body_directory, &records.raw_body_references)
+        .map_err(|_| IngestError::StoreWriteFailed)?;
+    drop(store);
     let _ = state.usage_updates.send(());
 
     Ok(StatusCode::ACCEPTED)

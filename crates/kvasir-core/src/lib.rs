@@ -20,7 +20,8 @@ pub use setup::{
 };
 pub use store::{StoreKey, StoreKeyError, UsageStore};
 pub use usage::{
-    ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
-    RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageEventKey,
-    TokenUsageRecord, TokenUsageSignal, ToolCallRecord, TraceSpanRecord, UsageRecords,
+    ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
+    RawBodyFileReference, RawBodyReferenceRecord, RepoBucket, RepoIdentity, RepoName, RepoPath,
+    TokenCount, TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal,
+    ToolCallRecord, TraceSpanRecord, UsageRecords,
 };
