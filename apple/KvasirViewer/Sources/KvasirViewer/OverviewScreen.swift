@@ -250,13 +250,7 @@ struct OverviewScreen: View {
                     detail: costPresentation.total.estimateLabel,
                     series: series,
                     color: .indigo,
-                    costDisplay: { point in
-                        guard let index = series.firstIndex(where: { $0.day == point.day }),
-                              costPresentation.series.indices.contains(index) else {
-                            return point.costDisplay
-                        }
-                        return costPresentation.series[index]
-                    }
+                    costDisplay: { $0.costDisplay }
                 ) { $0.costUsdNanos }
             }
             if showsToolCalls {
