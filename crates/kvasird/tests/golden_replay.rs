@@ -15,7 +15,7 @@ use kvasir_core::rpc::{
 };
 use kvasir_core::{
     ContentKind, ContentText, CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity,
-    RepoName, RepoPath,
+    RepoName, RepoPath, StoreKey, UsageStore,
 };
 use kvasird::{
     DaemonConfig, RunningDaemon, StoreKeySource, query_content, query_cost_rollup,
@@ -584,6 +584,676 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         )]
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_raw_body_file_imports_into_content_replay_and_removes_source() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("request-1.json");
+    std::fs::write(
+        &request_body_path,
+        r#"{"messages":[{"role":"user","content":"show me the full context"}]}"#,
+    )?;
+    let response_body_path = raw_body_dir.join("response-1.json");
+    std::fs::write(
+        &response_body_path,
+        r#"{"content":[{"type":"text","text":"full model response"}]}"#,
+    )?;
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "request-1.json",
+            "response-1.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert!(
+        !request_body_path.exists(),
+        "imported raw request body source file should be removed"
+    );
+    assert!(
+        !response_body_path.exists(),
+        "imported raw response body source file should be removed"
+    );
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "request-1.json",
+            "response-1.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert_eq!(
+        query_content(
+            rpc_socket_path,
+            ContentQuery {
+                harness: HarnessName::new("claude_code"),
+                session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+                prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+            },
+            BearerToken::new("test-token"),
+        )
+        .await?,
+        ContentReplay {
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+            items: vec![
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_802_180),
+                    harness: HarnessName::new("claude_code"),
+                    kind: ContentKind::RawApiRequest,
+                    content: ContentText::new(
+                        r#"{"messages":[{"role":"user","content":"show me the full context"}]}"#,
+                    )
+                    .unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_802_220),
+                    harness: HarnessName::new("claude_code"),
+                    kind: ContentKind::RawApiResponse,
+                    content: ContentText::new(
+                        r#"{"content":[{"type":"text","text":"full model response"}]}"#,
+                    )
+                    .unwrap(),
+                }
+            ],
+            availability: ContentAvailability::Captured {
+                harness: HarnessName::new("claude_code"),
+                kinds: vec![
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::RawApiRequest,
+                    },
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::RawApiResponse,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::UserPrompt,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::AssistantMessage,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::ToolInput,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::ToolOutput,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                ],
+            },
+        }
+    );
+
+    drop(daemon);
+    let raw_body_rows = persisted_raw_body_rows(&database_path)?;
+    assert_eq!(raw_body_rows.len(), 2);
+    assert_eq!(raw_body_rows[0].harness, "claude_code");
+    assert_eq!(raw_body_rows[0].content_kind, "raw_api_request");
+    assert_eq!(raw_body_rows[0].compression, "zstd");
+    assert_eq!(raw_body_rows[1].harness, "claude_code");
+    assert_eq!(raw_body_rows[1].content_kind, "raw_api_response");
+    assert_eq!(raw_body_rows[1].compression, "zstd");
+    assert_ne!(
+        raw_body_rows[0].compressed_body,
+        r#"{"messages":[{"role":"user","content":"show me the full context"}]}"#.as_bytes(),
+        "raw body should be compressed before storage"
+    );
+    assert_eq!(persisted_opencode_content_rows(&database_path)?, Vec::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn protobuf_claude_raw_body_file_imports_into_content_replay() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("request-protobuf.json");
+    std::fs::write(
+        &request_body_path,
+        r#"{"messages":[{"role":"user","content":"protobuf full context"}]}"#,
+    )?;
+    let response_body_path = raw_body_dir.join("response-protobuf.json");
+    std::fs::write(
+        &response_body_path,
+        r#"{"content":[{"type":"text","text":"protobuf model response"}]}"#,
+    )?;
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(claude_raw_api_body_ref_logs_protobuf_fixture(
+            "request-protobuf.json",
+            "response-protobuf.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert!(
+        !request_body_path.exists(),
+        "protobuf raw request body source file should be removed"
+    );
+    assert!(
+        !response_body_path.exists(),
+        "protobuf raw response body source file should be removed"
+    );
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(claude_raw_api_body_ref_logs_protobuf_fixture(
+            "request-protobuf.json",
+            "response-protobuf.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = query_content(
+        rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+
+    assert_eq!(replay.items.len(), 2);
+    assert_eq!(replay.items[0].kind, ContentKind::RawApiRequest);
+    assert_eq!(
+        replay.items[0].content.as_str(),
+        r#"{"messages":[{"role":"user","content":"protobuf full context"}]}"#
+    );
+    assert_eq!(replay.items[1].kind, ContentKind::RawApiResponse);
+    assert_eq!(
+        replay.items[1].content.as_str(),
+        r#"{"content":[{"type":"text","text":"protobuf model response"}]}"#
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_raw_body_files_arriving_after_otlp_are_imported_by_one_shot_scan()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("late-request.json");
+    let response_body_path = raw_body_dir.join("late-response.json");
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "late-request.json",
+            "late-response.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    std::fs::write(
+        &request_body_path,
+        r#"{"messages":[{"role":"user","content":"arrived after log"}]}"#,
+    )?;
+    std::fs::write(
+        &response_body_path,
+        r#"{"content":[{"type":"text","text":"arrived after log response"}]}"#,
+    )?;
+
+    daemon.import_available_raw_bodies_once().await?;
+    let replay = query_content(
+        rpc_socket_path.clone(),
+        ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+    assert_eq!(
+        replay.items[0].content.as_str(),
+        r#"{"messages":[{"role":"user","content":"arrived after log"}]}"#
+    );
+    assert_eq!(
+        replay.items[1].content.as_str(),
+        r#"{"content":[{"type":"text","text":"arrived after log response"}]}"#
+    );
+    assert!(!request_body_path.exists());
+    assert!(!response_body_path.exists());
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_raw_body_row_retries_plaintext_cleanup() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("orphan-request.json");
+
+    let database_path = temp.path().join("usage.sqlite3");
+    std::fs::write(&request_body_path, r#"{"plaintext":"left behind"}"#)?;
+    initialize_test_store(&database_path)?;
+    let event_key =
+        insert_raw_body_import_queue_row(&database_path, "orphan-request.json", 1_781_956_802_180)?;
+    insert_persisted_raw_body_row_for_event(&database_path, &event_key, "zstd")?;
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    daemon.import_available_raw_bodies_once().await?;
+
+    assert!(!request_body_path.exists());
+    assert!(
+        !raw_body_import_queue_body_refs(&database_path)?
+            .contains(&"orphan-request.json".to_owned())
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_persisted_raw_body_event_does_not_delete_reused_body_ref() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let database_path = temp.path().join("usage.sqlite3");
+    let reused_path = raw_body_dir.join("reused-request.json");
+    initialize_test_store(&database_path)?;
+    let event_key =
+        insert_raw_body_import_queue_row(&database_path, "reused-request.json", 1_781_956_802_180)?;
+    insert_persisted_raw_body_row_for_event(&database_path, &event_key, "zstd")?;
+    delete_raw_body_import_queue_event(&database_path, &event_key)?;
+    std::fs::write(&reused_path, r#"{"plaintext":"belongs to a newer event"}"#)?;
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw_api_body_ref_logs_fixture_with_nanos(
+            "reused-request.json",
+            1_781_956_802_180_000_000,
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    daemon.import_available_raw_bodies_once().await?;
+
+    assert_eq!(
+        std::fs::read_to_string(reused_path)?,
+        r#"{"plaintext":"belongs to a newer event"}"#
+    );
+    assert!(
+        !raw_body_import_queue_body_refs(&database_path)?
+            .contains(&"reused-request.json".to_owned())
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_raw_body_row_without_source_drains_import_queue() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    std::fs::create_dir_all(temp.path().join("raw-bodies"))?;
+    let database_path = temp.path().join("usage.sqlite3");
+    initialize_test_store(&database_path)?;
+    let event_key = insert_raw_body_import_queue_row(
+        &database_path,
+        "already-cleaned.json",
+        1_781_956_802_180,
+    )?;
+    insert_persisted_raw_body_row_for_event(&database_path, &event_key, "zstd")?;
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    daemon.import_available_raw_bodies_once().await?;
+
+    assert!(
+        !raw_body_import_queue_body_refs(&database_path)?
+            .contains(&"already-cleaned.json".to_owned())
+    );
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_stored_raw_body_compression_is_repaired_by_reingest() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let database_path = temp.path().join("usage.sqlite3");
+    let body_ref = "bad-compression.json";
+    let body_path = raw_body_dir.join(body_ref);
+    std::fs::write(&body_path, r#"{"plaintext":"recoverable"}"#)?;
+    initialize_test_store(&database_path)?;
+    let event_key = insert_raw_body_import_queue_row(&database_path, body_ref, 1_781_956_802_180)?;
+    insert_persisted_raw_body_row_for_event(&database_path, &event_key, "gzip")?;
+    delete_raw_body_import_queue_event(&database_path, &event_key)?;
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw_api_body_ref_logs_fixture_with_nanos(
+            body_ref,
+            1_781_956_802_180_000_000,
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert!(!body_path.exists());
+    let raw_body_rows = persisted_raw_body_rows(&database_path)?;
+    assert_eq!(raw_body_rows.len(), 1);
+    assert_eq!(raw_body_rows[0].compression, "zstd");
+    assert!(!raw_body_import_queue_body_refs(&database_path)?.contains(&body_ref.to_owned()));
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_raw_body_queue_rows_do_not_starve_later_ready_files() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let database_path = temp.path().join("usage.sqlite3");
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    for index in 0..65 {
+        insert_raw_body_import_queue_row(
+            &database_path,
+            &format!("missing-{index}.json"),
+            1_781_956_800_000 + index,
+        )?;
+    }
+    let ready_ref = "ready-after-missing.json";
+    std::fs::write(
+        raw_body_dir.join(ready_ref),
+        r#"{"messages":[{"role":"user","content":"not starved"}]}"#,
+    )?;
+    insert_raw_body_import_queue_row(&database_path, ready_ref, 1_781_956_900_000)?;
+
+    daemon.import_available_raw_bodies_once().await?;
+    daemon.import_available_raw_bodies_once().await?;
+
+    let replay = query_content(
+        rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+    assert_eq!(replay.items.len(), 1);
+    assert_eq!(
+        replay.items[0].content.as_str(),
+        r#"{"messages":[{"role":"user","content":"not starved"}]}"#
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_raw_body_file_import_rejects_symlink_sources() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let secret_path = temp.path().join("outside-secret.json");
+    std::fs::write(&secret_path, r#"{"secret":"do not import"}"#)?;
+    std::os::unix::fs::symlink(&secret_path, raw_body_dir.join("request-1.json"))?;
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "request-1.json",
+            "missing-response.json",
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(secret_path.exists());
+    assert!(raw_body_dir.join("request-1.json").exists());
+
+    drop(daemon);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_raw_body_file_import_rejects_hardlinked_sources() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let secret_path = temp.path().join("outside-secret.json");
+    std::fs::write(&secret_path, r#"{"secret":"do not import"}"#)?;
+    std::fs::hard_link(&secret_path, raw_body_dir.join("request-1.json"))?;
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "request-1.json",
+            "missing-response.json",
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        std::fs::read_to_string(secret_path)?,
+        r#"{"secret":"do not import"}"#
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_rejects_symlinked_raw_body_directory() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let real_raw_body_dir = temp.path().join("real-raw-bodies");
+    std::fs::create_dir_all(&real_raw_body_dir)?;
+    std::os::unix::fs::symlink(&real_raw_body_dir, temp.path().join("raw-bodies"))?;
+
+    let result = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await;
+
+    let error = match result {
+        Ok(_daemon) => anyhow::bail!("daemon should reject symlinked raw body directory"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("raw body directory must be a real directory")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_body_file_import_ignores_non_claude_code_harnesses() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("codex-request.json");
+    std::fs::write(&request_body_path, r#"{"input":"should stay untouched"}"#)?;
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw_api_body_ref_logs_fixture_for_harness(
+            "codex",
+            "codex-session-1",
+            "codex-turn-1",
+            "codex-request.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    assert!(request_body_path.exists());
+    let replay = query_content(
+        rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("codex"),
+            session_id: kvasir_core::rpc::SessionId::new("codex-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("codex-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+    assert_eq!(
+        replay.availability,
+        ContentAvailability::Unavailable {
+            reason: ContentUnavailableReason::PromptNotFound,
+        }
+    );
+
+    drop(daemon);
     Ok(())
 }
 
@@ -1952,6 +2622,111 @@ fn opencode_content_logs_fixture() -> &'static str {
     }"#
 }
 
+fn claude_raw_api_body_ref_logs_fixture(request_body_ref: &str, response_body_ref: &str) -> String {
+    format!(
+        r#"{{
+        "resourceLogs": [{{
+            "resource": {{
+                "attributes": [
+                    {{ "key": "service.name", "value": {{ "stringValue": "claude_code" }} }},
+                    {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                    {{ "key": "repo.path", "value": {{ "stringValue": "/Users/oyr/projects/kvasir" }} }},
+                    {{ "key": "session.id", "value": {{ "stringValue": "claude-session-1" }} }},
+                    {{ "key": "prompt.id", "value": {{ "stringValue": "claude-turn-1" }} }}
+                ]
+            }},
+            "scopeLogs": [{{
+                "logRecords": [{{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "claude_code.api_request_body",
+                    "body": {{ "stringValue": "" }},
+                    "attributes": [
+                        {{ "key": "content.opt_in", "value": {{ "boolValue": true }} }},
+                        {{ "key": "content.type", "value": {{ "stringValue": "raw_api_request" }} }},
+                        {{ "key": "body_ref", "value": {{ "stringValue": "{request_body_ref}" }} }}
+                    ]
+                }},
+                {{
+                    "timeUnixNano": "1781956802220000000",
+                    "eventName": "claude_code.api_response_body",
+                    "body": {{ "stringValue": "" }},
+                    "attributes": [
+                        {{ "key": "content.opt_in", "value": {{ "boolValue": true }} }},
+                        {{ "key": "content.type", "value": {{ "stringValue": "raw_api_response" }} }},
+                        {{ "key": "body_ref", "value": {{ "stringValue": "{response_body_ref}" }} }}
+                    ]
+                }}]
+            }}]
+        }}]
+    }}"#
+    )
+}
+
+fn raw_api_body_ref_logs_fixture_for_harness(
+    harness: &str,
+    session_id: &str,
+    prompt_id: &str,
+    request_body_ref: &str,
+) -> String {
+    format!(
+        r#"{{
+        "resourceLogs": [{{
+            "resource": {{
+                "attributes": [
+                    {{ "key": "service.name", "value": {{ "stringValue": "{harness}" }} }},
+                    {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                    {{ "key": "repo.path", "value": {{ "stringValue": "/Users/oyr/projects/kvasir" }} }},
+                    {{ "key": "session.id", "value": {{ "stringValue": "{session_id}" }} }},
+                    {{ "key": "prompt.id", "value": {{ "stringValue": "{prompt_id}" }} }}
+                ]
+            }},
+            "scopeLogs": [{{
+                "logRecords": [{{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "{harness}.content",
+                    "body": {{ "stringValue": "" }},
+                    "attributes": [
+                        {{ "key": "content.opt_in", "value": {{ "boolValue": true }} }},
+                        {{ "key": "content.type", "value": {{ "stringValue": "raw_api_request" }} }},
+                        {{ "key": "body_ref", "value": {{ "stringValue": "{request_body_ref}" }} }}
+                    ]
+                }}]
+            }}]
+        }}]
+    }}"#
+    )
+}
+
+fn raw_api_body_ref_logs_fixture_with_nanos(request_body_ref: &str, time_unix_nano: u64) -> String {
+    format!(
+        r#"{{
+        "resourceLogs": [{{
+            "resource": {{
+                "attributes": [
+                    {{ "key": "service.name", "value": {{ "stringValue": "claude_code" }} }},
+                    {{ "key": "repo.name", "value": {{ "stringValue": "kvasir" }} }},
+                    {{ "key": "repo.path", "value": {{ "stringValue": "/Users/oyr/projects/kvasir" }} }},
+                    {{ "key": "session.id", "value": {{ "stringValue": "claude-session-1" }} }},
+                    {{ "key": "prompt.id", "value": {{ "stringValue": "claude-turn-1" }} }}
+                ]
+            }},
+            "scopeLogs": [{{
+                "logRecords": [{{
+                    "timeUnixNano": "{time_unix_nano}",
+                    "eventName": "claude_code.api_request_body",
+                    "body": {{ "stringValue": "" }},
+                    "attributes": [
+                        {{ "key": "content.opt_in", "value": {{ "boolValue": true }} }},
+                        {{ "key": "content.type", "value": {{ "stringValue": "raw_api_request" }} }},
+                        {{ "key": "body_ref", "value": {{ "stringValue": "{request_body_ref}" }} }}
+                    ]
+                }}]
+            }}]
+        }}]
+    }}"#
+    )
+}
+
 fn opencode_degraded_trace_fixture() -> &'static str {
     r#"{
         "resourceSpans": [{
@@ -2649,6 +3424,73 @@ fn claude_tool_result_logs_protobuf_fixture() -> Vec<u8> {
     .encode_to_vec()
 }
 
+fn claude_raw_api_body_ref_logs_protobuf_fixture(
+    request_body_ref: &str,
+    response_body_ref: &str,
+) -> Vec<u8> {
+    ExportLogsServiceRequest {
+        resource_logs: vec![OtlpResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "claude_code"),
+                    string_attribute("repo.name", "kvasir"),
+                    string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
+                    string_attribute("session.id", "claude-session-1"),
+                    string_attribute("prompt.id", "claude-turn-1"),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![
+                    LogRecord {
+                        time_unix_nano: 1_781_956_802_180_000_000,
+                        observed_time_unix_nano: 0,
+                        severity_number: 0,
+                        severity_text: String::new(),
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(String::new())),
+                        }),
+                        attributes: vec![
+                            bool_attribute("content.opt_in", true),
+                            string_attribute("content.type", "raw_api_request"),
+                            string_attribute("body_ref", request_body_ref),
+                        ],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: Vec::new(),
+                        span_id: Vec::new(),
+                        event_name: "claude_code.api_request_body".to_owned(),
+                    },
+                    LogRecord {
+                        time_unix_nano: 1_781_956_802_220_000_000,
+                        observed_time_unix_nano: 0,
+                        severity_number: 0,
+                        severity_text: String::new(),
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(String::new())),
+                        }),
+                        attributes: vec![
+                            bool_attribute("content.opt_in", true),
+                            string_attribute("content.type", "raw_api_response"),
+                            string_attribute("body_ref", response_body_ref),
+                        ],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: Vec::new(),
+                        span_id: Vec::new(),
+                        event_name: "claude_code.api_response_body".to_owned(),
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
 fn string_attribute(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_owned(),
@@ -2665,6 +3507,16 @@ fn int_attribute(key: &str, value: i64) -> KeyValue {
         key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::IntValue(value)),
+        }),
+    }
+}
+
+fn bool_attribute(key: &str, value: bool) -> KeyValue {
+    KeyValue {
+        key: key.to_owned(),
+        key_strindex: 0,
+        value: Some(AnyValue {
+            value: Some(any_value::Value::BoolValue(value)),
         }),
     }
 }
@@ -2858,4 +3710,150 @@ fn persisted_opencode_content_rows(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+struct PersistedRawBodyRow {
+    harness: String,
+    content_kind: String,
+    compression: String,
+    compressed_body: Vec<u8>,
+}
+
+fn persisted_raw_body_rows(database_path: &Path) -> anyhow::Result<Vec<PersistedRawBodyRow>> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = "0b".repeat(32);
+    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let mut statement = connection.prepare(
+        "SELECT harness, content_kind, compression, compressed_body
+         FROM canonical_raw_body_records
+         ORDER BY event_key",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(PersistedRawBodyRow {
+                harness: row.get(0)?,
+                content_kind: row.get(1)?,
+                compression: row.get(2)?,
+                compressed_body: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn initialize_test_store(database_path: &Path) -> anyhow::Result<()> {
+    let key = StoreKey::from_bytes([11; 32]);
+    let store =
+        UsageStore::open_with_price_table(database_path, &key, PriceTable::bundled_defaults())?;
+    drop(store);
+    Ok(())
+}
+
+fn insert_raw_body_import_queue_row(
+    database_path: &Path,
+    body_ref: &str,
+    occurred_at_ms: i64,
+) -> anyhow::Result<String> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = "0b".repeat(32);
+    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let occurred_at_nanos = occurred_at_ms * 1_000_000;
+    let event_key = format!(
+        "otel-raw-body-file\nrepo_bucket=repo\nrepo_name=kvasir\nrepo_path=/Users/oyr/projects/kvasir\nharness=claude_code\nsession_id=claude-session-1\nprompt_id=claude-turn-1\nkind=raw_api_request\noccurred_at_nanos={occurred_at_nanos}\nbody_ref={body_ref}\n"
+    );
+    connection.execute(
+        "INSERT INTO raw_body_import_queue (
+            event_key,
+            occurred_at_ms,
+            session_id,
+            prompt_id,
+            day,
+            repo_bucket,
+            repo_name,
+            repo_path,
+            harness,
+            content_kind,
+            body_ref
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        (
+            event_key.as_str(),
+            occurred_at_ms,
+            "claude-session-1",
+            "claude-turn-1",
+            "2026-06-20",
+            "repo",
+            "kvasir",
+            "/Users/oyr/projects/kvasir",
+            "claude_code",
+            "raw_api_request",
+            body_ref,
+        ),
+    )?;
+    Ok(event_key)
+}
+
+fn insert_persisted_raw_body_row_for_event(
+    database_path: &Path,
+    event_key: &str,
+    compression: &str,
+) -> anyhow::Result<()> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = "0b".repeat(32);
+    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    connection.execute(
+        "INSERT INTO canonical_raw_body_records (
+            event_key,
+            occurred_at_ms,
+            session_id,
+            prompt_id,
+            day,
+            repo_bucket,
+            repo_name,
+            repo_path,
+            harness,
+            content_kind,
+            compression,
+            compressed_body
+        )
+        SELECT
+            event_key,
+            occurred_at_ms,
+            session_id,
+            prompt_id,
+            day,
+            repo_bucket,
+            repo_name,
+            repo_path,
+            harness,
+            content_kind,
+            ?2,
+            x'00'
+        FROM raw_body_import_queue
+        WHERE event_key = ?1",
+        (event_key, compression),
+    )?;
+    Ok(())
+}
+
+fn raw_body_import_queue_body_refs(database_path: &Path) -> anyhow::Result<Vec<String>> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = "0b".repeat(32);
+    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let mut statement =
+        connection.prepare("SELECT body_ref FROM raw_body_import_queue ORDER BY body_ref")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn delete_raw_body_import_queue_event(database_path: &Path, event_key: &str) -> anyhow::Result<()> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = "0b".repeat(32);
+    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    connection.execute(
+        "DELETE FROM raw_body_import_queue WHERE event_key = ?1",
+        [event_key],
+    )?;
+    Ok(())
 }

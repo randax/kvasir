@@ -21,10 +21,10 @@ use crate::rpc::{
     TraceId, TraceSpanKind, canonical_harness_name,
 };
 use crate::usage::{
-    ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RepoBucket,
-    RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageEventKey,
-    TokenUsageRecord, TokenUsageSignal, ToolCallCount, ToolCallEventKey, ToolCallRecord,
-    TraceSpanRecord, UsageRecords,
+    ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
+    RawBodyFileReference, RawBodyReferenceRecord, RepoBucket, RepoIdentity, RepoName, RepoPath,
+    TokenCount, TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal,
+    ToolCallCount, ToolCallEventKey, ToolCallRecord, TraceSpanRecord, UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -251,6 +251,15 @@ pub fn parse_otlp_json_usage_logs(bytes: &[u8]) -> Result<UsageRecords, OtlpErro
                     prompt_id.clone(),
                 )? {
                     records.content.push(record);
+                }
+                if let Some(record) = json_raw_body_reference_record(
+                    log_record,
+                    repo.clone(),
+                    harness.as_deref(),
+                    session_id.clone(),
+                    prompt_id.clone(),
+                )? {
+                    records.raw_body_references.push(record);
                 }
             }
         }
@@ -488,6 +497,15 @@ fn records_from_scope_logs_for_logs(
             resource_prompt_id.clone(),
         )? {
             records.content.push(record);
+        }
+        if let Some(record) = proto_raw_body_reference_record(
+            &log_record,
+            repo.clone(),
+            resource_harness,
+            resource_session_id.clone(),
+            resource_prompt_id.clone(),
+        )? {
+            records.raw_body_references.push(record);
         }
     }
     Ok(records)
@@ -1339,7 +1357,7 @@ fn proto_content_record(
         return Ok(None);
     }
     let Some(kind) = proto_attribute(&log_record.attributes, "content.type")
-        .and_then(|value| ContentKind::from_attribute(&value))
+        .and_then(|value| ContentKind::from_inline_content_attribute(&value))
     else {
         return Ok(None);
     };
@@ -1405,7 +1423,7 @@ fn json_content_record(
         return Ok(None);
     }
     let Some(kind) = json_attribute(attributes, "content.type")
-        .and_then(|value| ContentKind::from_attribute(&value))
+        .and_then(|value| ContentKind::from_inline_content_attribute(&value))
     else {
         return Ok(None);
     };
@@ -1441,6 +1459,134 @@ fn json_content_record(
         harness: HarnessName::new(harness),
         kind,
         content,
+    }))
+}
+
+fn proto_raw_body_reference_record(
+    log_record: &LogRecord,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<Option<RawBodyReferenceRecord>, OtlpError> {
+    let Some(harness) = content_record_harness(resource_harness) else {
+        return Ok(None);
+    };
+    if !raw_body_harness_provides_files(harness.as_str()) {
+        return Ok(None);
+    }
+    if !is_raw_body_event(Some(log_record.event_name.as_str()), || {
+        proto_attribute(&log_record.attributes, "event.name")
+    }) || !proto_bool_attribute(&log_record.attributes, "content.opt_in")
+    {
+        return Ok(None);
+    }
+    let Some(kind) = proto_attribute(&log_record.attributes, "content.type")
+        .and_then(|value| ContentKind::from_attribute(&value))
+        .filter(|kind| kind.is_raw_api_body())
+    else {
+        return Ok(None);
+    };
+    let Some(body_ref) = first_proto_attribute(
+        &log_record.attributes,
+        &["body_ref", "body.ref", "content.body_ref"],
+    )
+    .and_then(RawBodyFileReference::new) else {
+        return Ok(None);
+    };
+    let Some(session_id) = resource_session_id.or_else(|| proto_session_id(&log_record.attributes))
+    else {
+        return Ok(None);
+    };
+    let Some(prompt_id) = resource_prompt_id.or_else(|| proto_prompt_id(&log_record.attributes))
+    else {
+        return Ok(None);
+    };
+    let occurred_at_nanos = if log_record.time_unix_nano == 0 {
+        log_record.observed_time_unix_nano
+    } else {
+        log_record.time_unix_nano
+    };
+    let occurred_at = TimestampMillis::try_from_unix_nanos(occurred_at_nanos)
+        .ok_or(OtlpError::MissingTimestamp)?;
+    let event_key = raw_body_event_key(
+        &repo,
+        harness.as_str(),
+        &session_id,
+        &prompt_id,
+        kind,
+        occurred_at_nanos,
+        &body_ref,
+    );
+    Ok(Some(RawBodyReferenceRecord {
+        event_key,
+        occurred_at,
+        session_id,
+        prompt_id,
+        repo,
+        harness: HarnessName::new(harness),
+        kind,
+        body_ref,
+    }))
+}
+
+fn json_raw_body_reference_record(
+    log_record: &Value,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<Option<RawBodyReferenceRecord>, OtlpError> {
+    let attributes = log_record.get("attributes").and_then(Value::as_array);
+    let Some(harness) = content_record_harness(resource_harness) else {
+        return Ok(None);
+    };
+    if !raw_body_harness_provides_files(harness.as_str()) {
+        return Ok(None);
+    }
+    if !is_raw_body_event(log_record.get("eventName").and_then(Value::as_str), || {
+        json_attribute(attributes, "event.name")
+    }) || !json_bool_attribute(attributes, "content.opt_in")
+    {
+        return Ok(None);
+    }
+    let Some(kind) = json_attribute(attributes, "content.type")
+        .and_then(|value| ContentKind::from_attribute(&value))
+        .filter(|kind| kind.is_raw_api_body())
+    else {
+        return Ok(None);
+    };
+    let Some(body_ref) =
+        first_json_attribute(attributes, &["body_ref", "body.ref", "content.body_ref"])
+            .and_then(RawBodyFileReference::new)
+    else {
+        return Ok(None);
+    };
+    let Some(session_id) = resource_session_id.or_else(|| json_session_id(attributes)) else {
+        return Ok(None);
+    };
+    let Some(prompt_id) = resource_prompt_id.or_else(|| json_prompt_id(attributes)) else {
+        return Ok(None);
+    };
+    let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
+    let event_key = raw_body_event_key(
+        &repo,
+        harness.as_str(),
+        &session_id,
+        &prompt_id,
+        kind,
+        occurred_at_nanos,
+        &body_ref,
+    );
+    Ok(Some(RawBodyReferenceRecord {
+        event_key,
+        occurred_at,
+        session_id,
+        prompt_id,
+        repo,
+        harness: HarnessName::new(harness),
+        kind,
+        body_ref,
     }))
 }
 
@@ -2546,6 +2692,40 @@ fn content_event_key(
     ContentEventKey::new(canonical)
 }
 
+fn raw_body_event_key(
+    repo: &RepoBucket,
+    harness: &str,
+    session_id: &SessionId,
+    prompt_id: &PromptId,
+    kind: ContentKind,
+    occurred_at_nanos: u64,
+    body_ref: &RawBodyFileReference,
+) -> ContentEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otel-raw-body-file");
+    canonical.push('\n');
+    append_repo_key(&mut canonical, repo);
+    canonical.push_str("harness=");
+    canonical.push_str(harness);
+    canonical.push('\n');
+    canonical.push_str("session_id=");
+    canonical.push_str(session_id.as_str());
+    canonical.push('\n');
+    canonical.push_str("prompt_id=");
+    canonical.push_str(prompt_id.as_str());
+    canonical.push('\n');
+    canonical.push_str("kind=");
+    canonical.push_str(kind.storage_name());
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&occurred_at_nanos.to_string());
+    canonical.push('\n');
+    canonical.push_str("body_ref=");
+    canonical.push_str(body_ref.as_str());
+    canonical.push('\n');
+    ContentEventKey::new(canonical)
+}
+
 fn content_fingerprint(content: &str) -> String {
     let mut forward_hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in content.as_bytes() {
@@ -2743,6 +2923,10 @@ fn content_harness_provides_logs(harness: &str) -> bool {
     )
 }
 
+fn raw_body_harness_provides_files(harness: &str) -> bool {
+    harness == "claude_code"
+}
+
 fn is_content_event(
     event_name: Option<&str>,
     attribute_event_name: impl FnOnce() -> Option<String>,
@@ -2751,6 +2935,25 @@ fn is_content_event(
         .and_then(|value| meaningful_attribute(Some(value.to_owned())))
         .or_else(|| meaningful_attribute(attribute_event_name()))
         .is_some_and(|value| value == "content" || value.ends_with(".content"))
+}
+
+fn is_raw_body_event(
+    event_name: Option<&str>,
+    attribute_event_name: impl FnOnce() -> Option<String>,
+) -> bool {
+    let event_name = event_name
+        .and_then(|value| meaningful_attribute(Some(value.to_owned())))
+        .or_else(|| meaningful_attribute(attribute_event_name()));
+    event_name.is_some_and(|value| {
+        matches!(
+            value.as_str(),
+            "api_request_body"
+                | "api_response_body"
+                | "claude_code.api_request_body"
+                | "claude_code.api_response_body"
+        ) || value == "content"
+            || value.ends_with(".content")
+    })
 }
 
 fn repo_from_proto_attributes(attributes: &[KeyValue]) -> RepoBucket {

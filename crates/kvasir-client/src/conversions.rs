@@ -291,6 +291,8 @@ impl From<CoreContentKind> for KvasirContentKind {
             CoreContentKind::AssistantMessage => Self::AssistantMessage,
             CoreContentKind::ToolInput => Self::ToolInput,
             CoreContentKind::ToolOutput => Self::ToolOutput,
+            CoreContentKind::RawApiRequest => Self::RawApiRequest,
+            CoreContentKind::RawApiResponse => Self::RawApiResponse,
         }
     }
 }
