@@ -123,12 +123,20 @@ pub struct KvasirCostUsd {
     pub nanos: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirCostSource {
+    Native,
+    Estimated,
+    Mixed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirCostRollup {
     pub day: KvasirRollupDay,
     pub repo: KvasirRepoBucket,
     pub model: KvasirModelName,
     pub cost_usd: KvasirCostUsd,
+    pub source: KvasirCostSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -151,6 +159,7 @@ pub struct KvasirOverviewRollup {
 pub struct KvasirOverviewTotals {
     pub total_tokens: u64,
     pub cost_usd_nanos: u64,
+    pub cost_source: Option<KvasirCostSource>,
     pub tool_calls: u64,
 }
 
@@ -159,6 +168,7 @@ pub struct KvasirOverviewSeriesPoint {
     pub day: KvasirRollupDay,
     pub total_tokens: u64,
     pub cost_usd_nanos: u64,
+    pub cost_source: Option<KvasirCostSource>,
     pub tool_calls: u64,
 }
 
@@ -418,21 +428,26 @@ impl KvasirOverviewSnapshot {
                 repo,
                 model,
                 cost_usd,
+                source,
             } = cost_rollup;
             totals.cost_usd_nanos = totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
+            totals.cost_source = combined_cost_source(totals.cost_source, source);
             let point = points_by_day
                 .entry(day.clone())
                 .or_insert_with(|| KvasirOverviewSeriesPoint::empty(day));
             point.cost_usd_nanos = point.cost_usd_nanos.saturating_add(cost_usd.nanos);
+            point.cost_source = combined_cost_source(point.cost_source, source);
             let repo_totals = totals_by_repo
                 .entry(repo)
                 .or_insert_with(KvasirOverviewTotals::zero);
             repo_totals.cost_usd_nanos = repo_totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
+            repo_totals.cost_source = combined_cost_source(repo_totals.cost_source, source);
             let model_totals = totals_by_model
                 .entry(model)
                 .or_insert_with(KvasirOverviewTotals::zero);
             model_totals.cost_usd_nanos =
                 model_totals.cost_usd_nanos.saturating_add(cost_usd.nanos);
+            model_totals.cost_source = combined_cost_source(model_totals.cost_source, source);
         }
 
         for tool_call_rollup in rollup.tool_call_rollups {
@@ -482,6 +497,7 @@ impl KvasirOverviewTotals {
         Self {
             total_tokens: 0,
             cost_usd_nanos: 0,
+            cost_source: None,
             tool_calls: 0,
         }
     }
@@ -493,9 +509,24 @@ impl KvasirOverviewSeriesPoint {
             day,
             total_tokens: 0,
             cost_usd_nanos: 0,
+            cost_source: None,
             tool_calls: 0,
         }
     }
+}
+
+fn combined_cost_source(
+    current: Option<KvasirCostSource>,
+    next: KvasirCostSource,
+) -> Option<KvasirCostSource> {
+    Some(match (current, next) {
+        (None, source) => source,
+        (Some(KvasirCostSource::Mixed), _) | (_, KvasirCostSource::Mixed) => {
+            KvasirCostSource::Mixed
+        }
+        (Some(source), next) if source == next => source,
+        (Some(_), _) => KvasirCostSource::Mixed,
+    })
 }
 
 fn repo_summary_order(
@@ -867,12 +898,14 @@ mod tests {
                         cost_usd: KvasirCostUsd {
                             nanos: 1_250_000_000,
                         },
+                        source: KvasirCostSource::Native,
                     },
                     KvasirCostRollup {
                         day: day(2026, 6, 20),
                         repo: other_repo.clone(),
                         model: KvasirModelName::try_from("claude-sonnet-4".to_owned())?,
                         cost_usd: KvasirCostUsd { nanos: 75_000_000 },
+                        source: KvasirCostSource::Estimated,
                     },
                     KvasirCostRollup {
                         day: day(2026, 6, 21),
@@ -881,6 +914,7 @@ mod tests {
                         cost_usd: KvasirCostUsd {
                             nanos: 2_000_000_000,
                         },
+                        source: KvasirCostSource::Native,
                     },
                 ],
                 tool_call_rollups: vec![
@@ -916,6 +950,7 @@ mod tests {
             KvasirOverviewTotals {
                 total_tokens: 5_050,
                 cost_usd_nanos: 3_325_000_000,
+                cost_source: Some(KvasirCostSource::Mixed),
                 tool_calls: 12,
             }
         );
@@ -926,12 +961,14 @@ mod tests {
                     day: day(2026, 6, 20),
                     total_tokens: 2_150,
                     cost_usd_nanos: 1_325_000_000,
+                    cost_source: Some(KvasirCostSource::Mixed),
                     tool_calls: 6,
                 },
                 KvasirOverviewSeriesPoint {
                     day: day(2026, 6, 21),
                     total_tokens: 2_900,
                     cost_usd_nanos: 2_000_000_000,
+                    cost_source: Some(KvasirCostSource::Native),
                     tool_calls: 6,
                 },
             ]
@@ -944,6 +981,7 @@ mod tests {
                     totals: KvasirOverviewTotals {
                         total_tokens: 4_650,
                         cost_usd_nanos: 3_250_000_000,
+                        cost_source: Some(KvasirCostSource::Native),
                         tool_calls: 10,
                     },
                 },
@@ -952,6 +990,7 @@ mod tests {
                     totals: KvasirOverviewTotals {
                         total_tokens: 400,
                         cost_usd_nanos: 75_000_000,
+                        cost_source: Some(KvasirCostSource::Estimated),
                         tool_calls: 2,
                     },
                 },
@@ -965,6 +1004,7 @@ mod tests {
                     totals: KvasirOverviewTotals {
                         total_tokens: 3_300,
                         cost_usd_nanos: 2_075_000_000,
+                        cost_source: Some(KvasirCostSource::Mixed),
                         tool_calls: 0,
                     },
                 },
@@ -973,6 +1013,7 @@ mod tests {
                     totals: KvasirOverviewTotals {
                         total_tokens: 1_750,
                         cost_usd_nanos: 1_250_000_000,
+                        cost_source: Some(KvasirCostSource::Native),
                         tool_calls: 0,
                     },
                 },
@@ -980,6 +1021,84 @@ mod tests {
         );
         assert_eq!(snapshot.selected_repo, Some(selected_repo));
         assert_eq!(snapshot.selected_model, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn overview_snapshot_preserves_cost_source_for_aggregated_costs()
+    -> Result<(), KvasirClientError> {
+        let kvasir_repo = repo("kvasir", "/repos/kvasir")?;
+        let other_repo = repo("other", "/repos/other")?;
+        let sonnet = KvasirModelName::try_from("claude-sonnet-4".to_owned())?;
+        let opus = KvasirModelName::try_from("claude-opus-4".to_owned())?;
+
+        let snapshot = KvasirOverviewSnapshot::from_rollup(
+            KvasirOverviewRollup {
+                token_rollups: Vec::new(),
+                cost_rollups: vec![
+                    KvasirCostRollup {
+                        day: day(2026, 6, 20),
+                        repo: kvasir_repo.clone(),
+                        model: sonnet.clone(),
+                        cost_usd: KvasirCostUsd { nanos: 1_000 },
+                        source: KvasirCostSource::Estimated,
+                    },
+                    KvasirCostRollup {
+                        day: day(2026, 6, 20),
+                        repo: other_repo.clone(),
+                        model: opus.clone(),
+                        cost_usd: KvasirCostUsd { nanos: 2_000 },
+                        source: KvasirCostSource::Native,
+                    },
+                    KvasirCostRollup {
+                        day: day(2026, 6, 21),
+                        repo: kvasir_repo.clone(),
+                        model: sonnet.clone(),
+                        cost_usd: KvasirCostUsd { nanos: 3_000 },
+                        source: KvasirCostSource::Estimated,
+                    },
+                ],
+                tool_call_rollups: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(snapshot.totals.cost_source, Some(KvasirCostSource::Mixed));
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.cost_source)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(KvasirCostSource::Mixed),
+                Some(KvasirCostSource::Estimated),
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .repo_breakdown
+                .iter()
+                .map(|summary| (&summary.repo, summary.totals.cost_source))
+                .collect::<Vec<_>>(),
+            vec![
+                (&kvasir_repo, Some(KvasirCostSource::Estimated)),
+                (&other_repo, Some(KvasirCostSource::Native)),
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .model_breakdown
+                .iter()
+                .map(|summary| (&summary.model, summary.totals.cost_source))
+                .collect::<Vec<_>>(),
+            vec![
+                (&sonnet, Some(KvasirCostSource::Estimated)),
+                (&opus, Some(KvasirCostSource::Native)),
+            ]
+        );
 
         Ok(())
     }

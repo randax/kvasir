@@ -68,6 +68,7 @@ struct OverviewScreen: View {
     @ViewBuilder
     private var content: some View {
         if let snapshot = model.overviewSnapshot {
+            let costPresentation = Self.costDashboardPresentation(for: snapshot)
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     if model.launchAgentOutcome == .requiresApproval {
@@ -79,10 +80,18 @@ struct OverviewScreen: View {
                     if let errorMessage = model.errorMessage {
                         errorBanner(errorMessage)
                     }
-                    totals(snapshot.totals, showsToolCalls: snapshot.selectedModel == nil)
+                    totals(
+                        snapshot.totals,
+                        costDisplay: costPresentation.total,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
                     modelDashboard(snapshot.modelBreakdown)
                     repoDashboard(snapshot.repoBreakdown, showsToolCalls: snapshot.selectedModel == nil)
-                    charts(snapshot.series, showsToolCalls: snapshot.selectedModel == nil)
+                    charts(
+                        snapshot.series,
+                        costPresentation: costPresentation,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
                 }
                 .padding(24)
             }
@@ -104,10 +113,23 @@ struct OverviewScreen: View {
         }
     }
 
-    private func totals(_ totals: OverviewTotals, showsToolCalls: Bool) -> some View {
+    nonisolated static func costDashboardPresentation(for snapshot: OverviewSnapshot) -> OverviewCostDashboardPresentation {
+        snapshot.costDashboardPresentation
+    }
+
+    private func totals(
+        _ totals: OverviewTotals,
+        costDisplay: OverviewCostDisplay,
+        showsToolCalls: Bool
+    ) -> some View {
         HStack(spacing: 12) {
             TotalTile(title: "Tokens", value: totals.totalTokens.formatted(), systemImage: "sum")
-            TotalTile(title: "Cost", value: usd(totals.costUsdNanos), systemImage: "dollarsign")
+            TotalTile(
+                title: "Cost",
+                value: usd(totals.costUsdNanos),
+                systemImage: "dollarsign",
+                detail: costDisplay.estimateLabel
+            )
             if showsToolCalls {
                 TotalTile(title: "Tool calls", value: totals.toolCalls.formatted(), systemImage: "hammer")
             }
@@ -123,8 +145,10 @@ struct OverviewScreen: View {
                 if let selectedRepo = model.selectedRepo {
                     Text(selectedRepo.displayName)
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(selectedRepo.displayName)
                 }
 
                 Spacer()
@@ -213,11 +237,21 @@ struct OverviewScreen: View {
         }
     }
 
-    private func charts(_ series: [OverviewSeriesPoint], showsToolCalls: Bool) -> some View {
+    private func charts(
+        _ series: [OverviewSeriesPoint],
+        costPresentation: OverviewCostDashboardPresentation,
+        showsToolCalls: Bool
+    ) -> some View {
         Grid(horizontalSpacing: 16, verticalSpacing: 16) {
             GridRow {
                 MetricChart(title: "Tokens", series: series, color: .teal) { $0.totalTokens }
-                MetricChart(title: "Cost", series: series, color: .indigo) { $0.costUsdNanos }
+                MetricChart(
+                    title: "Cost",
+                    detail: costPresentation.total.estimateLabel,
+                    series: series,
+                    color: .indigo,
+                    costDisplay: { $0.costDisplay }
+                ) { $0.costUsdNanos }
             }
             if showsToolCalls {
                 GridRow {
@@ -316,7 +350,7 @@ private struct RepoHeaderRow: View {
             Text("Tokens")
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
-                .frame(width: 110, alignment: .trailing)
+                .frame(width: 132, alignment: .trailing)
             if showsToolCalls {
                 Text("Tool calls")
                     .frame(width: 110, alignment: .trailing)
@@ -337,7 +371,7 @@ private struct ModelHeaderRow: View {
             Text("Tokens")
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
-                .frame(width: 110, alignment: .trailing)
+                .frame(width: 132, alignment: .trailing)
         }
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)
@@ -363,12 +397,16 @@ private struct RepoSummaryRow: View {
                         Text(summary.repo.displayName)
                             .font(.body.weight(.medium))
                             .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(summary.repo.displayName)
                     }
                     if let subtitle = summary.repo.subtitle {
                         Text(subtitle)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(subtitle)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -376,9 +414,10 @@ private struct RepoSummaryRow: View {
                 Text(summary.totals.totalTokens.formatted())
                     .monospacedDigit()
                     .frame(width: 110, alignment: .trailing)
-                Text(costFormatter(summary.totals.costUsdNanos))
-                    .monospacedDigit()
-                    .frame(width: 110, alignment: .trailing)
+                CostValue(
+                    display: summary.totals.costDisplay,
+                    formatter: costFormatter
+                )
                 if showsToolCalls {
                     Text(summary.totals.toolCalls.formatted())
                         .monospacedDigit()
@@ -416,9 +455,10 @@ private struct ModelSummaryRow: View {
                 Text(summary.totals.totalTokens.formatted())
                     .monospacedDigit()
                     .frame(width: 110, alignment: .trailing)
-                Text(costFormatter(summary.totals.costUsdNanos))
-                    .monospacedDigit()
-                    .frame(width: 110, alignment: .trailing)
+                CostValue(
+                    display: summary.totals.costDisplay,
+                    formatter: costFormatter
+                )
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -434,6 +474,7 @@ private struct TotalTile: View {
     let title: String
     let value: String
     let systemImage: String
+    var detail: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -443,6 +484,9 @@ private struct TotalTile: View {
             Text(value)
                 .font(.system(.title2, design: .rounded, weight: .semibold))
                 .monospacedDigit()
+            if let detail {
+                EstimateBadge(text: detail)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
@@ -456,21 +500,41 @@ private struct TotalTile: View {
 
 private struct MetricChart: View {
     let title: String
+    var detail: String? = nil
     let series: [OverviewSeriesPoint]
     let color: Color
+    var costDisplay: (OverviewSeriesPoint) -> OverviewCostDisplay = {
+        OverviewCostDisplay(costUsdNanos: $0.costUsdNanos, source: nil)
+    }
     let value: (OverviewSeriesPoint) -> UInt64
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.headline)
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.headline)
+                if let detail {
+                    EstimateBadge(text: detail)
+                }
+            }
 
             Chart(series, id: \.day) { point in
+                let display = costDisplay(point)
                 BarMark(
                     x: .value("Day", point.day.shortLabel),
                     y: .value(title, value(point))
                 )
-                .foregroundStyle(color.gradient)
+                .foregroundStyle((display.usesEstimatedCost ? Color.orange : color).gradient)
+                .annotation(position: .top) {
+                    if let marker = display.chartMarkerLabel {
+                        Text(marker)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .accessibilityLabel(display.estimateLabel ?? marker)
+                    }
+                }
             }
             .chartYAxis {
                 AxisMarks(position: .leading)
@@ -483,6 +547,37 @@ private struct MetricChart: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.35))
         )
+    }
+}
+
+private struct CostValue: View {
+    let display: OverviewCostDisplay
+    let formatter: (UInt64) -> String
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            Text(formatter(display.costUsdNanos))
+                .monospacedDigit()
+            if let detail = display.estimateLabel {
+                EstimateBadge(text: detail)
+            }
+        }
+        .frame(width: 132, alignment: .trailing)
+    }
+}
+
+private struct EstimateBadge: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: OverviewCostDisplay.estimateBadgeSystemImage)
+            .labelStyle(.titleAndIcon)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.orange)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .minimumScaleFactor(0.8)
+            .help(text)
     }
 }
 

@@ -125,15 +125,106 @@ public struct OverviewRollupDay: Comparable, Hashable, Sendable {
     }
 }
 
+public enum OverviewCostSource: Equatable, Sendable {
+    case native
+    case estimated
+    case mixed
+
+    public var estimateLabel: String? {
+        switch self {
+        case .native:
+            return nil
+        case .estimated:
+            return "Estimated"
+        case .mixed:
+            return "Partly estimated"
+        }
+    }
+
+    public var chartMarkerLabel: String? {
+        switch self {
+        case .native:
+            return nil
+        case .estimated:
+            return "Est."
+        case .mixed:
+            return "Partly est."
+        }
+    }
+
+    public var usesEstimatedCost: Bool {
+        switch self {
+        case .native:
+            return false
+        case .estimated, .mixed:
+            return true
+        }
+    }
+}
+
+public struct OverviewCostDisplay: Equatable, Sendable {
+    public static let estimateBadgeSystemImage = "plusminus"
+
+    public var costUsdNanos: UInt64
+    public var source: OverviewCostSource?
+
+    public init(costUsdNanos: UInt64, source: OverviewCostSource?) {
+        self.costUsdNanos = costUsdNanos
+        self.source = source
+    }
+
+    public var estimateLabel: String? {
+        source?.estimateLabel
+    }
+
+    public var chartMarkerLabel: String? {
+        source?.chartMarkerLabel
+    }
+
+    public var usesEstimatedCost: Bool {
+        source?.usesEstimatedCost ?? false
+    }
+}
+
+public struct OverviewCostDashboardPresentation: Equatable, Sendable {
+    public var total: OverviewCostDisplay
+    public var series: [OverviewCostDisplay]
+    public var repos: [OverviewCostDisplay]
+    public var models: [OverviewCostDisplay]
+
+    public init(
+        total: OverviewCostDisplay,
+        series: [OverviewCostDisplay],
+        repos: [OverviewCostDisplay],
+        models: [OverviewCostDisplay]
+    ) {
+        self.total = total
+        self.series = series
+        self.repos = repos
+        self.models = models
+    }
+}
+
 public struct OverviewTotals: Equatable, Sendable {
     public var totalTokens: UInt64
     public var costUsdNanos: UInt64
+    public var costSource: OverviewCostSource?
     public var toolCalls: UInt64
 
-    public init(totalTokens: UInt64, costUsdNanos: UInt64, toolCalls: UInt64) {
+    public init(
+        totalTokens: UInt64,
+        costUsdNanos: UInt64,
+        costSource: OverviewCostSource? = nil,
+        toolCalls: UInt64
+    ) {
         self.totalTokens = totalTokens
         self.costUsdNanos = costUsdNanos
+        self.costSource = costSource
         self.toolCalls = toolCalls
+    }
+
+    public var costDisplay: OverviewCostDisplay {
+        OverviewCostDisplay(costUsdNanos: costUsdNanos, source: costSource)
     }
 }
 
@@ -141,18 +232,25 @@ public struct OverviewSeriesPoint: Equatable, Sendable {
     public var day: OverviewRollupDay
     public var totalTokens: UInt64
     public var costUsdNanos: UInt64
+    public var costSource: OverviewCostSource?
     public var toolCalls: UInt64
 
     public init(
         day: OverviewRollupDay,
         totalTokens: UInt64,
         costUsdNanos: UInt64,
+        costSource: OverviewCostSource? = nil,
         toolCalls: UInt64
     ) {
         self.day = day
         self.totalTokens = totalTokens
         self.costUsdNanos = costUsdNanos
+        self.costSource = costSource
         self.toolCalls = toolCalls
+    }
+
+    public var costDisplay: OverviewCostDisplay {
+        OverviewCostDisplay(costUsdNanos: costUsdNanos, source: costSource)
     }
 }
 
@@ -178,6 +276,15 @@ public struct OverviewSnapshot: Equatable, Sendable {
         self.modelBreakdown = modelBreakdown
         self.selectedRepo = selectedRepo
         self.selectedModel = selectedModel
+    }
+
+    public var costDashboardPresentation: OverviewCostDashboardPresentation {
+        OverviewCostDashboardPresentation(
+            total: totals.costDisplay,
+            series: series.map(\.costDisplay),
+            repos: repoBreakdown.map(\.totals.costDisplay),
+            models: modelBreakdown.map(\.totals.costDisplay)
+        )
     }
 }
 

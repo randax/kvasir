@@ -11,13 +11,13 @@ use kvasir_client::{
     KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
     KvasirContentKind, KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
     KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
-    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewModelSummary,
-    KvasirOverviewRepoSummary, KvasirOverviewRollup, KvasirOverviewSeriesPoint,
-    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
-    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
-    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
-    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
-    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
+    KvasirCostSource, KvasirCostUsd, KvasirHarnessName, KvasirModelName,
+    KvasirOverviewModelSummary, KvasirOverviewRepoSummary, KvasirOverviewRollup,
+    KvasirOverviewSeriesPoint, KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
+    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
+    KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
     KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
@@ -1132,6 +1132,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     cost_usd: KvasirCostUsd {
                         nanos: 1_250_000_000,
                     },
+                    source: KvasirCostSource::Native,
                 },
                 KvasirCostRollup {
                     day: KvasirRollupDay {
@@ -1142,6 +1143,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     repo: kvasir_repo(),
                     model: model("claude-sonnet-4-20250514"),
                     cost_usd: KvasirCostUsd { nanos: 200_000_000 },
+                    source: KvasirCostSource::Native,
                 },
                 KvasirCostRollup {
                     day: KvasirRollupDay {
@@ -1152,6 +1154,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     repo: kvasir_repo(),
                     model: model("claude-opus-4-20250514"),
                     cost_usd: KvasirCostUsd { nanos: 500_000_000 },
+                    source: KvasirCostSource::Native,
                 },
                 KvasirCostRollup {
                     day: KvasirRollupDay {
@@ -1162,6 +1165,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     repo: kvasir_repo(),
                     model: model("claude-sonnet-4-20250514"),
                     cost_usd: KvasirCostUsd { nanos: 18_015_000 },
+                    source: KvasirCostSource::Estimated,
                 },
             ],
             tool_call_rollups: vec![
@@ -1196,6 +1200,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
             totals: KvasirOverviewTotals {
                 total_tokens: 5_000,
                 cost_usd_nanos: 1_968_015_000,
+                cost_source: Some(KvasirCostSource::Mixed),
                 tool_calls: 3,
             },
             series: vec![
@@ -1207,6 +1212,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     },
                     total_tokens: 2_150,
                     cost_usd_nanos: 1_450_000_000,
+                    cost_source: Some(KvasirCostSource::Native),
                     tool_calls: 3,
                 },
                 KvasirOverviewSeriesPoint {
@@ -1217,6 +1223,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     },
                     total_tokens: 2_850,
                     cost_usd_nanos: 518_015_000,
+                    cost_source: Some(KvasirCostSource::Mixed),
                     tool_calls: 0,
                 },
             ],
@@ -1225,6 +1232,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                 totals: KvasirOverviewTotals {
                     total_tokens: 5_000,
                     cost_usd_nanos: 1_968_015_000,
+                    cost_source: Some(KvasirCostSource::Mixed),
                     tool_calls: 3,
                 },
             }],
@@ -1234,6 +1242,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     totals: KvasirOverviewTotals {
                         total_tokens: 3_300,
                         cost_usd_nanos: 218_015_000,
+                        cost_source: Some(KvasirCostSource::Mixed),
                         tool_calls: 0,
                     },
                 },
@@ -1242,6 +1251,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     totals: KvasirOverviewTotals {
                         total_tokens: 1_700,
                         cost_usd_nanos: 1_750_000_000,
+                        cost_source: Some(KvasirCostSource::Native),
                         tool_calls: 0,
                     },
                 },
@@ -1317,6 +1327,7 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
             totals: KvasirOverviewTotals {
                 total_tokens: 3_300,
                 cost_usd_nanos: 218_015_000,
+                cost_source: Some(KvasirCostSource::Mixed),
                 tool_calls: 0,
             },
             series: vec![
@@ -1328,6 +1339,7 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
                     },
                     total_tokens: 450,
                     cost_usd_nanos: 200_000_000,
+                    cost_source: Some(KvasirCostSource::Native),
                     tool_calls: 0,
                 },
                 KvasirOverviewSeriesPoint {
@@ -1338,6 +1350,7 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
                     },
                     total_tokens: 2_850,
                     cost_usd_nanos: 18_015_000,
+                    cost_source: Some(KvasirCostSource::Estimated),
                     tool_calls: 0,
                 },
             ],
@@ -1346,6 +1359,7 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
                 totals: KvasirOverviewTotals {
                     total_tokens: 3_300,
                     cost_usd_nanos: 218_015_000,
+                    cost_source: Some(KvasirCostSource::Mixed),
                     tool_calls: 0,
                 },
             }],
@@ -1354,6 +1368,7 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
                 totals: KvasirOverviewTotals {
                     total_tokens: 3_300,
                     cost_usd_nanos: 218_015_000,
+                    cost_source: Some(KvasirCostSource::Mixed),
                     tool_calls: 0,
                 },
             }],
@@ -1540,6 +1555,7 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
                 cost_usd: KvasirCostUsd {
                     nanos: 1_250_000_000,
                 },
+                source: KvasirCostSource::Native,
             },
             KvasirCostRollup {
                 day: KvasirRollupDay {
@@ -1550,6 +1566,7 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
                 repo: kvasir_repo(),
                 model: model("claude-sonnet-4-20250514"),
                 cost_usd: KvasirCostUsd { nanos: 200_000_000 },
+                source: KvasirCostSource::Native,
             },
             KvasirCostRollup {
                 day: KvasirRollupDay {
@@ -1560,6 +1577,7 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
                 repo: kvasir_repo(),
                 model: model("claude-opus-4-20250514"),
                 cost_usd: KvasirCostUsd { nanos: 500_000_000 },
+                source: KvasirCostSource::Native,
             },
         ]
     );

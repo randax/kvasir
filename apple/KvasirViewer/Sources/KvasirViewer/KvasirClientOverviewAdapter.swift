@@ -81,6 +81,7 @@ private extension KvasirOverviewTotals {
         OverviewTotals(
             totalTokens: totalTokens,
             costUsdNanos: costUsdNanos,
+            costSource: costSource?.overviewCostSource,
             toolCalls: toolCalls
         )
     }
@@ -92,6 +93,7 @@ private extension KvasirOverviewSeriesPoint {
             day: day.overviewDay,
             totalTokens: totalTokens,
             costUsdNanos: costUsdNanos,
+            costSource: costSource?.overviewCostSource,
             toolCalls: toolCalls
         )
     }
@@ -112,6 +114,19 @@ private extension KvasirOverviewModelSummary {
 private extension KvasirRollupDay {
     var overviewDay: OverviewRollupDay {
         OverviewRollupDay(year: Int(year), month: Int(month), day: Int(day))
+    }
+}
+
+private extension KvasirCostSource {
+    var overviewCostSource: OverviewCostSource {
+        switch self {
+        case .native:
+            return .native
+        case .estimated:
+            return .estimated
+        case .mixed:
+            return .mixed
+        }
     }
 }
 #endif

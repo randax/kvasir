@@ -15,10 +15,11 @@ use crate::error::KvasirClientError;
 use crate::types::{
     KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
     KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem,
-    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostUsd, KvasirOverviewRollup,
-    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
-    KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace,
-    KvasirTraceDurationMeasures, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource, KvasirCostUsd,
+    KvasirOverviewRollup, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
+    KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceQuery,
+    KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -141,7 +142,18 @@ impl TryFrom<CoreCostRollup> for KvasirCostRollup {
             cost_usd: KvasirCostUsd {
                 nanos: rollup.cost_usd.as_nanos(),
             },
+            source: rollup.source.into(),
         })
+    }
+}
+
+impl From<kvasir_core::rpc::CostSource> for KvasirCostSource {
+    fn from(source: kvasir_core::rpc::CostSource) -> Self {
+        match source {
+            kvasir_core::rpc::CostSource::Native => Self::Native,
+            kvasir_core::rpc::CostSource::Estimated => Self::Estimated,
+            kvasir_core::rpc::CostSource::Mixed => Self::Mixed,
+        }
     }
 }
 
