@@ -18,7 +18,12 @@ pub use setup::{
     RepoInjectionShellHook, RepoInjectionShellProfile, SetupConfig, SetupCredential, SetupError,
     SetupSecretSource, prepare_setup_config, resolve_setup_config,
 };
-pub use store::{StoreKey, StoreKeyError, UsageStore};
+pub use store::{
+    RawBodyCleanupError, RawBodyCleanupReport, RawBodyImportCandidate, RawBodyImportFailure,
+    RawBodyImportFailureKind, RawBodyImportPreparation, RawBodyPreparedImport, StoreError,
+    StoreKey, StoreKeyError, UsageStore, cleanup_prepared_raw_body_imports,
+    prepare_raw_body_import_candidate,
+};
 pub use usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
     RawBodyFileReference, RawBodyReferenceRecord, RepoBucket, RepoIdentity, RepoName, RepoPath,

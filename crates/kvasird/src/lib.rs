@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::os::raw::c_int;
@@ -20,9 +21,11 @@ use kvasir_core::rpc::{
     ToolCallRollupQuery, Trace, TraceQuery,
 };
 use kvasir_core::{
-    PriceTable, StoreKey, UsageStore, parse_otlp_json_traces, parse_otlp_json_usage_logs,
-    parse_otlp_json_usage_metrics, parse_otlp_protobuf_traces, parse_otlp_protobuf_usage_logs,
-    parse_otlp_protobuf_usage_metrics,
+    PriceTable, RawBodyImportFailure, RawBodyImportFailureKind, RawBodyImportPreparation,
+    StoreError, StoreKey, UsageStore, cleanup_prepared_raw_body_imports, parse_otlp_json_traces,
+    parse_otlp_json_usage_logs, parse_otlp_json_usage_metrics, parse_otlp_protobuf_traces,
+    parse_otlp_protobuf_usage_logs, parse_otlp_protobuf_usage_metrics,
+    prepare_raw_body_import_candidate,
 };
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -39,6 +42,8 @@ const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_RPC_RESPONSE_BYTES: usize = 1024 * 1024;
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const RAW_BODY_IMPORT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const RAW_BODY_IMPORT_BATCH_SIZE: usize = 64;
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
@@ -253,11 +258,19 @@ pub struct RunningDaemon {
     rpc_socket_path: PathBuf,
     shutdown: broadcast::Sender<()>,
     tasks: Vec<JoinHandle<()>>,
+    state: DaemonState,
 }
 
 impl RunningDaemon {
     pub fn otlp_addr(&self) -> SocketAddr {
         self.otlp_addr
+    }
+
+    #[doc(hidden)]
+    pub async fn import_available_raw_bodies_once(&self) -> anyhow::Result<bool> {
+        import_available_raw_bodies(&self.state)
+            .await
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -330,13 +343,36 @@ pub async fn start_with_store_key_source(
     let rpc_task = tokio::spawn(async move {
         serve_rpc(unix_listener, rpc_state, rpc_shutdown).await;
     });
+    let raw_body_state = state.clone();
+    let raw_body_shutdown = shutdown.clone();
+    let raw_body_import_task = tokio::spawn(async move {
+        run_raw_body_import_scanner(raw_body_state, raw_body_shutdown).await;
+    });
 
     Ok(RunningDaemon {
         otlp_addr,
         rpc_socket_path: config.rpc_socket_path,
         shutdown,
-        tasks: vec![http_task, rpc_task],
+        tasks: vec![http_task, rpc_task, raw_body_import_task],
+        state,
     })
+}
+
+async fn run_raw_body_import_scanner(state: DaemonState, shutdown: broadcast::Sender<()>) {
+    let mut shutdown = shutdown.subscribe();
+    let mut interval = tokio::time::interval(RAW_BODY_IMPORT_SCAN_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = interval.tick() => {
+                if let Err(error) = import_available_raw_bodies(&state).await {
+                    eprintln!("raw body background import failed: {error:?}");
+                }
+            }
+        }
+    }
 }
 
 fn bind_private_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
@@ -650,17 +686,133 @@ async fn ingest_otlp(
     }
     .map_err(|_| IngestError::InvalidPayload)?;
 
-    let mut store = state.store.lock().await;
-    store
-        .ingest_usage(&records)
-        .map_err(|_| IngestError::StoreWriteFailed)?;
-    store
-        .ingest_raw_body_references(&state.raw_body_directory, &records.raw_body_references)
-        .map_err(|_| IngestError::StoreWriteFailed)?;
-    drop(store);
+    {
+        let mut store = state.store.lock().await;
+        store
+            .ingest_usage(&records)
+            .map_err(|_| IngestError::StoreWriteFailed)?;
+        store
+            .record_raw_body_references(&records.raw_body_references)
+            .map_err(|_| IngestError::StoreWriteFailed)?;
+    }
+    import_available_raw_bodies(&state).await?;
     let _ = state.usage_updates.send(());
 
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, IngestError> {
+    let candidates = {
+        let store = state.store.lock().await;
+        store
+            .raw_body_import_candidates(RAW_BODY_IMPORT_BATCH_SIZE)
+            .map_err(|_| IngestError::StoreWriteFailed)?
+    };
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let mut prepared_imports = Vec::new();
+    let mut completed_event_keys = Vec::new();
+    let mut import_failures = Vec::new();
+    for candidate in candidates {
+        let event_key = candidate.event_key().to_owned();
+        if candidate.is_blocked_by_unsupported_compression() {
+            import_failures.push(RawBodyImportFailure {
+                event_key,
+                failure_kind: RawBodyImportFailureKind::UnsupportedStoredCompression,
+            });
+            continue;
+        }
+
+        match prepare_raw_body_import_candidate(&state.raw_body_directory, candidate) {
+            Ok(RawBodyImportPreparation::Prepared(prepared)) => {
+                prepared_imports.push(prepared);
+            }
+            Ok(RawBodyImportPreparation::Missing(candidate)) => {
+                import_failures.push(RawBodyImportFailure {
+                    event_key: candidate.event_key().to_owned(),
+                    failure_kind: RawBodyImportFailureKind::Missing,
+                });
+            }
+            Ok(RawBodyImportPreparation::AlreadyCleaned(candidate)) => {
+                completed_event_keys.push(candidate.event_key().to_owned());
+            }
+            Err(error) => {
+                eprintln!("raw body source preparation failed: {error:?}");
+                import_failures.push(RawBodyImportFailure {
+                    event_key,
+                    failure_kind: raw_body_failure_kind(&error),
+                });
+            }
+        }
+    }
+
+    let stores_new_body = prepared_imports
+        .iter()
+        .any(|prepared| prepared.stores_body());
+    let inserted_event_keys = if prepared_imports.is_empty() {
+        Vec::new()
+    } else {
+        let mut store = state.store.lock().await;
+        store
+            .commit_prepared_raw_body_imports(&prepared_imports)
+            .map_err(|_| IngestError::StoreWriteFailed)?
+    };
+    let inserted_event_keys: HashSet<String> = inserted_event_keys.into_iter().collect();
+    let mut cleanup_imports = Vec::new();
+    for prepared in prepared_imports {
+        if !prepared.stores_body() || inserted_event_keys.contains(prepared.event_key()) {
+            cleanup_imports.push(prepared);
+        } else {
+            import_failures.push(RawBodyImportFailure {
+                event_key: prepared.event_key().to_owned(),
+                failure_kind: RawBodyImportFailureKind::Io,
+            });
+        }
+    }
+
+    let cleanup_report = cleanup_prepared_raw_body_imports(cleanup_imports);
+    for cleanup_error in cleanup_report.cleanup_errors {
+        eprintln!(
+            "raw body cleanup failed for event_key={} body_ref={}: {:?}",
+            cleanup_error.event_key, cleanup_error.body_ref, cleanup_error.error
+        );
+        import_failures.push(RawBodyImportFailure {
+            event_key: cleanup_error.event_key,
+            failure_kind: raw_body_failure_kind(&cleanup_error.error),
+        });
+    }
+    completed_event_keys.extend(cleanup_report.completed_event_keys);
+
+    if !completed_event_keys.is_empty() || !import_failures.is_empty() {
+        let mut store = state.store.lock().await;
+        store
+            .complete_raw_body_imports(&completed_event_keys)
+            .map_err(|_| IngestError::StoreWriteFailed)?;
+        store
+            .record_raw_body_import_failures(&import_failures)
+            .map_err(|_| IngestError::StoreWriteFailed)?;
+    }
+
+    if stores_new_body {
+        let _ = state.usage_updates.send(());
+    }
+    Ok(stores_new_body || !completed_event_keys.is_empty())
+}
+
+fn raw_body_failure_kind(error: &StoreError) -> RawBodyImportFailureKind {
+    match error {
+        StoreError::RawBodyPathEscapesDirectory
+        | StoreError::RawBodyNotRegularFile
+        | StoreError::RawBodyPathChangedBeforeDelete => RawBodyImportFailureKind::InvalidSource,
+        StoreError::RawBodySourceGrewBeforeDelete => RawBodyImportFailureKind::Io,
+        StoreError::RawBodyIo(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RawBodyImportFailureKind::Missing
+        }
+        StoreError::RawBodyIo(_) => RawBodyImportFailureKind::Io,
+        _ => RawBodyImportFailureKind::Io,
+    }
 }
 
 fn authorize(state: &DaemonState, headers: &HeaderMap) -> Result<(), IngestError> {
