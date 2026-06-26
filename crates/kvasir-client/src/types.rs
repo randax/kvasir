@@ -159,6 +159,10 @@ pub struct KvasirOverviewRollup {
     pub token_rollups: Vec<KvasirTokenRollup>,
     pub cost_rollups: Vec<KvasirCostRollup>,
     pub tool_call_rollups: Vec<KvasirToolCallRollup>,
+    pub session_summaries: Vec<KvasirOverviewSessionSummary>,
+    pub session_summaries_more_available: u64,
+    pub prompt_summaries: Vec<KvasirOverviewPromptSummary>,
+    pub prompt_summaries_more_available: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -167,6 +171,14 @@ pub struct KvasirOverviewTotals {
     pub cost_usd_nanos: u64,
     pub cost_source: Option<KvasirCostSource>,
     pub tool_calls: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirAttributionStatus {
+    Direct,
+    TraceDerived,
+    Partial,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -206,12 +218,16 @@ pub struct KvasirOverviewPromptRoute {
 pub struct KvasirOverviewSessionSummary {
     pub route: KvasirOverviewSessionRoute,
     pub totals: KvasirOverviewTotals,
+    pub attribution_status: KvasirAttributionStatus,
+    pub last_activity: KvasirTimestampMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirOverviewPromptSummary {
     pub route: KvasirOverviewPromptRoute,
     pub totals: KvasirOverviewTotals,
+    pub attribution_status: KvasirAttributionStatus,
+    pub last_activity: KvasirTimestampMillis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -240,7 +256,9 @@ pub struct KvasirOverviewSnapshot {
     pub repo_breakdown: Vec<KvasirOverviewRepoSummary>,
     pub model_breakdown: Vec<KvasirOverviewModelSummary>,
     pub session_breakdown: Vec<KvasirOverviewSessionSummary>,
+    pub session_breakdown_more_available: u64,
     pub prompt_breakdown: Vec<KvasirOverviewPromptSummary>,
+    pub prompt_breakdown_more_available: u64,
     pub selected_repo: Option<KvasirRepoBucket>,
     pub selected_model: Option<KvasirModelName>,
     pub selected_session: Option<KvasirOverviewSessionRoute>,
@@ -448,12 +466,21 @@ impl KvasirOverviewSnapshot {
         selected_session: Option<KvasirOverviewSessionRoute>,
         selected_prompt: Option<KvasirOverviewPromptRoute>,
     ) -> Self {
+        let KvasirOverviewRollup {
+            token_rollups,
+            cost_rollups,
+            tool_call_rollups,
+            session_summaries,
+            session_summaries_more_available,
+            prompt_summaries,
+            prompt_summaries_more_available,
+        } = rollup;
         let mut totals = KvasirOverviewTotals::zero();
         let mut points_by_day: HashMap<KvasirRollupDay, KvasirOverviewSeriesPoint> = HashMap::new();
         let mut totals_by_repo: HashMap<KvasirRepoBucket, KvasirOverviewTotals> = HashMap::new();
         let mut totals_by_model: HashMap<KvasirModelName, KvasirOverviewTotals> = HashMap::new();
 
-        for token_rollup in rollup.token_rollups {
+        for token_rollup in token_rollups {
             let KvasirTokenRollup {
                 day,
                 repo,
@@ -480,7 +507,7 @@ impl KvasirOverviewSnapshot {
             model_totals.total_tokens = model_totals.total_tokens.saturating_add(tokens);
         }
 
-        for cost_rollup in rollup.cost_rollups {
+        for cost_rollup in cost_rollups {
             let KvasirCostRollup {
                 day,
                 repo,
@@ -508,7 +535,7 @@ impl KvasirOverviewSnapshot {
             model_totals.cost_source = combined_cost_source(model_totals.cost_source, source);
         }
 
-        for tool_call_rollup in rollup.tool_call_rollups {
+        for tool_call_rollup in tool_call_rollups {
             totals.tool_calls = totals
                 .tool_calls
                 .saturating_add(tool_call_rollup.call_count);
@@ -544,8 +571,10 @@ impl KvasirOverviewSnapshot {
             series,
             repo_breakdown,
             model_breakdown,
-            session_breakdown: Vec::new(),
-            prompt_breakdown: Vec::new(),
+            session_breakdown: session_summaries,
+            session_breakdown_more_available: session_summaries_more_available,
+            prompt_breakdown: prompt_summaries,
+            prompt_breakdown_more_available: prompt_summaries_more_available,
             selected_repo,
             selected_model,
             selected_session,
@@ -1017,6 +1046,10 @@ mod tests {
                         call_count: 6,
                     },
                 ],
+                session_summaries: Vec::new(),
+                session_summaries_more_available: 0,
+                prompt_summaries: Vec::new(),
+                prompt_summaries_more_available: 0,
             },
             Some(selected_repo.clone()),
             None,
@@ -1144,6 +1177,10 @@ mod tests {
                     },
                 ],
                 tool_call_rollups: Vec::new(),
+                session_summaries: Vec::new(),
+                session_summaries_more_available: 0,
+                prompt_summaries: Vec::new(),
+                prompt_summaries_more_available: 0,
             },
             None,
             None,

@@ -88,8 +88,16 @@ struct OverviewScreen: View {
                     )
                     repoDashboard(snapshot.repoBreakdown, showsToolCalls: snapshot.selectedModel == nil)
                     modelDashboard(snapshot.modelBreakdown)
-                    sessionDashboard(snapshot.sessionBreakdown, showsToolCalls: snapshot.selectedModel == nil)
-                    promptDashboard(snapshot.promptBreakdown, showsToolCalls: snapshot.selectedModel == nil)
+                    sessionDashboard(
+                        snapshot.sessionBreakdown,
+                        moreAvailable: snapshot.sessionBreakdownMoreAvailable,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
+                    promptDashboard(
+                        snapshot.promptBreakdown,
+                        moreAvailable: snapshot.promptBreakdownMoreAvailable,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
                     charts(
                         snapshot.series,
                         costPresentation: costPresentation,
@@ -284,12 +292,23 @@ struct OverviewScreen: View {
         }
     }
 
-    private func sessionDashboard(_ sessions: [OverviewSessionSummary], showsToolCalls: Bool) -> some View {
+    private func sessionDashboard(
+        _ sessions: [OverviewSessionSummary],
+        moreAvailable: UInt64,
+        showsToolCalls: Bool
+    ) -> some View {
         Group {
             if !sessions.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Sessions")
-                        .font(.headline)
+                    HStack(spacing: 8) {
+                        Text("Sessions")
+                            .font(.headline)
+                        if moreAvailable > 0 {
+                            Text("\(moreAvailable.formatted()) more available")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
 
                     VStack(spacing: 0) {
                         SessionHeaderRow(showsToolCalls: showsToolCalls)
@@ -315,12 +334,23 @@ struct OverviewScreen: View {
         }
     }
 
-    private func promptDashboard(_ prompts: [OverviewPromptSummary], showsToolCalls: Bool) -> some View {
+    private func promptDashboard(
+        _ prompts: [OverviewPromptSummary],
+        moreAvailable: UInt64,
+        showsToolCalls: Bool
+    ) -> some View {
         Group {
             if !prompts.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Prompts")
-                        .font(.headline)
+                    HStack(spacing: 8) {
+                        Text("Prompts")
+                            .font(.headline)
+                        if moreAvailable > 0 {
+                            Text("\(moreAvailable.formatted()) more available")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
 
                     VStack(spacing: 0) {
                         PromptHeaderRow(showsToolCalls: showsToolCalls)
@@ -563,6 +593,8 @@ private struct SessionHeaderRow: View {
         HStack(spacing: 12) {
             Text("Session")
                 .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Status")
+                .frame(width: 96, alignment: .leading)
             Text("Tokens")
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
@@ -586,6 +618,8 @@ private struct PromptHeaderRow: View {
         HStack(spacing: 12) {
             Text("Prompt")
                 .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Status")
+                .frame(width: 96, alignment: .leading)
             Text("Tokens")
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
@@ -719,6 +753,7 @@ private struct SessionSummaryRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+                AttributionStatusChip(status: summary.attributionStatus)
                 Text(summary.totals.totalTokens.formatted())
                     .monospacedDigit()
                     .frame(width: 110, alignment: .trailing)
@@ -769,6 +804,7 @@ private struct PromptSummaryRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+                AttributionStatusChip(status: summary.attributionStatus)
                 Text(summary.totals.totalTokens.formatted())
                     .monospacedDigit()
                     .frame(width: 110, alignment: .trailing)
@@ -789,6 +825,32 @@ private struct PromptSummaryRow: View {
         }
         .buttonStyle(.plain)
         .help(summary.route.promptID.displayName())
+    }
+}
+
+private struct AttributionStatusChip: View {
+    let status: OverviewAttributionStatus
+
+    var body: some View {
+        Text(status.displayName)
+            .font(.caption.weight(.medium))
+            .lineLimit(1)
+            .foregroundStyle(foregroundColor)
+            .frame(width: 96, alignment: .leading)
+            .help(status.displayName)
+    }
+
+    private var foregroundColor: Color {
+        switch status {
+        case .direct:
+            return .secondary
+        case .traceDerived:
+            return .teal
+        case .partial:
+            return .orange
+        case .unavailable:
+            return .secondary
+        }
     }
 }
 

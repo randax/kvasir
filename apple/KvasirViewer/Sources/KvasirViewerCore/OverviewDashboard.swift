@@ -446,7 +446,9 @@ public struct OverviewSnapshot: Equatable, Sendable {
     public var repoBreakdown: [OverviewRepoSummary]
     public var modelBreakdown: [OverviewModelSummary]
     public var sessionBreakdown: [OverviewSessionSummary]
+    public var sessionBreakdownMoreAvailable: UInt64
     public var promptBreakdown: [OverviewPromptSummary]
+    public var promptBreakdownMoreAvailable: UInt64
     public var selectedRepo: OverviewRepoBucket?
     public var selectedModel: OverviewModelName?
     public var selectedSession: OverviewSessionRoute?
@@ -459,7 +461,9 @@ public struct OverviewSnapshot: Equatable, Sendable {
         repoBreakdown: [OverviewRepoSummary],
         modelBreakdown: [OverviewModelSummary] = [],
         sessionBreakdown: [OverviewSessionSummary] = [],
+        sessionBreakdownMoreAvailable: UInt64 = 0,
         promptBreakdown: [OverviewPromptSummary] = [],
+        promptBreakdownMoreAvailable: UInt64 = 0,
         selectedRepo: OverviewRepoBucket?,
         selectedModel: OverviewModelName? = nil,
         selectedSession: OverviewSessionRoute? = nil,
@@ -471,7 +475,9 @@ public struct OverviewSnapshot: Equatable, Sendable {
         self.repoBreakdown = repoBreakdown
         self.modelBreakdown = modelBreakdown
         self.sessionBreakdown = sessionBreakdown
+        self.sessionBreakdownMoreAvailable = sessionBreakdownMoreAvailable
         self.promptBreakdown = promptBreakdown
+        self.promptBreakdownMoreAvailable = promptBreakdownMoreAvailable
         self.selectedRepo = selectedRepo
         self.selectedModel = selectedModel
         self.selectedSession = selectedSession
@@ -522,23 +528,61 @@ public struct OverviewModelSummary: Equatable, Sendable {
     }
 }
 
+public enum OverviewAttributionStatus: Equatable, Sendable {
+    case direct
+    case traceDerived
+    case partial
+    case unavailable
+
+    public var displayName: String {
+        switch self {
+        case .direct:
+            return "Direct"
+        case .traceDerived:
+            return "Trace"
+        case .partial:
+            return "Partial"
+        case .unavailable:
+            return "Unavailable"
+        }
+    }
+}
+
 public struct OverviewSessionSummary: Equatable, Sendable {
     public var route: OverviewSessionRoute
     public var totals: OverviewTotals
+    public var attributionStatus: OverviewAttributionStatus
+    public var lastActivity: Date
 
-    public init(route: OverviewSessionRoute, totals: OverviewTotals) {
+    public init(
+        route: OverviewSessionRoute,
+        totals: OverviewTotals,
+        attributionStatus: OverviewAttributionStatus = .direct,
+        lastActivity: Date = Date(timeIntervalSince1970: 0)
+    ) {
         self.route = route
         self.totals = totals
+        self.attributionStatus = attributionStatus
+        self.lastActivity = lastActivity
     }
 }
 
 public struct OverviewPromptSummary: Equatable, Sendable {
     public var route: OverviewPromptRoute
     public var totals: OverviewTotals
+    public var attributionStatus: OverviewAttributionStatus
+    public var lastActivity: Date
 
-    public init(route: OverviewPromptRoute, totals: OverviewTotals) {
+    public init(
+        route: OverviewPromptRoute,
+        totals: OverviewTotals,
+        attributionStatus: OverviewAttributionStatus = .direct,
+        lastActivity: Date = Date(timeIntervalSince1970: 0)
+    ) {
         self.route = route
         self.totals = totals
+        self.attributionStatus = attributionStatus
+        self.lastActivity = lastActivity
     }
 }
 

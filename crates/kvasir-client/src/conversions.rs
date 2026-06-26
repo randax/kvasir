@@ -4,22 +4,25 @@ use kvasir_core::rpc::{
     ContentKindAvailability as CoreContentKindAvailability, ContentQuery,
     ContentReplay as CoreContentReplay, ContentReplayItem as CoreContentReplayItem,
     ContentUnavailableReason as CoreContentUnavailableReason, CostRollup as CoreCostRollup,
-    CostRollupQuery, OverviewRollup as CoreOverviewRollup, RollupQuery, RpcError, TimestampMillis,
-    TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
-    Trace as CoreTrace, TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery,
-    TraceSpan as CoreTraceSpan, TraceSpanKind as CoreTraceSpanKind,
+    CostRollupQuery, OverviewRollup as CoreOverviewRollup, PromptSummary as CorePromptSummary,
+    RollupQuery, RpcError, SessionSummary as CoreSessionSummary,
+    SummaryTotals as CoreSummaryTotals, TimestampMillis, TokenRollup as CoreTokenRollup,
+    ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery, Trace as CoreTrace,
+    TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery, TraceSpan as CoreTraceSpan,
+    TraceSpanKind as CoreTraceSpanKind,
 };
 use kvasir_core::{ContentKind as CoreContentKind, RepoBucket, RepoIdentity};
 
 use crate::error::KvasirClientError;
 use crate::types::{
-    KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
-    KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem,
-    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource, KvasirCostUsd,
-    KvasirOverviewRollup, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
-    KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceQuery,
-    KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirAttributionStatus, KvasirContentAvailability, KvasirContentKind,
+    KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
+    KvasirContentReplayItem, KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource,
+    KvasirCostUsd, KvasirOverviewPromptRoute, KvasirOverviewPromptSummary, KvasirOverviewRollup,
+    KvasirOverviewSessionRoute, KvasirOverviewSessionSummary, KvasirOverviewTotals,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace,
+    KvasirTraceDurationMeasures, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -201,6 +204,72 @@ impl TryFrom<CoreToolCallRollup> for KvasirToolCallRollup {
     }
 }
 
+impl From<kvasir_core::rpc::AttributionStatus> for KvasirAttributionStatus {
+    fn from(status: kvasir_core::rpc::AttributionStatus) -> Self {
+        match status {
+            kvasir_core::rpc::AttributionStatus::Direct => Self::Direct,
+            kvasir_core::rpc::AttributionStatus::TraceDerived => Self::TraceDerived,
+            kvasir_core::rpc::AttributionStatus::Partial => Self::Partial,
+            kvasir_core::rpc::AttributionStatus::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl From<CoreSummaryTotals> for KvasirOverviewTotals {
+    fn from(totals: CoreSummaryTotals) -> Self {
+        Self {
+            total_tokens: totals.total_tokens,
+            cost_usd_nanos: totals.cost_usd.as_nanos(),
+            cost_source: totals.cost_source.map(KvasirCostSource::from),
+            tool_calls: totals.tool_calls,
+        }
+    }
+}
+
+impl From<kvasir_core::rpc::SessionRoute> for KvasirOverviewSessionRoute {
+    fn from(route: kvasir_core::rpc::SessionRoute) -> Self {
+        Self {
+            harness: crate::types::KvasirHarnessName::from_core(route.harness),
+            session_id: crate::types::KvasirSessionId::from_core(route.session_id),
+        }
+    }
+}
+
+impl From<kvasir_core::rpc::PromptRoute> for KvasirOverviewPromptRoute {
+    fn from(route: kvasir_core::rpc::PromptRoute) -> Self {
+        Self {
+            session: route.session.into(),
+            prompt_id: crate::types::KvasirPromptId::from_core(route.prompt_id),
+        }
+    }
+}
+
+impl From<CoreSessionSummary> for KvasirOverviewSessionSummary {
+    fn from(summary: CoreSessionSummary) -> Self {
+        Self {
+            route: summary.route.into(),
+            totals: summary.totals.into(),
+            attribution_status: summary.attribution_status.into(),
+            last_activity: KvasirTimestampMillis {
+                value: summary.last_activity.value(),
+            },
+        }
+    }
+}
+
+impl From<CorePromptSummary> for KvasirOverviewPromptSummary {
+    fn from(summary: CorePromptSummary) -> Self {
+        Self {
+            route: summary.route.into(),
+            totals: summary.totals.into(),
+            attribution_status: summary.attribution_status.into(),
+            last_activity: KvasirTimestampMillis {
+                value: summary.last_activity.value(),
+            },
+        }
+    }
+}
+
 impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
     type Error = KvasirClientError;
 
@@ -221,6 +290,18 @@ impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
                 .into_iter()
                 .map(KvasirToolCallRollup::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            session_summaries: rollup
+                .session_summaries
+                .into_iter()
+                .map(KvasirOverviewSessionSummary::from)
+                .collect(),
+            session_summaries_more_available: rollup.session_summaries_more_available,
+            prompt_summaries: rollup
+                .prompt_summaries
+                .into_iter()
+                .map(KvasirOverviewPromptSummary::from)
+                .collect(),
+            prompt_summaries_more_available: rollup.prompt_summaries_more_available,
         })
     }
 }

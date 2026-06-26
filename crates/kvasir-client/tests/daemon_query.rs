@@ -14,9 +14,9 @@ use kvasir_client::{
     KvasirCostSource, KvasirCostUsd, KvasirHarnessName, KvasirModelName,
     KvasirOverviewModelSummary, KvasirOverviewRepoSummary, KvasirOverviewRollup,
     KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute, KvasirOverviewSnapshot,
-    KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind,
-    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId,
-    KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
+    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath,
+    KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
     KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures,
     KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
@@ -1196,6 +1196,10 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     call_count: 2,
                 },
             ],
+            session_summaries: Vec::new(),
+            session_summaries_more_available: 0,
+            prompt_summaries: Vec::new(),
+            prompt_summaries_more_available: 0,
         }
     );
     assert_eq!(
@@ -1261,7 +1265,9 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                 },
             ],
             session_breakdown: vec![],
+            session_breakdown_more_available: 0,
             prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
             selected_repo: Some(kvasir_repo()),
             selected_model: None,
             selected_session: None,
@@ -1384,7 +1390,9 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
                 },
             }],
             session_breakdown: vec![],
+            session_breakdown_more_available: 0,
             prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
             selected_repo: Some(kvasir_repo()),
             selected_model: Some(selected_model),
             selected_session: None,
@@ -1397,8 +1405,8 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn client_deep_scoped_overview_snapshot_does_not_leak_aggregate_rollups()
--> anyhow::Result<()> {
+async fn client_deep_scoped_overview_snapshot_does_not_leak_aggregate_rollups() -> anyhow::Result<()>
+{
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
     let daemon = start_with_store_key_source(
@@ -1456,7 +1464,9 @@ async fn client_deep_scoped_overview_snapshot_does_not_leak_aggregate_rollups()
             repo_breakdown: vec![],
             model_breakdown: vec![],
             session_breakdown: vec![],
+            session_breakdown_more_available: 0,
             prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
             selected_repo: Some(kvasir_repo()),
             selected_model: None,
             selected_session: Some(selected_session),

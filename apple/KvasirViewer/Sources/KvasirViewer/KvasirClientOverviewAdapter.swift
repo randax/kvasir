@@ -1,4 +1,5 @@
 #if canImport(kvasir_client)
+import Foundation
 import kvasir_client
 import KvasirViewerCore
 
@@ -109,7 +110,9 @@ private extension KvasirOverviewSnapshot {
             repoBreakdown: repoBreakdown.map { $0.overviewRepoSummary },
             modelBreakdown: modelBreakdown.map { $0.overviewModelSummary },
             sessionBreakdown: sessionBreakdown.map { $0.overviewSessionSummary },
+            sessionBreakdownMoreAvailable: sessionBreakdownMoreAvailable,
             promptBreakdown: promptBreakdown.map { $0.overviewPromptSummary },
+            promptBreakdownMoreAvailable: promptBreakdownMoreAvailable,
             selectedRepo: selectedRepo?.overviewRepo,
             selectedModel: selectedModel.map(OverviewModelName.init),
             selectedSession: selectedSession?.overviewSessionRoute,
@@ -156,13 +159,38 @@ private extension KvasirOverviewModelSummary {
 
 private extension KvasirOverviewSessionSummary {
     var overviewSessionSummary: OverviewSessionSummary {
-        OverviewSessionSummary(route: route.overviewSessionRoute, totals: totals.overviewTotals)
+        OverviewSessionSummary(
+            route: route.overviewSessionRoute,
+            totals: totals.overviewTotals,
+            attributionStatus: attributionStatus.overviewAttributionStatus,
+            lastActivity: lastActivity.overviewDate
+        )
     }
 }
 
 private extension KvasirOverviewPromptSummary {
     var overviewPromptSummary: OverviewPromptSummary {
-        OverviewPromptSummary(route: route.overviewPromptRoute, totals: totals.overviewTotals)
+        OverviewPromptSummary(
+            route: route.overviewPromptRoute,
+            totals: totals.overviewTotals,
+            attributionStatus: attributionStatus.overviewAttributionStatus,
+            lastActivity: lastActivity.overviewDate
+        )
+    }
+}
+
+private extension KvasirAttributionStatus {
+    var overviewAttributionStatus: OverviewAttributionStatus {
+        switch self {
+        case .direct:
+            return .direct
+        case .traceDerived:
+            return .traceDerived
+        case .partial:
+            return .partial
+        case .unavailable:
+            return .unavailable
+        }
     }
 }
 
@@ -203,6 +231,12 @@ private extension KvasirOverviewDimensionKind {
 private extension KvasirRollupDay {
     var overviewDay: OverviewRollupDay {
         OverviewRollupDay(year: Int(year), month: Int(month), day: Int(day))
+    }
+}
+
+private extension KvasirTimestampMillis {
+    var overviewDate: Date {
+        Date(timeIntervalSince1970: Double(value) / 1_000)
     }
 }
 

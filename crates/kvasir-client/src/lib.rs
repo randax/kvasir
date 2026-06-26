@@ -14,19 +14,19 @@ pub use setup::{
     uninstall_kvasir_harness_telemetry,
 };
 pub use types::{
-    KvasirBearerToken, KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
-    KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem, KvasirContentText,
-    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource, KvasirCostUsd,
-    KvasirDimensionValue, KvasirHarnessName, KvasirModelName, KvasirOverviewDimensionFilter,
-    KvasirOverviewDimensionKind, KvasirOverviewModelSummary, KvasirOverviewPromptRoute,
-    KvasirOverviewPromptSummary, KvasirOverviewRepoSummary, KvasirOverviewRollup,
-    KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute, KvasirOverviewSessionSummary,
-    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
-    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
-    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
-    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTrace,
-    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind,
+    KvasirAttributionStatus, KvasirBearerToken, KvasirContentAvailability, KvasirContentKind,
+    KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
+    KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
+    KvasirCostSource, KvasirCostUsd, KvasirDimensionValue, KvasirHarnessName, KvasirModelName,
+    KvasirOverviewDimensionFilter, KvasirOverviewDimensionKind, KvasirOverviewModelSummary,
+    KvasirOverviewPromptRoute, KvasirOverviewPromptSummary, KvasirOverviewRepoSummary,
+    KvasirOverviewRollup, KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute,
+    KvasirOverviewSessionSummary, KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
+    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
+    KvasirToolName, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery,
+    KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 uniffi::setup_scaffolding!();

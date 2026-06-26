@@ -994,6 +994,8 @@ fn overview_rollups(
     store: &kvasir_core::UsageStore,
     query: RollupQuery,
 ) -> Result<OverviewRollup, kvasir_core::store::StoreError> {
+    let session_summary_page = store.session_summaries(query.clone())?;
+    let prompt_summary_page = store.prompt_summaries(query.clone())?;
     Ok(OverviewRollup {
         token_rollups: store.token_rollups(query.clone())?,
         cost_rollups: store.cost_rollups(CostRollupQuery {
@@ -1014,6 +1016,10 @@ fn overview_rollups(
             session_id: query.session_id,
             prompt_id: query.prompt_id,
         })?,
+        session_summaries: session_summary_page.summaries,
+        session_summaries_more_available: session_summary_page.more_available,
+        prompt_summaries: prompt_summary_page.summaries,
+        prompt_summaries_more_available: prompt_summary_page.more_available,
     })
 }
 

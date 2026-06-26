@@ -57,7 +57,7 @@ impl ModelName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct HarnessName(String);
 
 impl HarnessName {
@@ -109,7 +109,7 @@ impl ToolName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);
 
 impl SessionId {
@@ -122,7 +122,7 @@ impl SessionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PromptId(String);
 
 impl PromptId {
@@ -283,6 +283,63 @@ pub struct RollupQuery {
     pub prompt_id: Option<PromptId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionRoute {
+    pub harness: HarnessName,
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PromptRoute {
+    pub session: SessionRoute,
+    pub prompt_id: PromptId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionStatus {
+    Direct,
+    TraceDerived,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryTotals {
+    pub total_tokens: u64,
+    pub cost_usd: CostUsd,
+    pub cost_source: Option<CostSource>,
+    pub tool_calls: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub route: SessionRoute,
+    pub totals: SummaryTotals,
+    pub attribution_status: AttributionStatus,
+    pub last_activity: TimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummaryPage {
+    pub summaries: Vec<SessionSummary>,
+    pub more_available: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSummary {
+    pub route: PromptRoute,
+    pub totals: SummaryTotals,
+    pub attribution_status: AttributionStatus,
+    pub last_activity: TimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSummaryPage {
+    pub summaries: Vec<PromptSummary>,
+    pub more_available: u64,
+}
+
 impl RollupQuery {
     pub fn new(start: TimestampMillis, end: TimestampMillis) -> Self {
         Self {
@@ -327,6 +384,15 @@ impl RollupQuery {
     pub fn with_prompt(self, prompt_id: PromptId) -> Self {
         Self {
             prompt_id: Some(prompt_id),
+            ..self
+        }
+    }
+
+    pub fn with_session_route(self, route: SessionRoute) -> Self {
+        Self {
+            harness: Some(route.harness),
+            session_id: Some(route.session_id),
+            prompt_id: None,
             ..self
         }
     }
@@ -519,6 +585,10 @@ pub struct OverviewRollup {
     pub token_rollups: Vec<TokenRollup>,
     pub cost_rollups: Vec<CostRollup>,
     pub tool_call_rollups: Vec<ToolCallRollup>,
+    pub session_summaries: Vec<SessionSummary>,
+    pub session_summaries_more_available: u64,
+    pub prompt_summaries: Vec<PromptSummary>,
+    pub prompt_summaries_more_available: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
