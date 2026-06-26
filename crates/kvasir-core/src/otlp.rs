@@ -316,6 +316,8 @@ pub fn parse_otlp_json_traces(bytes: &[u8]) -> Result<UsageRecords, OtlpError> {
                     span,
                     repo.clone(),
                     harness.as_deref(),
+                    session_id.clone(),
+                    prompt_id.clone(),
                 )?);
                 if let Some(record) = json_trace_span_record(
                     span,
@@ -558,6 +560,8 @@ fn records_from_scope_spans_for_traces(
             &span,
             repo.clone(),
             resource_harness,
+            resource_session_id.clone(),
+            resource_prompt_id.clone(),
         )?);
         if let Some(record) = proto_trace_span_record(
             span,
@@ -1428,7 +1432,6 @@ fn proto_content_record(
         &prompt_id,
         kind,
         occurred_at_nanos,
-        content.as_str(),
     );
     Ok(Some(ContentRecord {
         event_key,
@@ -1485,7 +1488,6 @@ fn json_content_record(
         &prompt_id,
         kind,
         occurred_at_nanos,
-        content.as_str(),
     );
     Ok(Some(ContentRecord {
         event_key,
@@ -1940,6 +1942,9 @@ fn proto_trace_span_record(
     resource_prompt_id: Option<PromptId>,
     resource_harness: Option<&str>,
 ) -> Result<Option<TraceSpanRecord>, OtlpError> {
+    let is_opencode_span = is_opencode_span(resource_harness, &span.name, |key| {
+        proto_attribute(&span.attributes, key)
+    });
     let Some(kind) = proto_trace_span_kind(&span.attributes)
         .or_else(|| opencode_inferred_proto_span_kind(resource_harness, &span))
     else {
@@ -1950,24 +1955,50 @@ fn proto_trace_span_record(
     };
     let Some(session_id) = resource_session_id.or_else(|| proto_session_id(&span.attributes))
     else {
-        if is_opencode_context(resource_harness) {
+        if is_opencode_span {
             return Ok(None);
         }
         return Err(OtlpError::MissingSessionId);
     };
-    let Some(prompt_id) = resource_prompt_id.or_else(|| proto_prompt_id(&span.attributes)) else {
-        if is_opencode_context(resource_harness) {
+    let Some(prompt_id) =
+        proto_trace_prompt_id(resource_prompt_id, &span.attributes, is_opencode_span)
+    else {
+        if is_opencode_span {
             return Ok(None);
         }
         return Err(OtlpError::MissingPromptId);
     };
-    let trace_id = canonical_proto_trace_id(span.trace_id)?;
-    let span_id = canonical_proto_span_id(span.span_id)?;
-    let parent_span_id = canonical_proto_parent_span_id(span.parent_span_id)?.map(SpanId::new);
-    let started_at = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano)
-        .ok_or(OtlpError::MissingTimestamp)?;
-    let ended_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
-        .ok_or(OtlpError::MissingTimestamp)?;
+    let trace_id = match canonical_proto_trace_id(span.trace_id) {
+        Ok(trace_id) => trace_id,
+        Err(OtlpError::MissingTraceId | OtlpError::InvalidTraceId) if is_opencode_span => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let span_id = match canonical_proto_span_id(span.span_id) {
+        Ok(span_id) => span_id,
+        Err(OtlpError::MissingSpanId | OtlpError::InvalidSpanId) if is_opencode_span => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let parent_span_id = match canonical_proto_parent_span_id(span.parent_span_id) {
+        Ok(parent_span_id) => parent_span_id.map(SpanId::new),
+        Err(OtlpError::InvalidSpanId) if is_opencode_span => None,
+        Err(err) => return Err(err),
+    };
+    let Some(started_at) = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano) else {
+        if is_opencode_span {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingTimestamp);
+    };
+    let Some(ended_at) = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano) else {
+        if is_opencode_span {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingTimestamp);
+    };
     let tool_name = if kind == TraceSpanKind::ToolCall {
         proto_trace_tool_name(&span.attributes)
     } else {
@@ -1995,6 +2026,8 @@ fn proto_opencode_span_records(
     span: &OtlpSpan,
     repo: RepoBucket,
     resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
 ) -> Result<UsageRecords, OtlpError> {
     if !is_opencode_span(resource_harness, &span.name, |key| {
         proto_attribute(&span.attributes, key)
@@ -2003,8 +2036,21 @@ fn proto_opencode_span_records(
     }
     let mut records = UsageRecords::default();
     records.extend(proto_opencode_token_records(span, repo.clone())?);
+    let content_span_kind = opencode_inferred_proto_span_kind(resource_harness, span);
+    let content_repo = repo.clone();
     if let Some(record) = proto_opencode_tool_call_record(span, repo)? {
         records.tool_calls.push(record);
+    }
+    if let Some(span_kind @ (TraceSpanKind::LlmRequest | TraceSpanKind::ToolCall)) =
+        content_span_kind
+    {
+        records.content.extend(proto_opencode_content_records(
+            span,
+            span_kind,
+            content_repo,
+            resource_session_id,
+            resource_prompt_id,
+        )?);
     }
     Ok(records)
 }
@@ -2013,6 +2059,8 @@ fn json_opencode_span_records(
     span: &Value,
     repo: RepoBucket,
     resource_harness: Option<&str>,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
 ) -> Result<UsageRecords, OtlpError> {
     let attributes = span.get("attributes").and_then(Value::as_array);
     let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -2023,10 +2071,311 @@ fn json_opencode_span_records(
     }
     let mut records = UsageRecords::default();
     records.extend(json_opencode_token_records(span, attributes, repo.clone())?);
+    let content_span_kind = opencode_inferred_json_span_kind(resource_harness, span);
+    let content_repo = repo.clone();
     if let Some(record) = json_opencode_tool_call_record(span, attributes, repo)? {
         records.tool_calls.push(record);
     }
+    if let Some(span_kind @ (TraceSpanKind::LlmRequest | TraceSpanKind::ToolCall)) =
+        content_span_kind
+    {
+        records.content.extend(json_opencode_content_records(
+            span,
+            attributes,
+            span_kind,
+            content_repo,
+            resource_session_id,
+            resource_prompt_id,
+        )?);
+    }
     Ok(records)
+}
+
+fn proto_opencode_content_records(
+    span: &OtlpSpan,
+    span_kind: TraceSpanKind,
+    repo: RepoBucket,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<Vec<ContentRecord>, OtlpError> {
+    let mut contents: Vec<(ContentKind, ContentText)> = Vec::new();
+    let explicit_opt_in = opencode_proto_content_opted_in(&span.attributes);
+    for &kind in opencode_inline_content_kinds_for_span(span_kind) {
+        if let Some(content) = proto_opencode_span_content(&span.attributes, kind, explicit_opt_in)
+        {
+            contents.push((kind, content));
+        }
+    }
+    if let Some((kind, content)) = explicit_opt_in
+        .then(|| proto_typed_span_content(&span.attributes))
+        .flatten()
+    {
+        let already_captured = contents
+            .iter()
+            .any(|(captured_kind, _)| *captured_kind == kind);
+        if !already_captured {
+            contents.push((kind, content));
+        }
+    }
+    if contents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(session_id) = resource_session_id.or_else(|| proto_session_id(&span.attributes))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(prompt_id) = proto_opencode_prompt_id(resource_prompt_id, &span.attributes) else {
+        return Ok(Vec::new());
+    };
+    let Some(started_at) = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano) else {
+        return Ok(Vec::new());
+    };
+    if started_at.value() == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(occurred_at) = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano) else {
+        return Ok(Vec::new());
+    };
+    let trace_id = match canonical_proto_trace_id(span.trace_id.clone()) {
+        Ok(trace_id) => trace_id,
+        Err(OtlpError::MissingTraceId | OtlpError::InvalidTraceId) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let span_id = match canonical_proto_span_id(span.span_id.clone()) {
+        Ok(span_id) => span_id,
+        Err(OtlpError::MissingSpanId | OtlpError::InvalidSpanId) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut records = Vec::new();
+    for (kind, content) in contents {
+        records.push(trace_content_record(TraceContentRecordParts {
+            repo: repo.clone(),
+            session_id: session_id.clone(),
+            prompt_id: prompt_id.clone(),
+            kind,
+            occurred_at,
+            occurred_at_nanos: span.end_time_unix_nano,
+            trace_id: &trace_id,
+            span_id: &span_id,
+            content,
+        }));
+    }
+    Ok(records)
+}
+
+fn json_opencode_content_records(
+    span: &Value,
+    attributes: Option<&Vec<Value>>,
+    span_kind: TraceSpanKind,
+    repo: RepoBucket,
+    resource_session_id: Option<SessionId>,
+    resource_prompt_id: Option<PromptId>,
+) -> Result<Vec<ContentRecord>, OtlpError> {
+    let mut contents: Vec<(ContentKind, ContentText)> = Vec::new();
+    let explicit_opt_in = opencode_json_content_opted_in(attributes);
+    for &kind in opencode_inline_content_kinds_for_span(span_kind) {
+        if let Some(content) = json_opencode_span_content(attributes, kind, explicit_opt_in) {
+            contents.push((kind, content));
+        }
+    }
+    if let Some((kind, content)) = explicit_opt_in
+        .then(|| json_typed_span_content(attributes))
+        .flatten()
+    {
+        let already_captured = contents
+            .iter()
+            .any(|(captured_kind, _)| *captured_kind == kind);
+        if !already_captured {
+            contents.push((kind, content));
+        }
+    }
+    if contents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(session_id) = resource_session_id.or_else(|| json_session_id(attributes)) else {
+        return Ok(Vec::new());
+    };
+    let Some(prompt_id) = json_opencode_prompt_id(resource_prompt_id, attributes) else {
+        return Ok(Vec::new());
+    };
+    let Some(started_at) = json_timestamp(span, "startTimeUnixNano") else {
+        return Ok(Vec::new());
+    };
+    if started_at.value() == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(occurred_at_nanos) = json_number(span, "endTimeUnixNano") else {
+        return Ok(Vec::new());
+    };
+    let Some(occurred_at) = TimestampMillis::try_from_unix_nanos(occurred_at_nanos) else {
+        return Ok(Vec::new());
+    };
+    let trace_id = match canonical_json_trace_id(span.get("traceId").and_then(Value::as_str)) {
+        Ok(trace_id) => trace_id,
+        Err(OtlpError::MissingTraceId | OtlpError::InvalidTraceId) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let span_id = match canonical_json_span_id(span.get("spanId").and_then(Value::as_str)) {
+        Ok(span_id) => span_id,
+        Err(OtlpError::MissingSpanId | OtlpError::InvalidSpanId) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut records = Vec::new();
+    for (kind, content) in contents {
+        records.push(trace_content_record(TraceContentRecordParts {
+            repo: repo.clone(),
+            session_id: session_id.clone(),
+            prompt_id: prompt_id.clone(),
+            kind,
+            occurred_at,
+            occurred_at_nanos,
+            trace_id: &trace_id,
+            span_id: &span_id,
+            content,
+        }));
+    }
+    Ok(records)
+}
+
+fn opencode_inline_content_kinds_for_span(kind: TraceSpanKind) -> &'static [ContentKind] {
+    match kind {
+        TraceSpanKind::LlmRequest => &[ContentKind::UserPrompt, ContentKind::AssistantMessage],
+        TraceSpanKind::ToolCall => &[ContentKind::ToolInput, ContentKind::ToolOutput],
+        TraceSpanKind::Interaction => &[],
+    }
+}
+
+fn proto_opencode_span_content(
+    attributes: &[KeyValue],
+    kind: ContentKind,
+    explicit_opt_in: bool,
+) -> Option<ContentText> {
+    first_meaningful_proto_content_attribute(attributes, opencode_sdk_content_attribute_keys(kind))
+        .or_else(|| {
+            explicit_opt_in
+                .then(|| {
+                    first_meaningful_proto_content_attribute(
+                        attributes,
+                        opencode_explicit_content_attribute_keys(kind),
+                    )
+                })
+                .flatten()
+        })
+        .and_then(ContentText::new)
+}
+
+fn json_opencode_span_content(
+    attributes: Option<&Vec<Value>>,
+    kind: ContentKind,
+    explicit_opt_in: bool,
+) -> Option<ContentText> {
+    first_meaningful_json_content_attribute(attributes, opencode_sdk_content_attribute_keys(kind))
+        .or_else(|| {
+            explicit_opt_in
+                .then(|| {
+                    first_meaningful_json_content_attribute(
+                        attributes,
+                        opencode_explicit_content_attribute_keys(kind),
+                    )
+                })
+                .flatten()
+        })
+        .and_then(ContentText::new)
+}
+
+fn opencode_explicit_content_attribute_keys(kind: ContentKind) -> &'static [&'static str] {
+    match kind {
+        ContentKind::UserPrompt => &["content.user_prompt", "content.user"],
+        ContentKind::AssistantMessage => &["content.assistant_message", "content.assistant"],
+        ContentKind::ToolInput => &["content.tool_input"],
+        ContentKind::ToolOutput => &["content.tool_output", "content.tool_result"],
+        ContentKind::RawApiRequest | ContentKind::RawApiResponse => &[],
+    }
+}
+
+fn opencode_sdk_content_attribute_keys(kind: ContentKind) -> &'static [&'static str] {
+    match kind {
+        ContentKind::UserPrompt => &["gen_ai.input.messages", "ai.prompt.messages", "ai.prompt"],
+        ContentKind::AssistantMessage => &[
+            "gen_ai.output.messages",
+            "ai.response.messages",
+            "ai.response.text",
+        ],
+        ContentKind::ToolInput => &["ai.toolCall.args", "gen_ai.tool.call.arguments"],
+        ContentKind::ToolOutput => &["ai.toolCall.result", "gen_ai.tool.call.result"],
+        ContentKind::RawApiRequest | ContentKind::RawApiResponse => &[],
+    }
+}
+
+fn opencode_proto_content_opted_in(attributes: &[KeyValue]) -> bool {
+    proto_any_bool_attribute(
+        attributes,
+        &[
+            "content.opt_in",
+            "ai.content.opt_in",
+            "kvasir.content.opt_in",
+        ],
+    )
+}
+
+fn opencode_json_content_opted_in(attributes: Option<&Vec<Value>>) -> bool {
+    json_any_bool_attribute(
+        attributes,
+        &[
+            "content.opt_in",
+            "ai.content.opt_in",
+            "kvasir.content.opt_in",
+        ],
+    )
+}
+
+fn proto_typed_span_content(attributes: &[KeyValue]) -> Option<(ContentKind, ContentText)> {
+    let kind = first_meaningful_proto_attribute(attributes, &["content.type", "content.kind"])
+        .and_then(|value| ContentKind::from_inline_content_attribute(&value))?;
+    let content = first_meaningful_proto_attribute(
+        attributes,
+        &["content", "content.value", "content.text", "content.body"],
+    )
+    .and_then(ContentText::new)?;
+    Some((kind, content))
+}
+
+fn json_typed_span_content(attributes: Option<&Vec<Value>>) -> Option<(ContentKind, ContentText)> {
+    let kind = first_meaningful_json_attribute(attributes, &["content.type", "content.kind"])
+        .and_then(|value| ContentKind::from_inline_content_attribute(&value))?;
+    let content = first_meaningful_json_attribute(
+        attributes,
+        &["content", "content.value", "content.text", "content.body"],
+    )
+    .and_then(ContentText::new)?;
+    Some((kind, content))
+}
+
+struct TraceContentRecordParts<'a> {
+    repo: RepoBucket,
+    session_id: SessionId,
+    prompt_id: PromptId,
+    kind: ContentKind,
+    occurred_at: TimestampMillis,
+    occurred_at_nanos: u64,
+    trace_id: &'a str,
+    span_id: &'a str,
+    content: ContentText,
+}
+
+fn trace_content_record(parts: TraceContentRecordParts<'_>) -> ContentRecord {
+    ContentRecord {
+        event_key: trace_content_event_key(&parts),
+        occurred_at: parts.occurred_at,
+        session_id: parts.session_id,
+        prompt_id: parts.prompt_id,
+        repo: parts.repo,
+        harness: HarnessName::new("opencode"),
+        kind: parts.kind,
+        content: parts.content,
+    }
 }
 
 fn proto_opencode_token_records(
@@ -2036,17 +2385,25 @@ fn proto_opencode_token_records(
     let Some(model) = opencode_proto_model(&span.attributes) else {
         return Ok(UsageRecords::default());
     };
-    let occurred_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
-        .ok_or(OtlpError::MissingTimestamp)?;
-    let counter_start = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano)
-        .ok_or(OtlpError::MissingTimestamp)?;
-    let trace_id = canonical_proto_trace_id(span.trace_id.clone())?;
-    let span_id = canonical_proto_span_id(span.span_id.clone())?;
+    let Some(occurred_at) = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano) else {
+        return Ok(UsageRecords::default());
+    };
+    let Some(counter_start) = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano)
+    else {
+        return Ok(UsageRecords::default());
+    };
+    let Some(trace_id) = proto_opencode_trace_id(&span.trace_id) else {
+        return Ok(UsageRecords::default());
+    };
+    let Some(span_id) = proto_opencode_span_id(&span.span_id) else {
+        return Ok(UsageRecords::default());
+    };
     let mut records = UsageRecords::default();
     for (measure, keys) in opencode_token_attribute_keys() {
-        let Some(token_count) = proto_token_count_attribute(&span.attributes, keys).transpose()?
-        else {
-            continue;
+        let token_count = match proto_token_count_attribute(&span.attributes, keys).transpose() {
+            Ok(Some(token_count)) => token_count,
+            Ok(None) => continue,
+            Err(_) => return Ok(UsageRecords::default()),
         };
         let event_key = trace_token_usage_event_key(
             &repo,
@@ -2087,15 +2444,24 @@ fn json_opencode_token_records(
     let Some(model) = opencode_json_model(attributes) else {
         return Ok(UsageRecords::default());
     };
-    let occurred_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
-    let counter_start =
-        json_timestamp(span, "startTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
-    let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
-    let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
+    let Some(occurred_at) = json_timestamp(span, "endTimeUnixNano") else {
+        return Ok(UsageRecords::default());
+    };
+    let Some(counter_start) = json_timestamp(span, "startTimeUnixNano") else {
+        return Ok(UsageRecords::default());
+    };
+    let Some(trace_id) = json_opencode_trace_id(span) else {
+        return Ok(UsageRecords::default());
+    };
+    let Some(span_id) = json_opencode_span_id(span) else {
+        return Ok(UsageRecords::default());
+    };
     let mut records = UsageRecords::default();
     for (measure, keys) in opencode_token_attribute_keys() {
-        let Some(token_count) = json_token_count_attribute(attributes, keys).transpose()? else {
-            continue;
+        let token_count = match json_token_count_attribute(attributes, keys).transpose() {
+            Ok(Some(token_count)) => token_count,
+            Ok(None) => continue,
+            Err(_) => return Ok(UsageRecords::default()),
         };
         let event_key = trace_token_usage_event_key(
             &repo,
@@ -2138,10 +2504,15 @@ fn proto_opencode_tool_call_record(
     let Ok(tool_name) = proto_tool_name(&span.attributes) else {
         return Ok(None);
     };
-    let occurred_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
-        .ok_or(OtlpError::MissingTimestamp)?;
-    let trace_id = canonical_proto_trace_id(span.trace_id.clone())?;
-    let span_id = canonical_proto_span_id(span.span_id.clone())?;
+    let Some(occurred_at) = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano) else {
+        return Ok(None);
+    };
+    let Some(trace_id) = proto_opencode_trace_id(&span.trace_id) else {
+        return Ok(None);
+    };
+    let Some(span_id) = proto_opencode_span_id(&span.span_id) else {
+        return Ok(None);
+    };
     let event_key = trace_tool_call_event_key(&repo, &trace_id, &span_id, tool_name.as_str());
     Ok(Some(
         ToolCallRecord::new(
@@ -2166,9 +2537,15 @@ fn json_opencode_tool_call_record(
     let Ok(tool_name) = json_tool_name(attributes) else {
         return Ok(None);
     };
-    let occurred_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
-    let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
-    let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
+    let Some(occurred_at) = json_timestamp(span, "endTimeUnixNano") else {
+        return Ok(None);
+    };
+    let Some(trace_id) = json_opencode_trace_id(span) else {
+        return Ok(None);
+    };
+    let Some(span_id) = json_opencode_span_id(span) else {
+        return Ok(None);
+    };
     let event_key = trace_tool_call_event_key(&repo, &trace_id, &span_id, tool_name.as_str());
     Ok(Some(
         ToolCallRecord::new(
@@ -2190,6 +2567,9 @@ fn json_trace_span_record(
 ) -> Result<Option<TraceSpanRecord>, OtlpError> {
     let attributes = span.get("attributes").and_then(Value::as_array);
     let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
+    let is_opencode_span = is_opencode_span(resource_harness, name, |key| {
+        json_attribute(attributes, key)
+    });
     let Some(kind) = json_trace_span_kind(attributes)
         .or_else(|| opencode_inferred_json_span_kind(resource_harness, span))
     else {
@@ -2199,29 +2579,54 @@ fn json_trace_span_record(
         return Err(OtlpError::InvalidTraceSpanKind);
     };
     let Some(session_id) = resource_session_id.or_else(|| json_session_id(attributes)) else {
-        if is_opencode_context(resource_harness) {
+        if is_opencode_span {
             return Ok(None);
         }
         return Err(OtlpError::MissingSessionId);
     };
-    let Some(prompt_id) = resource_prompt_id.or_else(|| json_prompt_id(attributes)) else {
-        if is_opencode_context(resource_harness) {
+    let Some(prompt_id) = json_trace_prompt_id(resource_prompt_id, attributes, is_opencode_span)
+    else {
+        if is_opencode_span {
             return Ok(None);
         }
         return Err(OtlpError::MissingPromptId);
     };
-    let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
-    let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
-    let parent_span_id = span
+    let trace_id = match canonical_json_trace_id(span.get("traceId").and_then(Value::as_str)) {
+        Ok(trace_id) => trace_id,
+        Err(OtlpError::MissingTraceId | OtlpError::InvalidTraceId) if is_opencode_span => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let span_id = match canonical_json_span_id(span.get("spanId").and_then(Value::as_str)) {
+        Ok(span_id) => span_id,
+        Err(OtlpError::MissingSpanId | OtlpError::InvalidSpanId) if is_opencode_span => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let parent_span_id = match span
         .get("parentSpanId")
         .and_then(Value::as_str)
         .map(canonical_json_parent_span_id)
-        .transpose()?
-        .flatten()
-        .map(SpanId::new);
-    let started_at =
-        json_timestamp(span, "startTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
-    let ended_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
+        .transpose()
+    {
+        Ok(parent_span_id) => parent_span_id.flatten().map(SpanId::new),
+        Err(OtlpError::InvalidSpanId) if is_opencode_span => None,
+        Err(err) => return Err(err),
+    };
+    let Some(started_at) = json_timestamp(span, "startTimeUnixNano") else {
+        if is_opencode_span {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingTimestamp);
+    };
+    let Some(ended_at) = json_timestamp(span, "endTimeUnixNano") else {
+        if is_opencode_span {
+            return Ok(None);
+        }
+        return Err(OtlpError::MissingTimestamp);
+    };
     let tool_name = if kind == TraceSpanKind::ToolCall {
         json_trace_tool_name(attributes)
     } else {
@@ -2429,6 +2834,41 @@ fn proto_prompt_id(attributes: &[KeyValue]) -> Option<PromptId> {
         .map(PromptId::new)
 }
 
+fn proto_message_id(attributes: &[KeyValue]) -> Option<PromptId> {
+    first_proto_attribute(attributes, &["message.id", "message_id"])
+        .and_then(|value| meaningful_attribute(Some(value)))
+        .map(PromptId::new)
+}
+
+fn proto_trace_prompt_id(
+    resource_prompt_id: Option<PromptId>,
+    attributes: &[KeyValue],
+    is_opencode_span: bool,
+) -> Option<PromptId> {
+    if is_opencode_span {
+        proto_opencode_prompt_id(resource_prompt_id, attributes)
+    } else {
+        resource_prompt_id.or_else(|| proto_prompt_id(attributes))
+    }
+}
+
+fn proto_opencode_prompt_id(
+    resource_prompt_id: Option<PromptId>,
+    attributes: &[KeyValue],
+) -> Option<PromptId> {
+    proto_message_id(attributes)
+        .or_else(|| proto_prompt_id(attributes))
+        .or(resource_prompt_id)
+}
+
+fn proto_opencode_trace_id(bytes: &[u8]) -> Option<String> {
+    canonical_proto_trace_id(bytes.to_vec()).ok()
+}
+
+fn proto_opencode_span_id(bytes: &[u8]) -> Option<String> {
+    canonical_proto_span_id(bytes.to_vec()).ok()
+}
+
 fn json_session_id(attributes: Option<&Vec<Value>>) -> Option<SessionId> {
     first_json_attribute(attributes, &["session.id", "session_id", "conversation.id"])
         .and_then(|value| meaningful_attribute(Some(value)))
@@ -2439,6 +2879,41 @@ fn json_prompt_id(attributes: Option<&Vec<Value>>) -> Option<PromptId> {
     first_json_attribute(attributes, &["prompt.id", "prompt_id"])
         .and_then(|value| meaningful_attribute(Some(value)))
         .map(PromptId::new)
+}
+
+fn json_message_id(attributes: Option<&Vec<Value>>) -> Option<PromptId> {
+    first_json_attribute(attributes, &["message.id", "message_id"])
+        .and_then(|value| meaningful_attribute(Some(value)))
+        .map(PromptId::new)
+}
+
+fn json_trace_prompt_id(
+    resource_prompt_id: Option<PromptId>,
+    attributes: Option<&Vec<Value>>,
+    is_opencode_span: bool,
+) -> Option<PromptId> {
+    if is_opencode_span {
+        json_opencode_prompt_id(resource_prompt_id, attributes)
+    } else {
+        resource_prompt_id.or_else(|| json_prompt_id(attributes))
+    }
+}
+
+fn json_opencode_prompt_id(
+    resource_prompt_id: Option<PromptId>,
+    attributes: Option<&Vec<Value>>,
+) -> Option<PromptId> {
+    json_message_id(attributes)
+        .or_else(|| json_prompt_id(attributes))
+        .or(resource_prompt_id)
+}
+
+fn json_opencode_trace_id(span: &Value) -> Option<String> {
+    canonical_json_trace_id(span.get("traceId").and_then(Value::as_str)).ok()
+}
+
+fn json_opencode_span_id(span: &Value) -> Option<String> {
+    canonical_json_span_id(span.get("spanId").and_then(Value::as_str)).ok()
 }
 
 fn proto_trace_span_kind(attributes: &[KeyValue]) -> Option<TraceSpanKind> {
@@ -2466,6 +2941,14 @@ fn first_meaningful_proto_attribute(attributes: &[KeyValue], keys: &[&str]) -> O
         .find_map(|key| meaningful_attribute(proto_attribute(attributes, key)))
 }
 
+fn first_meaningful_proto_content_attribute(
+    attributes: &[KeyValue],
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| meaningful_attribute(proto_content_attribute(attributes, key)))
+}
+
 fn first_json_attribute(attributes: Option<&Vec<Value>>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| json_attribute(attributes, key))
 }
@@ -2476,6 +2959,14 @@ fn first_meaningful_json_attribute(
 ) -> Option<String> {
     keys.iter()
         .find_map(|key| meaningful_attribute(json_attribute(attributes, key)))
+}
+
+fn first_meaningful_json_content_attribute(
+    attributes: Option<&Vec<Value>>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| meaningful_attribute(json_content_attribute(attributes, key)))
 }
 
 fn canonical_proto_trace_id(bytes: Vec<u8>) -> Result<String, OtlpError> {
@@ -2707,7 +3198,6 @@ fn content_event_key(
     prompt_id: &PromptId,
     kind: ContentKind,
     occurred_at_nanos: u64,
-    content: &str,
 ) -> ContentEventKey {
     let mut canonical = String::new();
     canonical.push_str("otlp-log-content");
@@ -2728,11 +3218,33 @@ fn content_event_key(
     canonical.push_str("occurred_at_nanos=");
     canonical.push_str(&occurred_at_nanos.to_string());
     canonical.push('\n');
-    canonical.push_str("content_len=");
-    canonical.push_str(&content.len().to_string());
+    ContentEventKey::new(canonical)
+}
+
+fn trace_content_event_key(parts: &TraceContentRecordParts<'_>) -> ContentEventKey {
+    let mut canonical = String::new();
+    canonical.push_str("otlp-trace-content");
     canonical.push('\n');
-    canonical.push_str("content_fingerprint=");
-    canonical.push_str(&content_fingerprint(content));
+    append_repo_key(&mut canonical, &parts.repo);
+    canonical.push_str("harness=opencode");
+    canonical.push('\n');
+    canonical.push_str("session_id=");
+    canonical.push_str(parts.session_id.as_str());
+    canonical.push('\n');
+    canonical.push_str("prompt_id=");
+    canonical.push_str(parts.prompt_id.as_str());
+    canonical.push('\n');
+    canonical.push_str("trace_id=");
+    canonical.push_str(parts.trace_id);
+    canonical.push('\n');
+    canonical.push_str("span_id=");
+    canonical.push_str(parts.span_id);
+    canonical.push('\n');
+    canonical.push_str("kind=");
+    canonical.push_str(parts.kind.storage_name());
+    canonical.push('\n');
+    canonical.push_str("occurred_at_nanos=");
+    canonical.push_str(&parts.occurred_at_nanos.to_string());
     canonical.push('\n');
     ContentEventKey::new(canonical)
 }
@@ -2769,20 +3281,6 @@ fn raw_body_event_key(
     canonical.push_str(body_ref.as_str());
     canonical.push('\n');
     ContentEventKey::new(canonical)
-}
-
-fn content_fingerprint(content: &str) -> String {
-    let mut forward_hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in content.as_bytes() {
-        forward_hash ^= u64::from(*byte);
-        forward_hash = forward_hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let mut reverse_hash = 0xaf63_dc4c_8601_ec8c_u64;
-    for byte in content.as_bytes().iter().rev() {
-        reverse_hash ^= u64::from(*byte);
-        reverse_hash = reverse_hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{forward_hash:016x}{reverse_hash:016x}")
 }
 
 fn trace_token_usage_event_key(
@@ -2964,7 +3462,7 @@ fn content_record_harness(resource_harness: Option<&str>) -> Option<String> {
 fn content_harness_provides_logs(harness: &str) -> bool {
     matches!(
         harness,
-        "claude" | "claude_code" | "codex" | "github_copilot" | "opencode"
+        "claude" | "claude_code" | "codex" | "github_copilot"
     )
 }
 
@@ -3037,11 +3535,70 @@ fn proto_attribute(attributes: &[KeyValue], key: &str) -> Option<String> {
         .and_then(proto_string_value)
 }
 
+fn proto_content_attribute(attributes: &[KeyValue], key: &str) -> Option<String> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(proto_content_value)
+}
+
 fn proto_string_value(value: &AnyValue) -> Option<String> {
     match value.value.as_ref()? {
         any_value::Value::StringValue(value) => Some(value.clone()),
         _ => None,
     }
+}
+
+fn proto_content_value(value: &AnyValue) -> Option<String> {
+    match value.value.as_ref()? {
+        any_value::Value::StringValue(value) => Some(value.clone()),
+        _ => content_json_to_string(proto_any_value_to_json(value)),
+    }
+}
+
+fn proto_any_value_to_json(value: &AnyValue) -> Value {
+    match value.value.as_ref() {
+        Some(any_value::Value::StringValue(value)) => Value::String(value.clone()),
+        Some(any_value::Value::StringValueStrindex(value)) => Value::Number((*value).into()),
+        Some(any_value::Value::BoolValue(value)) => Value::Bool(*value),
+        Some(any_value::Value::IntValue(value)) => Value::Number((*value).into()),
+        Some(any_value::Value::DoubleValue(value)) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        Some(any_value::Value::ArrayValue(values)) => Value::Array(
+            values
+                .values
+                .iter()
+                .filter_map(|value| meaningful_content_json(proto_any_value_to_json(value)))
+                .collect(),
+        ),
+        Some(any_value::Value::KvlistValue(values)) => {
+            let entries = values.values.iter().filter_map(|attribute| {
+                let value = meaningful_content_json(
+                    attribute
+                        .value
+                        .as_ref()
+                        .map(proto_any_value_to_json)
+                        .unwrap_or(Value::Null),
+                )?;
+                Some((attribute.key.clone(), value))
+            });
+            Value::Object(serde_json::Map::from_iter(entries))
+        }
+        Some(any_value::Value::BytesValue(value)) => Value::String(hex_encode(value)),
+        None => Value::Null,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn proto_bool_attribute(attributes: &[KeyValue], key: &str) -> bool {
@@ -3057,6 +3614,10 @@ fn proto_bool_attribute(attributes: &[KeyValue], key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn proto_any_bool_attribute(attributes: &[KeyValue], keys: &[&str]) -> bool {
+    keys.iter().any(|key| proto_bool_attribute(attributes, key))
+}
+
 fn json_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<String> {
     attributes?
         .iter()
@@ -3065,6 +3626,14 @@ fn json_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<String> 
         .and_then(|value| value.get("stringValue"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn json_content_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<String> {
+    attributes?
+        .iter()
+        .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|attribute| attribute.get("value"))
+        .and_then(json_content_any_value)
 }
 
 fn json_bool_attribute(attributes: Option<&Vec<Value>>, key: &str) -> bool {
@@ -3086,11 +3655,104 @@ fn json_bool_attribute(attributes: Option<&Vec<Value>>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn json_any_bool_attribute(attributes: Option<&Vec<Value>>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| json_bool_attribute(attributes, key))
+}
+
 fn json_string_any_value(value: &Value) -> Option<String> {
     value
         .get("stringValue")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn json_content_any_value(value: &Value) -> Option<String> {
+    if let Some(value) = json_string_any_value(value) {
+        return Some(value);
+    }
+    content_json_to_string(json_any_value_to_json(value))
+}
+
+fn content_json_to_string(value: Value) -> Option<String> {
+    meaningful_content_json(value).and_then(|value| serde_json::to_string(&value).ok())
+}
+
+fn meaningful_content_json(value: Value) -> Option<Value> {
+    match value {
+        Value::Null => None,
+        Value::Array(values) => {
+            let values: Vec<_> = values
+                .into_iter()
+                .filter_map(meaningful_content_json)
+                .collect();
+            (!values.is_empty()).then_some(Value::Array(values))
+        }
+        Value::Object(values) => {
+            let values = values
+                .into_iter()
+                .filter_map(|(key, value)| Some((key, meaningful_content_json(value)?)))
+                .collect::<serde_json::Map<_, _>>();
+            (!values.is_empty()).then_some(Value::Object(values))
+        }
+        value => Some(value),
+    }
+}
+
+fn json_any_value_to_json(value: &Value) -> Value {
+    if let Some(value) = value.get("stringValue").and_then(Value::as_str) {
+        return Value::String(value.to_owned());
+    }
+    if let Some(value) = value.get("boolValue").and_then(Value::as_bool) {
+        return Value::Bool(value);
+    }
+    if let Some(value) = value.get("intValue").and_then(Value::as_str) {
+        return value
+            .parse::<i64>()
+            .map(|value| Value::Number(value.into()))
+            .unwrap_or_else(|_| Value::String(value.to_owned()));
+    }
+    if let Some(value) = value.get("intValue").and_then(Value::as_i64) {
+        return Value::Number(value.into());
+    }
+    if let Some(value) = value.get("doubleValue").and_then(Value::as_f64) {
+        return serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null);
+    }
+    if let Some(values) = value
+        .get("arrayValue")
+        .and_then(|value| value.get("values"))
+        .and_then(Value::as_array)
+    {
+        return Value::Array(
+            values
+                .iter()
+                .filter_map(|value| meaningful_content_json(json_any_value_to_json(value)))
+                .collect(),
+        );
+    }
+    if let Some(values) = value
+        .get("kvlistValue")
+        .and_then(|value| value.get("values"))
+        .and_then(Value::as_array)
+    {
+        let entries = values.iter().filter_map(|attribute| {
+            let key = attribute.get("key")?.as_str()?.to_owned();
+            let value = meaningful_content_json(
+                attribute
+                    .get("value")
+                    .map(json_any_value_to_json)
+                    .unwrap_or(Value::Null),
+            )?;
+            Some((key, value))
+        });
+        return Value::Object(serde_json::Map::from_iter(entries));
+    }
+    value
+        .get("bytesValue")
+        .and_then(Value::as_str)
+        .map(|value| Value::String(value.to_owned()))
+        .unwrap_or(Value::Null)
 }
 
 fn json_number(value: &Value, key: &str) -> Option<u64> {
@@ -3368,6 +4030,607 @@ mod tests {
         assert_eq!(records.trace_spans.len(), 0);
         assert_eq!(records.token_usage.len(), 1);
         assert_eq!(records.tool_calls.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_spans_normalize_content_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = json_opencode_trace_payload_with_content_attributes();
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.content.len(), 4);
+        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].session_id, SessionId::new("session-12"));
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
+        assert_eq!(records.content[0].kind, ContentKind::UserPrompt);
+        assert_eq!(records.content[0].content.as_str(), "show src/lib.rs");
+        assert_eq!(records.content[1].kind, ContentKind::AssistantMessage);
+        assert_eq!(records.content[1].content.as_str(), "I'll inspect it.");
+        assert_eq!(records.content[2].kind, ContentKind::ToolInput);
+        assert_eq!(
+            records.content[2].content.as_str(),
+            r#"{"path":"src/lib.rs"}"#
+        );
+        assert_eq!(records.content[3].kind, ContentKind::ToolOutput);
+        assert_eq!(records.content[3].content.as_str(), "pub mod store;");
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_spans_normalize_content_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_opencode_trace_payload_with_content_attributes();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.content.len(), 4);
+        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].session_id, SessionId::new("session-12"));
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
+        assert_eq!(records.content[0].kind, ContentKind::UserPrompt);
+        assert_eq!(records.content[0].content.as_str(), "show src/lib.rs");
+        assert_eq!(records.content[1].kind, ContentKind::AssistantMessage);
+        assert_eq!(records.content[1].content.as_str(), "I'll inspect it.");
+        assert_eq!(records.content[2].kind, ContentKind::ToolInput);
+        assert_eq!(
+            records.content[2].content.as_str(),
+            r#"{"path":"src/lib.rs"}"#
+        );
+        assert_eq!(records.content[3].kind, ContentKind::ToolOutput);
+        assert_eq!(records.content[3].content.as_str(), "pub mod store;");
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_content_prefers_span_message_id_over_resource_prompt_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "session.id", "value": { "stringValue": "session-12" } },
+                        { "key": "prompt.id", "value": { "stringValue": "stale-resource-prompt" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.generate",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956801800000000",
+                        "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                            { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                            { "key": "ai.prompt.messages", "value": { "stringValue": "show src/lib.rs" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].prompt_id, PromptId::new("prompt-7"));
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_content_prefers_span_message_id_over_resource_prompt_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("session.id", "session-12"),
+                        string_attribute("prompt.id", "stale-resource-prompt"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "opencode.generate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_801_800_000_000,
+                        attributes: vec![
+                            string_attribute("message.id", "prompt-7"),
+                            string_attribute("ai.operationId", "chat"),
+                            string_attribute("ai.prompt.messages", "show src/lib.rs"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.trace_spans.len(), 1);
+        assert_eq!(records.trace_spans[0].prompt_id, PromptId::new("prompt-7"));
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_content_serializes_structured_messages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.generate",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956801800000000",
+                        "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                            { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                            { "key": "ai.prompt", "value": { "stringValue": "flat summary" } },
+                            {
+                                "key": "gen_ai.input.messages",
+                                "value": {
+                                    "arrayValue": {
+                                        "values": [{
+                                            "kvlistValue": {
+                                                "values": [
+                                                    { "key": "role", "value": { "stringValue": "user" } },
+                                                    { "key": "content", "value": { "stringValue": "show src/lib.rs" } }
+                                                ]
+                                            }
+                                        }]
+                                    }
+                                }
+                            }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(
+            records.content[0].content.as_str(),
+            r#"[{"content":"show src/lib.rs","role":"user"}]"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_content_serializes_structured_messages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", "opencode"),
+                        string_attribute("session.id", "session-12"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "opencode.generate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_801_800_000_000,
+                        attributes: vec![
+                            string_attribute("message.id", "prompt-7"),
+                            string_attribute("ai.operationId", "chat"),
+                            string_attribute("ai.prompt", "flat summary"),
+                            KeyValue {
+                                key: "gen_ai.input.messages".to_owned(),
+                                key_strindex: 0,
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::ArrayValue(
+                                        opentelemetry_proto::tonic::common::v1::ArrayValue {
+                                            values: vec![AnyValue {
+                                                value: Some(any_value::Value::KvlistValue(
+                                                    opentelemetry_proto::tonic::common::v1::KeyValueList {
+                                                        values: vec![
+                                                            string_attribute("role", "user"),
+                                                            string_attribute("content", "show src/lib.rs"),
+                                                        ],
+                                                    },
+                                                )),
+                                            }],
+                                        },
+                                    )),
+                                }),
+                            },
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(
+            records.content[0].content.as_str(),
+            r#"[{"content":"show src/lib.rs","role":"user"}]"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_content_falls_back_after_malformed_structured_attribute()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.generate",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956801800000000",
+                        "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                            { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                            {
+                                "key": "gen_ai.input.messages",
+                                "value": { "arrayValue": { "values": [{}] } }
+                            },
+                            { "key": "ai.prompt", "value": { "stringValue": "flat prompt fallback" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].kind, ContentKind::UserPrompt);
+        assert_eq!(records.content[0].content.as_str(), "flat prompt fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_content_falls_back_after_malformed_structured_attribute()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", "opencode"),
+                        string_attribute("session.id", "session-12"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "opencode.generate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_801_800_000_000,
+                        attributes: vec![
+                            string_attribute("message.id", "prompt-7"),
+                            string_attribute("ai.operationId", "chat"),
+                            KeyValue {
+                                key: "gen_ai.input.messages".to_owned(),
+                                key_strindex: 0,
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::ArrayValue(
+                                        opentelemetry_proto::tonic::common::v1::ArrayValue {
+                                            values: vec![AnyValue { value: None }],
+                                        },
+                                    )),
+                                }),
+                            },
+                            string_attribute("ai.prompt", "flat prompt fallback"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].kind, ContentKind::UserPrompt);
+        assert_eq!(records.content[0].content.as_str(), "flat prompt fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_content_ignores_non_content_spans_without_trace_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } },
+                        { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [
+                        {
+                            "name": "opencode.generate",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                                { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                                { "key": "ai.usage.promptTokens", "value": { "intValue": "1200" } },
+                                { "key": "ai.prompt.messages", "value": { "stringValue": "bad span content" } }
+                            ]
+                        },
+                        {
+                            "name": "execute Read",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.operationId", "value": { "stringValue": "toolCall" } },
+                                { "key": "ai.toolCall.name", "value": { "stringValue": "Read" } },
+                                { "key": "ai.toolCall.args", "value": { "stringValue": "{\"path\":\"bad\"}" } }
+                            ]
+                        },
+                        {
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "3333333333333333",
+                            "name": "opencode.generate",
+                            "endTimeUnixNano": "1781956801700000000",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                                { "key": "ai.prompt.messages", "value": { "stringValue": "missing start content" } }
+                            ]
+                        },
+                        {
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "4444444444444444",
+                            "name": "opencode.generate",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956801700000000",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                                { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                                { "key": "ai.usage.promptTokens", "value": { "stringValue": "not-a-number" } }
+                            ]
+                        },
+                        {
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "1111111111111111",
+                            "name": "opencode.generate",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956801800000000",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.prompt.messages", "value": { "stringValue": "show src/lib.rs" } }
+                            ]
+                        }
+                    ]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.token_usage.len(), 0);
+        assert_eq!(records.tool_calls.len(), 0);
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
+        assert_eq!(records.content[0].kind, ContentKind::UserPrompt);
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_content_ignores_non_content_spans_without_trace_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", "opencode"),
+                        string_attribute("session.id", "session-12"),
+                        string_attribute("prompt.id", "prompt-7"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![
+                        Span {
+                            trace_id: Vec::new(),
+                            span_id: Vec::new(),
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "opencode.generate".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 0,
+                            end_time_unix_nano: 0,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.operationId", "chat"),
+                                string_attribute("ai.model.id", "gpt-4.1"),
+                                int_attribute("ai.usage.promptTokens", 1200),
+                                string_attribute("ai.prompt.messages", "bad span content"),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x44; 8],
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "opencode.generate".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 1_781_956_800_000_000_000,
+                            end_time_unix_nano: 1_781_956_801_700_000_000,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.operationId", "chat"),
+                                string_attribute("ai.model.id", "gpt-4.1"),
+                                string_attribute("ai.usage.promptTokens", "not-a-number"),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x33; 8],
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "opencode.generate".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 0,
+                            end_time_unix_nano: 1_781_956_801_700_000_000,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.operationId", "chat"),
+                                string_attribute("ai.prompt.messages", "missing start content"),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                        Span {
+                            trace_id: Vec::new(),
+                            span_id: Vec::new(),
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "execute Read".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 0,
+                            end_time_unix_nano: 0,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.operationId", "toolCall"),
+                                string_attribute("ai.toolCall.name", "Read"),
+                                string_attribute("ai.toolCall.args", r#"{"path":"bad"}"#),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x11; 8],
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "opencode.generate".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 1_781_956_800_000_000_000,
+                            end_time_unix_nano: 1_781_956_801_800_000_000,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.prompt.messages", "show src/lib.rs"),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.token_usage.len(), 0);
+        assert_eq!(records.tool_calls.len(), 0);
+        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
+        assert_eq!(records.content[0].kind, ContentKind::UserPrompt);
         Ok(())
     }
 
@@ -5200,6 +6463,43 @@ mod tests {
     }
 
     #[test]
+    fn json_content_log_event_key_omits_content_metadata() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = br#"{
+            "resourceLogs": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "claude_code" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } },
+                        { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                    ]
+                },
+                "scopeLogs": [{
+                    "logRecords": [{
+                        "timeUnixNano": "1781956800000000000",
+                        "eventName": "content",
+                        "body": { "stringValue": "secret prompt text" },
+                        "attributes": [
+                            { "key": "content.opt_in", "value": { "boolValue": true } },
+                            { "key": "content.type", "value": { "stringValue": "user_prompt" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_usage_logs(payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].content.as_str(), "secret prompt text");
+        let event_key = records.content[0].event_key.as_str();
+        assert!(!event_key.contains("secret prompt text"));
+        assert!(!event_key.contains("content_len="));
+        assert!(!event_key.contains("content_fingerprint="));
+        Ok(())
+    }
+
+    #[test]
     fn json_usage_logs_normalize_token_usage_records() -> Result<(), Box<dyn std::error::Error>> {
         let payload = br#"{
             "resourceLogs": [{
@@ -5244,8 +6544,7 @@ mod tests {
     }
 
     #[test]
-    fn json_opencode_content_logs_require_opt_in_and_normalize_content()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn json_opencode_content_logs_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
         let payload = br#"{
             "resourceLogs": [{
                 "resource": {
@@ -5283,19 +6582,7 @@ mod tests {
 
         let records = parse_otlp_json_usage_logs(payload)?;
 
-        assert_eq!(records.content.len(), 1);
-        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
-        assert_eq!(records.content[0].session_id, SessionId::new("session-12"));
-        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
-        assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
-        assert_eq!(records.content[0].content.as_str(), "stored assistant text");
-        assert_eq!(
-            records.content[0].repo,
-            RepoBucket::repo(RepoIdentity::new(
-                RepoName::new("kvasir"),
-                RepoPath::new("/repos/kvasir"),
-            ))
-        );
+        assert!(records.content.is_empty());
 
         Ok(())
     }
@@ -5545,8 +6832,49 @@ mod tests {
     }
 
     #[test]
-    fn protobuf_opencode_content_logs_require_opt_in_and_reject_raw_api_payloads()
+    fn protobuf_content_log_event_key_omits_content_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
+        let payload = protobuf_logs_payload_with_resource_attributes(
+            vec![
+                string_attribute("service.name", "claude_code"),
+                string_attribute("session.id", "session-12"),
+                string_attribute("prompt.id", "prompt-7"),
+            ],
+            vec![LogRecord {
+                time_unix_nano: 1_781_956_800_000_000_000,
+                observed_time_unix_nano: 0,
+                severity_number: 0,
+                severity_text: String::new(),
+                body: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(
+                        "secret prompt text".to_owned(),
+                    )),
+                }),
+                attributes: vec![
+                    bool_attribute("content.opt_in", true),
+                    string_attribute("content.type", "user_prompt"),
+                ],
+                dropped_attributes_count: 0,
+                flags: 0,
+                trace_id: Vec::new(),
+                span_id: Vec::new(),
+                event_name: "content".to_owned(),
+            }],
+        );
+
+        let records = parse_otlp_protobuf_usage_logs(&payload)?;
+
+        assert_eq!(records.content.len(), 1);
+        assert_eq!(records.content[0].content.as_str(), "secret prompt text");
+        let event_key = records.content[0].event_key.as_str();
+        assert!(!event_key.contains("secret prompt text"));
+        assert!(!event_key.contains("content_len="));
+        assert!(!event_key.contains("content_fingerprint="));
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_content_logs_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
         let payload = protobuf_logs_payload_with_resource_attributes(
             vec![
                 string_attribute("service.name", "opencode"),
@@ -5617,12 +6945,7 @@ mod tests {
 
         let records = parse_otlp_protobuf_usage_logs(&payload)?;
 
-        assert_eq!(records.content.len(), 1);
-        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
-        assert_eq!(records.content[0].session_id, SessionId::new("session-12"));
-        assert_eq!(records.content[0].prompt_id, PromptId::new("prompt-7"));
-        assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
-        assert_eq!(records.content[0].content.as_str(), "stored assistant text");
+        assert!(records.content.is_empty());
 
         Ok(())
     }
@@ -6462,6 +7785,55 @@ mod tests {
         )
     }
 
+    fn json_opencode_trace_payload_with_content_attributes() -> String {
+        r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                        { "key": "repo.path", "value": { "stringValue": "/repos/kvasir" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [
+                        {
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "1111111111111111",
+                            "name": "opencode.generate",
+                            "startTimeUnixNano": "1781956800000000000",
+                            "endTimeUnixNano": "1781956801800000000",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                                { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                                { "key": "ai.prompt.messages", "value": { "stringValue": "show src/lib.rs" } },
+                                { "key": "ai.response.text", "value": { "stringValue": "I'll inspect it." } }
+                            ]
+                        },
+                        {
+                            "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "spanId": "2222222222222222",
+                            "parentSpanId": "1111111111111111",
+                            "name": "opencode.tool",
+                            "startTimeUnixNano": "1781956801800000000",
+                            "endTimeUnixNano": "1781956801900000000",
+                            "attributes": [
+                                { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                                { "key": "ai.operationId", "value": { "stringValue": "tool" } },
+                                { "key": "tool.name", "value": { "stringValue": "Read" } },
+                                { "key": "ai.toolCall.args", "value": { "stringValue": "{\"path\":\"src/lib.rs\"}" } },
+                                { "key": "ai.toolCall.result", "value": { "stringValue": "pub mod store;" } }
+                            ]
+                        }
+                    ]
+                }]
+            }]
+        }"#
+        .to_owned()
+    }
+
     fn protobuf_trace_payload_with_span_kind_key(
         harness: &str,
         span_kind_key: &str,
@@ -6577,6 +7949,79 @@ mod tests {
                             attributes: vec![
                                 string_attribute("ai.operationId", "tool"),
                                 string_attribute("tool.name", "Read"),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn protobuf_opencode_trace_payload_with_content_attributes() -> Vec<u8> {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", "opencode"),
+                        string_attribute("repo.name", "kvasir"),
+                        string_attribute("repo.path", "/repos/kvasir"),
+                        string_attribute("session.id", "session-12"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x11; 8],
+                            trace_state: String::new(),
+                            parent_span_id: Vec::new(),
+                            flags: 0,
+                            name: "opencode.generate".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 1_781_956_800_000_000_000,
+                            end_time_unix_nano: 1_781_956_801_800_000_000,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.operationId", "chat"),
+                                string_attribute("ai.model.id", "gpt-4.1"),
+                                string_attribute("ai.prompt.messages", "show src/lib.rs"),
+                                string_attribute("ai.response.text", "I'll inspect it."),
+                            ],
+                            dropped_attributes_count: 0,
+                            events: Vec::new(),
+                            dropped_events_count: 0,
+                            links: Vec::new(),
+                            dropped_links_count: 0,
+                            status: None,
+                        },
+                        Span {
+                            trace_id: vec![0xaa; 16],
+                            span_id: vec![0x22; 8],
+                            trace_state: String::new(),
+                            parent_span_id: vec![0x11; 8],
+                            flags: 0,
+                            name: "opencode.tool".to_owned(),
+                            kind: 0,
+                            start_time_unix_nano: 1_781_956_801_800_000_000,
+                            end_time_unix_nano: 1_781_956_801_900_000_000,
+                            attributes: vec![
+                                string_attribute("message.id", "prompt-7"),
+                                string_attribute("ai.operationId", "tool"),
+                                string_attribute("tool.name", "Read"),
+                                string_attribute("ai.toolCall.args", r#"{"path":"src/lib.rs"}"#),
+                                string_attribute("ai.toolCall.result", "pub mod store;"),
                             ],
                             dropped_attributes_count: 0,
                             events: Vec::new(),

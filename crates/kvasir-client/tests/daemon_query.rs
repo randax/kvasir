@@ -478,6 +478,218 @@ async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result
     .await?;
 
     reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_trace_content_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("opencode"),
+            session_id: session("opencode-session-1"),
+            prompt_id: prompt("opencode-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("opencode-session-1"),
+            prompt_id: prompt("opencode-turn-1"),
+            items: vec![
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_801_920,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::UserPrompt,
+                    content: content_text("summarize README.md"),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_801_920,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::AssistantMessage,
+                    content: content_text("I need to read it first."),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_802_170,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::ToolInput,
+                    content: content_text(r#"{"path":"README.md"}"#),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_802_170,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::ToolOutput,
+                    content: content_text("kvasir is a local telemetry daemon"),
+                },
+            ],
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("opencode"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::UserPrompt,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::AssistantMessage,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::ToolInput,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::ToolOutput,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiRequest,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiResponse,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_queries_protobuf_content_replay_by_session_and_prompt() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(opencode_trace_content_protobuf_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("opencode"),
+            session_id: session("opencode-session-1"),
+            prompt_id: prompt("opencode-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("opencode-session-1"),
+            prompt_id: prompt("opencode-turn-1"),
+            items: vec![
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_801_920,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::UserPrompt,
+                    content: content_text("summarize README.md"),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_801_920,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::AssistantMessage,
+                    content: content_text("I need to read it first."),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_802_170,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::ToolInput,
+                    content: content_text(r#"{"path":"README.md"}"#),
+                },
+                KvasirContentReplayItem {
+                    occurred_at: KvasirTimestampMillis {
+                        value: 1_781_956_802_170,
+                    },
+                    harness: harness("opencode"),
+                    kind: KvasirContentKind::ToolOutput,
+                    content: content_text("kvasir is a local telemetry daemon"),
+                },
+            ],
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("opencode"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::UserPrompt,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::AssistantMessage,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::ToolInput,
+                    },
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::ToolOutput,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiRequest,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiResponse,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_does_not_replay_opencode_content_logs() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
         .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
         .header(AUTHORIZATION, "Bearer test-token")
         .header(CONTENT_TYPE, "application/json")
@@ -502,33 +714,9 @@ async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result
         KvasirContentReplay {
             session_id: session("opencode-session-1"),
             prompt_id: prompt("opencode-turn-1"),
-            items: vec![KvasirContentReplayItem {
-                occurred_at: KvasirTimestampMillis {
-                    value: 1_781_956_802_180,
-                },
-                harness: harness("opencode"),
-                kind: KvasirContentKind::AssistantMessage,
-                content: content_text("stored assistant text"),
-            }],
-            availability: KvasirContentAvailability::Captured {
-                harness: harness("opencode"),
-                kinds: vec![
-                    KvasirContentKindAvailability::Captured {
-                        kind: KvasirContentKind::AssistantMessage,
-                    },
-                    KvasirContentKindAvailability::Unavailable {
-                        kind: KvasirContentKind::UserPrompt,
-                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
-                    },
-                    KvasirContentKindAvailability::Unavailable {
-                        kind: KvasirContentKind::ToolInput,
-                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
-                    },
-                    KvasirContentKindAvailability::Unavailable {
-                        kind: KvasirContentKind::ToolOutput,
-                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
-                    },
-                ],
+            items: Vec::new(),
+            availability: KvasirContentAvailability::Unavailable {
+                reason: KvasirContentUnavailableReason::PromptNotFound,
             },
         }
     );
@@ -727,6 +915,14 @@ async fn client_queries_claude_content_replay_from_opted_in_logs() -> anyhow::Re
                         kind: KvasirContentKind::ToolInput,
                         reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
                     },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiRequest,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiResponse,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
                 ],
             },
         }
@@ -801,6 +997,14 @@ async fn client_queries_codex_content_replay_from_opted_in_logs() -> anyhow::Res
                     KvasirContentKindAvailability::Unavailable {
                         kind: KvasirContentKind::ToolOutput,
                         reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiRequest,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiResponse,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
                     },
                 ],
             },
@@ -965,7 +1169,67 @@ async fn client_reports_known_harness_content_kinds_when_prompt_has_no_content()
                         kind: KvasirContentKind::ToolOutput,
                         reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
                     },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiRequest,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiResponse,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
                 ],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_reports_not_provided_for_existing_unsupported_harness_prompt() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(unsupported_harness_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.content_replay(KvasirContentQuery {
+            harness: harness("unknown-harness"),
+            session_id: session("unknown-session-1"),
+            prompt_id: prompt("unknown-turn-1"),
+            bearer_token: bearer_token("test-token"),
+        })
+    })
+    .await??;
+
+    assert_eq!(
+        replay,
+        KvasirContentReplay {
+            session_id: session("unknown-session-1"),
+            prompt_id: prompt("unknown-turn-1"),
+            items: Vec::new(),
+            availability: KvasirContentAvailability::Unavailable {
+                reason: KvasirContentUnavailableReason::NotProvidedByHarness,
             },
         }
     );
@@ -2330,6 +2594,183 @@ fn large_claude_trace_fixture(span_count: usize) -> String {
     )
 }
 
+fn opencode_trace_content_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "2222222222222222",
+                        "name": "ai.generateText.doGenerate",
+                        "startTimeUnixNano": "1781956800120000000",
+                        "endTimeUnixNano": "1781956801920000000",
+                        "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "opencode-turn-1" } },
+                            { "key": "ai.operationId", "value": { "stringValue": "ai.generateText" } },
+                            { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                            { "key": "ai.prompt.messages", "value": { "stringValue": "summarize README.md" } },
+                            { "key": "ai.response.text", "value": { "stringValue": "I need to read it first." } }
+                        ]
+                    },
+                    {
+                        "traceId": "cccccccccccccccccccccccccccccccc",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "2222222222222222",
+                        "name": "execute Read",
+                        "startTimeUnixNano": "1781956801920000000",
+                        "endTimeUnixNano": "1781956802170000000",
+                        "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "opencode-turn-1" } },
+                            { "key": "ai.operationId", "value": { "stringValue": "toolCall" } },
+                            { "key": "ai.toolCall.name", "value": { "stringValue": "Read" } },
+                            { "key": "ai.toolCall.args", "value": { "stringValue": "{\"path\":\"README.md\"}" } },
+                            { "key": "ai.toolCall.result", "value": { "stringValue": "kvasir is a local telemetry daemon" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn opencode_trace_content_protobuf_fixture() -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "opencode"),
+                    string_attribute("repo.name", "kvasir"),
+                    string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
+                    string_attribute("session.id", "opencode-session-1"),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![
+                    Span {
+                        trace_id: hex_bytes("cccccccccccccccccccccccccccccccc"),
+                        span_id: hex_bytes("2222222222222222"),
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "ai.generateText.doGenerate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_120_000_000,
+                        end_time_unix_nano: 1_781_956_801_920_000_000,
+                        attributes: vec![
+                            string_attribute("message.id", "opencode-turn-1"),
+                            string_attribute("ai.operationId", "ai.generateText"),
+                            string_attribute("ai.model.id", "gpt-4.1"),
+                            string_attribute("ai.prompt.messages", "summarize README.md"),
+                            string_attribute("ai.response.text", "I need to read it first."),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes("cccccccccccccccccccccccccccccccc"),
+                        span_id: hex_bytes("3333333333333333"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("2222222222222222"),
+                        flags: 0,
+                        name: "execute Read".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_801_920_000_000,
+                        end_time_unix_nano: 1_781_956_802_170_000_000,
+                        attributes: vec![
+                            string_attribute("message.id", "opencode-turn-1"),
+                            string_attribute("ai.operationId", "toolCall"),
+                            string_attribute("ai.toolCall.name", "Read"),
+                            string_attribute("ai.toolCall.args", r#"{"path":"README.md"}"#),
+                            string_attribute(
+                                "ai.toolCall.result",
+                                "kvasir is a local telemetry daemon",
+                            ),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn unsupported_harness_trace_fixture() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "unknown-harness" } },
+                    { "key": "session.id", "value": { "stringValue": "unknown-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "unknown-turn-1" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [{
+                    "traceId": "dddddddddddddddddddddddddddddddd",
+                    "spanId": "1111111111111111",
+                    "name": "unknown.interaction",
+                    "startTimeUnixNano": "1781956800000000000",
+                    "endTimeUnixNano": "1781956800100000000",
+                    "attributes": [
+                        { "key": "span.kind", "value": { "stringValue": "interaction" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
+}
+
+fn opencode_content_logs_fixture() -> &'static str {
+    r#"{
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "opencode" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
+                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } }
+                ]
+            },
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1781956802180000000",
+                    "eventName": "opencode.content",
+                    "body": { "stringValue": "stored assistant text" },
+                    "attributes": [
+                        { "key": "content.opt_in", "value": { "boolValue": true } },
+                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
+                    ]
+                }]
+            }]
+        }]
+    }"#
+}
+
 fn claude_trace_protobuf_fixture() -> Vec<u8> {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -2399,33 +2840,6 @@ fn hex_nibble(value: u8) -> u8 {
         b'A'..=b'F' => value - b'A' + 10,
         _ => panic!("test fixture contains non-hex digit"),
     }
-}
-
-fn opencode_content_logs_fixture() -> &'static str {
-    r#"{
-        "resourceLogs": [{
-            "resource": {
-                "attributes": [
-                    { "key": "service.name", "value": { "stringValue": "opencode" } },
-                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
-                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
-                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
-                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } }
-                ]
-            },
-            "scopeLogs": [{
-                "logRecords": [{
-                    "timeUnixNano": "1781956802180000000",
-                    "eventName": "opencode.content",
-                    "body": { "stringValue": "stored assistant text" },
-                    "attributes": [
-                        { "key": "content.opt_in", "value": { "boolValue": true } },
-                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
-                    ]
-                }]
-            }]
-        }]
-    }"#
 }
 
 fn claude_content_logs_fixture() -> &'static str {

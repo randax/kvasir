@@ -2800,7 +2800,7 @@ impl UsageStore {
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
             transaction.execute(
-                "INSERT OR IGNORE INTO canonical_content_records (
+                "INSERT INTO canonical_content_records (
                     event_key,
                     occurred_at_ms,
                     session_id,
@@ -2812,7 +2812,18 @@ impl UsageStore {
                     harness,
                     content_kind,
                     content
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    occurred_at_ms = excluded.occurred_at_ms,
+                    session_id = excluded.session_id,
+                    prompt_id = excluded.prompt_id,
+                    day = excluded.day,
+                    repo_bucket = excluded.repo_bucket,
+                    repo_name = excluded.repo_name,
+                    repo_path = excluded.repo_path,
+                    harness = excluded.harness,
+                    content_kind = excluded.content_kind,
+                    content = excluded.content",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -3861,15 +3872,24 @@ fn content_availability(
         }
     }
     let provided = content_kinds_provided_by(harness);
+    if captured.is_empty() && provided.is_empty() {
+        return ContentAvailability::Unavailable {
+            reason: ContentUnavailableReason::NotProvidedByHarness,
+        };
+    }
     let mut kinds = Vec::new();
     for kind in &captured {
         kinds.push(ContentKindAvailability::Captured { kind: *kind });
     }
-    for kind in provided {
+    for kind in ContentKind::ALL {
         if !captured.contains(&kind) {
             kinds.push(ContentKindAvailability::Unavailable {
                 kind,
-                reason: ContentUnavailableReason::NotCapturedForPrompt,
+                reason: if provided.contains(&kind) {
+                    ContentUnavailableReason::NotCapturedForPrompt
+                } else {
+                    ContentUnavailableReason::NotProvidedByHarness
+                },
             });
         }
     }
@@ -5991,6 +6011,44 @@ mod tests {
     }
 
     #[test]
+    fn ingest_usage_replaces_content_record_for_same_event_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        for content in ["first seen text", "corrected richer text"] {
+            store.ingest_usage(&UsageRecords {
+                token_usage: Vec::new(),
+                cost_usage: Vec::new(),
+                tool_calls: Vec::new(),
+                trace_spans: Vec::new(),
+                content: vec![ContentRecord {
+                    event_key: ContentEventKey::new("content-event-1"),
+                    occurred_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                    session_id: SessionId::new("session-1"),
+                    prompt_id: PromptId::new("prompt-1"),
+                    repo: kvasir_repo("/repos/kvasir"),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new(content).unwrap(),
+                }],
+                raw_body_references: Vec::new(),
+            })?;
+        }
+
+        let replay = store.content_replay(ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-1"),
+            prompt_id: PromptId::new("prompt-1"),
+        })?;
+
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(replay.items[0].content.as_str(), "corrected richer text");
+
+        Ok(())
+    }
+
+    #[test]
     fn content_replay_is_scoped_by_harness() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
@@ -6036,6 +6094,110 @@ mod tests {
         assert_eq!(replay.items.len(), 1);
         assert_eq!(replay.items[0].harness, HarnessName::new("opencode"));
         assert_eq!(replay.items[0].content.as_str(), "opencode text");
+
+        Ok(())
+    }
+
+    #[test]
+    fn content_replay_reports_not_provided_kinds_for_inline_only_harnesses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("opencode-content"),
+                occurred_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                session_id: SessionId::new("session-12"),
+                prompt_id: PromptId::new("prompt-7"),
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("stored assistant text").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+
+        let replay = store.content_replay(ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-12"),
+            prompt_id: PromptId::new("prompt-7"),
+        })?;
+
+        assert_eq!(
+            replay.availability,
+            ContentAvailability::Captured {
+                harness: HarnessName::new("opencode"),
+                kinds: vec![
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::AssistantMessage,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::UserPrompt,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::ToolInput,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::ToolOutput,
+                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::RawApiRequest,
+                        reason: ContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::RawApiResponse,
+                        reason: ContentUnavailableReason::NotProvidedByHarness,
+                    },
+                ],
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn content_replay_reports_unsupported_harness_when_prompt_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: vec![trace_span_record(
+                "unknown-harness",
+                "session-12",
+                "prompt-7",
+                "trace-1",
+                "span-1",
+                1_781_956_800_000..1_781_956_801_000,
+                TraceSpanKind::Interaction,
+            )],
+            content: Vec::new(),
+            raw_body_references: Vec::new(),
+        })?;
+
+        let replay = store.content_replay(ContentQuery {
+            harness: HarnessName::new("unknown-harness"),
+            session_id: SessionId::new("session-12"),
+            prompt_id: PromptId::new("prompt-7"),
+        })?;
+
+        assert_eq!(
+            replay.availability,
+            ContentAvailability::Unavailable {
+                reason: ContentUnavailableReason::NotProvidedByHarness,
+            }
+        );
 
         Ok(())
     }
