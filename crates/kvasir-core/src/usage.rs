@@ -158,6 +158,22 @@ impl ToolCallCount {
     }
 }
 
+/// Typed linkage from an attributed usage row back to the trace span that
+/// produced it. Parsed once at the OTLP ingest boundary and carried in
+/// structured form thereafter, so downstream joins use equality on these
+/// values instead of re-scanning the serialized event key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceLink {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+}
+
+impl TraceLink {
+    pub fn new(trace_id: TraceId, span_id: SpanId) -> Self {
+        Self { trace_id, span_id }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsageRecord {
     pub occurred_at: TimestampMillis,
@@ -169,6 +185,14 @@ pub struct TokenUsageRecord {
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
     pub kind: TokenUsageKind,
+    pub trace_link: Option<TraceLink>,
+}
+
+impl TokenUsageRecord {
+    pub fn with_trace_link(mut self, trace_link: TraceLink) -> Self {
+        self.trace_link = Some(trace_link);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +257,7 @@ pub struct ToolCallRecord {
     pub tool_name: ToolName,
     pub call_count: ToolCallCount,
     pub kind: ToolCallKind,
+    pub trace_link: Option<TraceLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +300,7 @@ impl ToolCallRecord {
             tool_name,
             call_count,
             kind: ToolCallKind::Delta,
+            trace_link: None,
         }
     }
 
@@ -295,7 +321,13 @@ impl ToolCallRecord {
             tool_name,
             call_count,
             kind: ToolCallKind::Cumulative { counter_start },
+            trace_link: None,
         }
+    }
+
+    pub fn with_trace_link(mut self, trace_link: TraceLink) -> Self {
+        self.trace_link = Some(trace_link);
+        self
     }
 }
 
@@ -730,6 +762,7 @@ impl TokenUsageRecord {
             measure,
             token_count,
             kind: TokenUsageKind::Cumulative,
+            trace_link: None,
         }
     }
 
@@ -770,6 +803,7 @@ impl TokenUsageRecord {
             measure,
             token_count,
             kind: TokenUsageKind::Delta { event_key },
+            trace_link: None,
         }
     }
 
@@ -810,6 +844,7 @@ impl TokenUsageRecord {
             measure,
             token_count,
             kind: TokenUsageKind::Delta { event_key },
+            trace_link: None,
         }
     }
 }

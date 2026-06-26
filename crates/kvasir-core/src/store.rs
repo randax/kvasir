@@ -26,7 +26,7 @@ use crate::usage::{
     TokenUsageRecord, TokenUsageSignal, ToolCallKind, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 const SUMMARY_PAGE_LIMIT: usize = 10;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
@@ -517,13 +517,18 @@ impl UsageStore {
     }
 
     pub fn token_rollups(&self, query: RollupQuery) -> Result<Vec<TokenRollup>, StoreError> {
-        if query.harness.is_some() || query.has_deep_scope() {
+        // Session/prompt scope is intentionally dropped here: per-day/repo/model
+        // rollups would be misleading at that depth (see has_deep_scope). A harness
+        // filter, however, is just another WHERE predicate over canonical rows, so
+        // it must scope the data rather than zero it out.
+        if query.has_deep_scope() {
             return Ok(Vec::new());
         }
         let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let model_filter = query.model.as_ref().map(ModelName::as_str);
         let input_signal = TokenUsageSignal::authoritative_for(TokenMeasure::Input).storage_name();
         let output_signal =
@@ -552,6 +557,7 @@ impl UsageStore {
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
                 AND (?10 IS NULL OR model = ?10)
+                AND (?11 IS NULL OR harness = ?11)
                 AND (
                     (measure = 'input' AND token_signal IN (?6, ?9))
                     OR (measure = 'output' AND token_signal IN (?7, ?9))
@@ -572,6 +578,7 @@ impl UsageStore {
                 cache_signal,
                 opencode_trace_signal,
                 model_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -631,13 +638,16 @@ impl UsageStore {
     }
 
     pub fn cost_rollups(&self, query: CostRollupQuery) -> Result<Vec<CostRollup>, StoreError> {
-        if query.harness.is_some() || query.has_deep_scope() {
+        // See token_rollups: deep (session/prompt) scope is dropped, but a harness
+        // filter must scope the canonical rows instead of zeroing the result.
+        if query.has_deep_scope() {
             return Ok(Vec::new());
         }
         let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let model_filter = query.model.as_ref().map(ModelName::as_str);
         let mut statement = self.connection.prepare(
             "SELECT
@@ -657,6 +667,7 @@ impl UsageStore {
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
                 AND (?7 IS NULL OR model = ?7)
+                AND (?8 IS NULL OR harness = ?8)
              GROUP BY day, repo_bucket, repo_name, repo_path, model
              ORDER BY day, repo_bucket, repo_name, repo_path, model",
         )?;
@@ -669,6 +680,7 @@ impl UsageStore {
                 repo_bucket_filter,
                 MIXED_COST_SOURCE,
                 model_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -944,8 +956,8 @@ impl UsageStore {
                 COALESCE(SUM(costs.cost_usd_nanos), 0) AS cost_usd_nanos
              FROM canonical_token_usage AS tokens
              JOIN canonical_trace_spans AS spans
-                ON instr(tokens.event_key, char(10) || 'trace_id=' || spans.trace_id || char(10)) > 0
-                AND instr(tokens.event_key, char(10) || 'span_id=' || spans.span_id || char(10)) > 0
+                ON tokens.trace_id = spans.trace_id
+                AND tokens.span_id = spans.span_id
              LEFT JOIN canonical_cost_usage AS costs
                 ON costs.estimated_token_usage_id = tokens.id
              WHERE tokens.occurred_at_ms >= ?1
@@ -1130,8 +1142,8 @@ impl UsageStore {
                 SUM(tool_calls.call_count) AS tool_calls
              FROM canonical_tool_calls AS tool_calls
              JOIN canonical_trace_spans AS spans
-                ON instr(tool_calls.event_key, char(10) || 'trace_id=' || spans.trace_id || char(10)) > 0
-                AND instr(tool_calls.event_key, char(10) || 'span_id=' || spans.span_id || char(10)) > 0
+                ON tool_calls.trace_id = spans.trace_id
+                AND tool_calls.span_id = spans.span_id
              WHERE tool_calls.occurred_at_ms >= ?1
                 AND tool_calls.occurred_at_ms < ?2
                 AND tool_calls.harness = ?3
@@ -1353,8 +1365,8 @@ impl UsageStore {
                 COALESCE(SUM(costs.cost_usd_nanos), 0) AS cost_usd_nanos
              FROM canonical_token_usage AS tokens
              JOIN canonical_trace_spans AS spans
-                ON instr(tokens.event_key, char(10) || 'trace_id=' || spans.trace_id || char(10)) > 0
-                AND instr(tokens.event_key, char(10) || 'span_id=' || spans.span_id || char(10)) > 0
+                ON tokens.trace_id = spans.trace_id
+                AND tokens.span_id = spans.span_id
              LEFT JOIN canonical_cost_usage AS costs
                 ON costs.estimated_token_usage_id = tokens.id
              WHERE tokens.occurred_at_ms >= ?1
@@ -1425,8 +1437,8 @@ impl UsageStore {
                 COALESCE(SUM(costs.cost_usd_nanos), 0) AS cost_usd_nanos
              FROM canonical_token_usage AS tokens
              JOIN canonical_trace_spans AS spans
-                ON instr(tokens.event_key, char(10) || 'trace_id=' || spans.trace_id || char(10)) > 0
-                AND instr(tokens.event_key, char(10) || 'span_id=' || spans.span_id || char(10)) > 0
+                ON tokens.trace_id = spans.trace_id
+                AND tokens.span_id = spans.span_id
              LEFT JOIN canonical_cost_usage AS costs
                 ON costs.estimated_token_usage_id = tokens.id
              WHERE tokens.occurred_at_ms >= ?1
@@ -1497,8 +1509,8 @@ impl UsageStore {
                 SUM(tool_calls.call_count) AS tool_calls
              FROM canonical_tool_calls AS tool_calls
              JOIN canonical_trace_spans AS spans
-                ON instr(tool_calls.event_key, char(10) || 'trace_id=' || spans.trace_id || char(10)) > 0
-                AND instr(tool_calls.event_key, char(10) || 'span_id=' || spans.span_id || char(10)) > 0
+                ON tool_calls.trace_id = spans.trace_id
+                AND tool_calls.span_id = spans.span_id
              WHERE tool_calls.occurred_at_ms >= ?1
                 AND tool_calls.occurred_at_ms < ?2
                 AND tool_calls.harness = ?3
@@ -1564,8 +1576,8 @@ impl UsageStore {
                 SUM(tool_calls.call_count) AS tool_calls
              FROM canonical_tool_calls AS tool_calls
              JOIN canonical_trace_spans AS spans
-                ON instr(tool_calls.event_key, char(10) || 'trace_id=' || spans.trace_id || char(10)) > 0
-                AND instr(tool_calls.event_key, char(10) || 'span_id=' || spans.span_id || char(10)) > 0
+                ON tool_calls.trace_id = spans.trace_id
+                AND tool_calls.span_id = spans.span_id
              WHERE tool_calls.occurred_at_ms >= ?1
                 AND tool_calls.occurred_at_ms < ?2
                 AND tool_calls.harness = ?3
@@ -2071,6 +2083,9 @@ impl UsageStore {
         if schema_version < 15 {
             migrate_v14_to_v15(&transaction)?;
         }
+        if schema_version < 16 {
+            migrate_v15_to_v16(&transaction)?;
+        }
 
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS canonical_token_usage (
@@ -2086,6 +2101,8 @@ impl UsageStore {
                 model TEXT NOT NULL,
                 measure TEXT NOT NULL,
                 token_count INTEGER NOT NULL,
+                trace_id TEXT,
+                span_id TEXT,
                 superseded_metric_token_usage_id INTEGER
             );
 
@@ -2169,7 +2186,9 @@ impl UsageStore {
                 repo_path TEXT NOT NULL,
                 harness TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
-                call_count INTEGER NOT NULL
+                call_count INTEGER NOT NULL,
+                trace_id TEXT,
+                span_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS tool_call_rollups (
@@ -2315,10 +2334,15 @@ impl UsageStore {
                 TokenUsageKind::Delta { event_key } => Some(event_key.as_str()),
                 TokenUsageKind::Cumulative => None,
             };
+            let trace_id = record
+                .trace_link
+                .as_ref()
+                .map(|link| link.trace_id.as_str());
+            let span_id = record.trace_link.as_ref().map(|link| link.span_id.as_str());
             transaction.execute(
                 "INSERT INTO canonical_token_usage (
-                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, token_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, token_count, trace_id, span_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     event_key,
                     record.occurred_at.value(),
@@ -2331,6 +2355,8 @@ impl UsageStore {
                     record.model.as_str(),
                     record.measure.storage_name(),
                     delta,
+                    trace_id,
+                    span_id,
                 ],
             )?;
             let token_usage_id = transaction.last_insert_rowid();
@@ -2601,10 +2627,15 @@ impl UsageStore {
             let Some(call_count) = Self::tool_call_delta(transaction, record, &stored_repo)? else {
                 continue;
             };
+            let trace_id = record
+                .trace_link
+                .as_ref()
+                .map(|link| link.trace_id.as_str());
+            let span_id = record.trace_link.as_ref().map(|link| link.span_id.as_str());
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO canonical_tool_calls (
-                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count, trace_id, span_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -2615,6 +2646,8 @@ impl UsageStore {
                     record.harness.as_str(),
                     record.tool_name.as_str(),
                     call_count,
+                    trace_id,
+                    span_id,
                 ],
             )?;
             if inserted == 0 {
@@ -4288,6 +4321,65 @@ fn migrate_v14_to_v15(transaction: &rusqlite::Transaction<'_>) -> Result<(), Sto
         )?;
     }
     Ok(())
+}
+
+fn migrate_v15_to_v16(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    // Promote the trace linkage that used to be reconstructed by scanning the
+    // serialized event_key at query time into typed columns. New rows are written
+    // with these columns directly; existing rows are parsed once here, at the
+    // migration boundary, and never re-parsed from the event key again.
+    for table in ["canonical_token_usage", "canonical_tool_calls"] {
+        if !table_exists(transaction, table)? {
+            continue;
+        }
+        if !table_column_exists(transaction, table, "trace_id")? {
+            transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN trace_id TEXT"), [])?;
+        }
+        if !table_column_exists(transaction, table, "span_id")? {
+            transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN span_id TEXT"), [])?;
+        }
+        backfill_trace_link_columns(transaction, table)?;
+    }
+    Ok(())
+}
+
+fn backfill_trace_link_columns(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT id, event_key FROM {table}
+             WHERE event_key IS NOT NULL AND trace_id IS NULL"
+        ))?;
+        let mapped = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    let update = format!("UPDATE {table} SET trace_id = ?1, span_id = ?2 WHERE id = ?3");
+    for (id, event_key) in rows {
+        if let Some(link) = parse_event_key_trace_link(&event_key) {
+            transaction.execute(&update, params![link.0, link.1, id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract `(trace_id, span_id)` from a serialized usage event key. Each is
+/// written as its own `key=value` line, so we match on line prefixes rather than
+/// substrings. Used only at the migration boundary to backfill the typed columns.
+fn parse_event_key_trace_link(event_key: &str) -> Option<(String, String)> {
+    let mut trace_id = None;
+    let mut span_id = None;
+    for line in event_key.lines() {
+        if let Some(value) = line.strip_prefix("trace_id=") {
+            trace_id = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("span_id=") {
+            span_id = Some(value.to_owned());
+        }
+    }
+    Some((trace_id?, span_id?))
 }
 
 fn cost_source_column_type(
@@ -5999,8 +6091,7 @@ mod tests {
                     "prompt-a",
                     "trace-a",
                     "span-a",
-                    1_781_956_790_000,
-                    1_781_956_801_000,
+                    1_781_956_790_000..1_781_956_801_000,
                     TraceSpanKind::LlmRequest,
                 ),
                 trace_span_record(
@@ -6009,8 +6100,7 @@ mod tests {
                     "prompt-b",
                     "trace-b",
                     "span-b",
-                    1_781_956_890_000,
-                    1_781_956_902_000,
+                    1_781_956_890_000..1_781_956_902_000,
                     TraceSpanKind::LlmRequest,
                 ),
                 trace_span_record(
@@ -6019,8 +6109,7 @@ mod tests {
                     "prompt-b",
                     "trace-b",
                     "tool-b",
-                    1_781_956_901_000,
-                    1_781_956_902_000,
+                    1_781_956_901_000..1_781_956_902_000,
                     TraceSpanKind::ToolCall,
                 ),
             ],
@@ -6101,8 +6190,7 @@ mod tests {
                 "prompt-trace",
                 "trace-only",
                 "span-only",
-                1_781_956_800_000,
-                1_781_956_801_000,
+                1_781_956_800_000..1_781_956_801_000,
                 TraceSpanKind::Interaction,
             )],
             content: vec![ContentRecord {
@@ -9385,6 +9473,30 @@ occurred_at_nanos=1781956803000000000
         )
     }
 
+    #[test]
+    fn parse_event_key_trace_link_reads_typed_ids_from_serialized_key() {
+        let event_key = trace_token_key(
+            kvasir_repo("/repos/kvasir"),
+            "gpt-4.1",
+            TokenMeasure::Input,
+            "trace-xyz",
+            "span-xyz",
+            100,
+        );
+        assert_eq!(
+            parse_event_key_trace_link(&event_key),
+            Some(("trace-xyz".to_owned(), "span-xyz".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_event_key_trace_link_is_none_when_trace_fields_absent() {
+        assert_eq!(
+            parse_event_key_trace_link("otlp-metric-token-usage\nmodel=gpt-4.1\nmeasure=input\n"),
+            None
+        );
+    }
+
     fn opencode_trace_token_record(
         repo: RepoBucket,
         model: &str,
@@ -9411,6 +9523,10 @@ occurred_at_nanos=1781956803000000000
             TokenCount::new(token_count),
         );
         record.counter_start = TimestampMillis::new_for_test(occurred_at_ms - 1_000);
+        record.trace_link = Some(crate::usage::TraceLink::new(
+            TraceId::new(trace_id),
+            SpanId::new(span_id),
+        ));
         record
     }
 
@@ -9427,6 +9543,10 @@ occurred_at_nanos=1781956803000000000
             HarnessName::new("opencode"),
             ToolName::new("Read"),
         )
+        .with_trace_link(crate::usage::TraceLink::new(
+            TraceId::new(trace_id),
+            SpanId::new(span_id),
+        ))
     }
 
     fn trace_span_record(
@@ -9435,8 +9555,7 @@ occurred_at_nanos=1781956803000000000
         prompt_id: &str,
         trace_id: &str,
         span_id: &str,
-        started_at_ms: i64,
-        ended_at_ms: i64,
+        span_ms: std::ops::Range<i64>,
         kind: TraceSpanKind,
     ) -> crate::usage::TraceSpanRecord {
         crate::usage::TraceSpanRecord {
@@ -9448,9 +9567,9 @@ occurred_at_nanos=1781956803000000000
             parent_span_id: None,
             kind,
             name: SpanName::new("span"),
-            started_at: TimestampMillis::new_for_test(started_at_ms),
-            ended_at: TimestampMillis::new_for_test(ended_at_ms),
-            duration_ms: u64::try_from(ended_at_ms - started_at_ms).unwrap(),
+            started_at: TimestampMillis::new_for_test(span_ms.start),
+            ended_at: TimestampMillis::new_for_test(span_ms.end),
+            duration_ms: u64::try_from(span_ms.end - span_ms.start).unwrap(),
             tool_name: if kind == TraceSpanKind::ToolCall {
                 Some(ToolName::new("Read"))
             } else {

@@ -24,7 +24,7 @@ use crate::usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
     RawBodyFileReference, RawBodyReferenceRecord, RepoBucket, RepoIdentity, RepoName, RepoPath,
     TokenCount, TokenMeasure, TokenUsageContext, TokenUsageEventKey, TokenUsageRecord,
-    TokenUsageSignal, ToolCallCount, ToolCallEventKey, ToolCallRecord, TraceSpanRecord,
+    TokenUsageSignal, ToolCallCount, ToolCallEventKey, ToolCallRecord, TraceLink, TraceSpanRecord,
     UsageRecords,
 };
 
@@ -2040,6 +2040,8 @@ fn proto_opencode_token_records(
         .ok_or(OtlpError::MissingTimestamp)?;
     let counter_start = TimestampMillis::try_from_unix_nanos(span.start_time_unix_nano)
         .ok_or(OtlpError::MissingTimestamp)?;
+    let trace_id = canonical_proto_trace_id(span.trace_id.clone())?;
+    let span_id = canonical_proto_span_id(span.span_id.clone())?;
     let mut records = UsageRecords::default();
     for (measure, keys) in opencode_token_attribute_keys() {
         let Some(token_count) = proto_token_count_attribute(&span.attributes, keys).transpose()?
@@ -2050,20 +2052,24 @@ fn proto_opencode_token_records(
             &repo,
             model.as_str(),
             measure,
-            &canonical_proto_trace_id(span.trace_id.clone())?,
-            &canonical_proto_span_id(span.span_id.clone())?,
+            &trace_id,
+            &span_id,
             token_count,
         );
-        records
-            .token_usage
-            .push(TokenUsageRecord::new_delta_from_signal_with_harness(
+        records.token_usage.push(
+            TokenUsageRecord::new_delta_from_signal_with_harness(
                 TokenUsageSignal::OpenCodeTraces,
                 event_key,
                 occurred_at,
                 TokenUsageContext::new(repo.clone(), HarnessName::new("opencode"), model.clone()),
                 measure,
                 token_count,
-            ));
+            )
+            .with_trace_link(TraceLink::new(
+                TraceId::new(trace_id.clone()),
+                SpanId::new(span_id.clone()),
+            )),
+        );
         records
             .token_usage
             .last_mut()
@@ -2099,16 +2105,20 @@ fn json_opencode_token_records(
             &span_id,
             token_count,
         );
-        records
-            .token_usage
-            .push(TokenUsageRecord::new_delta_from_signal_with_harness(
+        records.token_usage.push(
+            TokenUsageRecord::new_delta_from_signal_with_harness(
                 TokenUsageSignal::OpenCodeTraces,
                 event_key,
                 occurred_at,
                 TokenUsageContext::new(repo.clone(), HarnessName::new("opencode"), model.clone()),
                 measure,
                 token_count,
-            ));
+            )
+            .with_trace_link(TraceLink::new(
+                TraceId::new(trace_id.clone()),
+                SpanId::new(span_id.clone()),
+            )),
+        );
         records
             .token_usage
             .last_mut()
@@ -2130,19 +2140,19 @@ fn proto_opencode_tool_call_record(
     };
     let occurred_at = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano)
         .ok_or(OtlpError::MissingTimestamp)?;
-    let event_key = trace_tool_call_event_key(
-        &repo,
-        &canonical_proto_trace_id(span.trace_id.clone())?,
-        &canonical_proto_span_id(span.span_id.clone())?,
-        tool_name.as_str(),
-    );
-    Ok(Some(ToolCallRecord::new(
-        event_key,
-        occurred_at,
-        repo,
-        HarnessName::new("opencode"),
-        tool_name,
-    )))
+    let trace_id = canonical_proto_trace_id(span.trace_id.clone())?;
+    let span_id = canonical_proto_span_id(span.span_id.clone())?;
+    let event_key = trace_tool_call_event_key(&repo, &trace_id, &span_id, tool_name.as_str());
+    Ok(Some(
+        ToolCallRecord::new(
+            event_key,
+            occurred_at,
+            repo,
+            HarnessName::new("opencode"),
+            tool_name,
+        )
+        .with_trace_link(TraceLink::new(TraceId::new(trace_id), SpanId::new(span_id))),
+    ))
 }
 
 fn json_opencode_tool_call_record(
@@ -2157,19 +2167,19 @@ fn json_opencode_tool_call_record(
         return Ok(None);
     };
     let occurred_at = json_timestamp(span, "endTimeUnixNano").ok_or(OtlpError::MissingTimestamp)?;
-    let event_key = trace_tool_call_event_key(
-        &repo,
-        &canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?,
-        &canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?,
-        tool_name.as_str(),
-    );
-    Ok(Some(ToolCallRecord::new(
-        event_key,
-        occurred_at,
-        repo,
-        HarnessName::new("opencode"),
-        tool_name,
-    )))
+    let trace_id = canonical_json_trace_id(span.get("traceId").and_then(Value::as_str))?;
+    let span_id = canonical_json_span_id(span.get("spanId").and_then(Value::as_str))?;
+    let event_key = trace_tool_call_event_key(&repo, &trace_id, &span_id, tool_name.as_str());
+    Ok(Some(
+        ToolCallRecord::new(
+            event_key,
+            occurred_at,
+            repo,
+            HarnessName::new("opencode"),
+            tool_name,
+        )
+        .with_trace_link(TraceLink::new(TraceId::new(trace_id), SpanId::new(span_id))),
+    ))
 }
 
 fn json_trace_span_record(
