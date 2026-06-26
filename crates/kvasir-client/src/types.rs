@@ -8,17 +8,20 @@ pub struct KvasirSocketPath(String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KvasirModelName(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KvasirHarnessName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirToolName(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KvasirSessionId(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KvasirPromptId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvasirDimensionValue(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvasirTraceId(String);
@@ -47,6 +50,7 @@ uniffi::custom_type!(KvasirHarnessName, String);
 uniffi::custom_type!(KvasirToolName, String);
 uniffi::custom_type!(KvasirSessionId, String);
 uniffi::custom_type!(KvasirPromptId, String);
+uniffi::custom_type!(KvasirDimensionValue, String);
 uniffi::custom_type!(KvasirTraceId, String);
 uniffi::custom_type!(KvasirSpanId, String);
 uniffi::custom_type!(KvasirSpanName, String);
@@ -85,7 +89,10 @@ pub struct KvasirRollupQuery {
     pub start: KvasirTimestampMillis,
     pub end: KvasirTimestampMillis,
     pub repo: Option<KvasirRepoBucket>,
+    pub harness: Option<KvasirHarnessName>,
     pub model: Option<KvasirModelName>,
+    pub session: Option<KvasirOverviewSessionRoute>,
+    pub prompt: Option<KvasirOverviewPromptRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -153,6 +160,11 @@ pub struct KvasirOverviewRollup {
     pub token_rollups: Vec<KvasirTokenRollup>,
     pub cost_rollups: Vec<KvasirCostRollup>,
     pub tool_call_rollups: Vec<KvasirToolCallRollup>,
+    pub harness_summaries: Vec<KvasirOverviewHarnessSummary>,
+    pub session_summaries: Vec<KvasirOverviewSessionSummary>,
+    pub session_summaries_more_available: u64,
+    pub prompt_summaries: Vec<KvasirOverviewPromptSummary>,
+    pub prompt_summaries_more_available: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -161,6 +173,14 @@ pub struct KvasirOverviewTotals {
     pub cost_usd_nanos: u64,
     pub cost_source: Option<KvasirCostSource>,
     pub tool_calls: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirAttributionStatus {
+    Direct,
+    TraceDerived,
+    Partial,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -184,14 +204,77 @@ pub struct KvasirOverviewModelSummary {
     pub totals: KvasirOverviewTotals,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct KvasirOverviewSessionRoute {
+    pub harness: KvasirHarnessName,
+    pub session_id: KvasirSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct KvasirOverviewPromptRoute {
+    pub session: KvasirOverviewSessionRoute,
+    pub prompt_id: KvasirPromptId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewSessionSummary {
+    pub route: KvasirOverviewSessionRoute,
+    pub totals: KvasirOverviewTotals,
+    pub attribution_status: KvasirAttributionStatus,
+    pub last_activity: KvasirTimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewPromptSummary {
+    pub route: KvasirOverviewPromptRoute,
+    pub totals: KvasirOverviewTotals,
+    pub attribution_status: KvasirAttributionStatus,
+    pub last_activity: KvasirTimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewHarnessSummary {
+    pub harness: KvasirHarnessName,
+    pub totals: KvasirOverviewTotals,
+    pub last_activity: KvasirTimestampMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirOverviewDimensionKind {
+    Subagent,
+    Skill,
+    Plugin,
+    McpServer,
+    McpTool,
+    Effort,
+    Speed,
+    QuerySource,
+    AccountOrg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirOverviewDimensionFilter {
+    pub kind: KvasirOverviewDimensionKind,
+    pub value: KvasirDimensionValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirOverviewSnapshot {
     pub totals: KvasirOverviewTotals,
     pub series: Vec<KvasirOverviewSeriesPoint>,
     pub repo_breakdown: Vec<KvasirOverviewRepoSummary>,
     pub model_breakdown: Vec<KvasirOverviewModelSummary>,
+    pub harness_breakdown: Vec<KvasirOverviewHarnessSummary>,
+    pub session_breakdown: Vec<KvasirOverviewSessionSummary>,
+    pub session_breakdown_more_available: u64,
+    pub prompt_breakdown: Vec<KvasirOverviewPromptSummary>,
+    pub prompt_breakdown_more_available: u64,
     pub selected_repo: Option<KvasirRepoBucket>,
+    pub selected_harness: Option<KvasirHarnessName>,
     pub selected_model: Option<KvasirModelName>,
+    pub selected_session: Option<KvasirOverviewSessionRoute>,
+    pub selected_prompt: Option<KvasirOverviewPromptRoute>,
+    pub dimensions: Vec<KvasirOverviewDimensionFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -390,14 +473,27 @@ impl KvasirOverviewSnapshot {
     pub(crate) fn from_rollup(
         rollup: KvasirOverviewRollup,
         selected_repo: Option<KvasirRepoBucket>,
+        selected_harness: Option<KvasirHarnessName>,
         selected_model: Option<KvasirModelName>,
+        selected_session: Option<KvasirOverviewSessionRoute>,
+        selected_prompt: Option<KvasirOverviewPromptRoute>,
     ) -> Self {
+        let KvasirOverviewRollup {
+            token_rollups,
+            cost_rollups,
+            tool_call_rollups,
+            harness_summaries,
+            session_summaries,
+            session_summaries_more_available,
+            prompt_summaries,
+            prompt_summaries_more_available,
+        } = rollup;
         let mut totals = KvasirOverviewTotals::zero();
         let mut points_by_day: HashMap<KvasirRollupDay, KvasirOverviewSeriesPoint> = HashMap::new();
         let mut totals_by_repo: HashMap<KvasirRepoBucket, KvasirOverviewTotals> = HashMap::new();
         let mut totals_by_model: HashMap<KvasirModelName, KvasirOverviewTotals> = HashMap::new();
 
-        for token_rollup in rollup.token_rollups {
+        for token_rollup in token_rollups {
             let KvasirTokenRollup {
                 day,
                 repo,
@@ -424,7 +520,7 @@ impl KvasirOverviewSnapshot {
             model_totals.total_tokens = model_totals.total_tokens.saturating_add(tokens);
         }
 
-        for cost_rollup in rollup.cost_rollups {
+        for cost_rollup in cost_rollups {
             let KvasirCostRollup {
                 day,
                 repo,
@@ -452,7 +548,7 @@ impl KvasirOverviewSnapshot {
             model_totals.cost_source = combined_cost_source(model_totals.cost_source, source);
         }
 
-        for tool_call_rollup in rollup.tool_call_rollups {
+        for tool_call_rollup in tool_call_rollups {
             totals.tool_calls = totals
                 .tool_calls
                 .saturating_add(tool_call_rollup.call_count);
@@ -488,8 +584,17 @@ impl KvasirOverviewSnapshot {
             series,
             repo_breakdown,
             model_breakdown,
+            harness_breakdown: harness_summaries,
+            session_breakdown: session_summaries,
+            session_breakdown_more_available: session_summaries_more_available,
+            prompt_breakdown: prompt_summaries,
+            prompt_breakdown_more_available: prompt_summaries_more_available,
             selected_repo,
+            selected_harness,
             selected_model,
+            selected_session,
+            selected_prompt,
+            dimensions: Vec::new(),
         }
     }
 }
@@ -655,6 +760,12 @@ impl From<KvasirPromptId> for String {
     }
 }
 
+impl From<KvasirDimensionValue> for String {
+    fn from(value: KvasirDimensionValue) -> Self {
+        value.0
+    }
+}
+
 impl From<KvasirTraceId> for String {
     fn from(value: KvasirTraceId) -> Self {
         value.0
@@ -744,6 +855,14 @@ impl TryFrom<String> for KvasirSessionId {
 }
 
 impl TryFrom<String> for KvasirPromptId {
+    type Error = KvasirClientError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        nonempty_text(value).map(Self)
+    }
+}
+
+impl TryFrom<String> for KvasirDimensionValue {
     type Error = KvasirClientError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -942,8 +1061,16 @@ mod tests {
                         call_count: 6,
                     },
                 ],
+                harness_summaries: Vec::new(),
+                session_summaries: Vec::new(),
+                session_summaries_more_available: 0,
+                prompt_summaries: Vec::new(),
+                prompt_summaries_more_available: 0,
             },
             Some(selected_repo.clone()),
+            None,
+            None,
+            None,
             None,
         );
 
@@ -1023,6 +1150,11 @@ mod tests {
         );
         assert_eq!(snapshot.selected_repo, Some(selected_repo));
         assert_eq!(snapshot.selected_model, None);
+        assert_eq!(snapshot.session_breakdown, Vec::new());
+        assert_eq!(snapshot.prompt_breakdown, Vec::new());
+        assert_eq!(snapshot.selected_session, None);
+        assert_eq!(snapshot.selected_prompt, None);
+        assert_eq!(snapshot.dimensions, Vec::new());
 
         Ok(())
     }
@@ -1062,7 +1194,15 @@ mod tests {
                     },
                 ],
                 tool_call_rollups: Vec::new(),
+                harness_summaries: Vec::new(),
+                session_summaries: Vec::new(),
+                session_summaries_more_available: 0,
+                prompt_summaries: Vec::new(),
+                prompt_summaries_more_available: 0,
             },
+            None,
+            None,
+            None,
             None,
             None,
         );

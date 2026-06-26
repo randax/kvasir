@@ -28,5 +28,5 @@ pub use usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
     RawBodyFileReference, RawBodyReferenceRecord, RepoBucket, RepoIdentity, RepoName, RepoPath,
     TokenCount, TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal,
-    ToolCallRecord, TraceSpanRecord, UsageRecords,
+    ToolCallRecord, TraceLink, TraceSpanRecord, UsageRecords,
 };

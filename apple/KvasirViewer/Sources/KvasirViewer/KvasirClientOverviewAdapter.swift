@@ -1,4 +1,5 @@
 #if canImport(kvasir_client)
+import Foundation
 import kvasir_client
 import KvasirViewerCore
 
@@ -20,7 +21,10 @@ func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
         start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),
         end: KvasirTimestampMillis(value: Int64(query.end.timeIntervalSince1970 * 1_000)),
         repo: query.repo?.kvasirRepoBucket,
-        model: query.model?.displayName()
+        harness: query.harness?.displayName(),
+        model: query.model?.displayName(),
+        session: query.session?.kvasirOverviewSessionRoute,
+        prompt: query.prompt?.kvasirOverviewPromptRoute
     )
 }
 
@@ -46,6 +50,24 @@ private extension OverviewRepoBucket {
     }
 }
 
+private extension OverviewSessionRoute {
+    var kvasirOverviewSessionRoute: KvasirOverviewSessionRoute {
+        KvasirOverviewSessionRoute(
+            harness: harness.displayName(),
+            sessionId: sessionID.displayName()
+        )
+    }
+}
+
+private extension OverviewPromptRoute {
+    var kvasirOverviewPromptRoute: KvasirOverviewPromptRoute {
+        KvasirOverviewPromptRoute(
+            session: session.kvasirOverviewSessionRoute,
+            promptId: promptID.displayName()
+        )
+    }
+}
+
 private extension KvasirRepoBucket {
     var overviewRepo: OverviewRepoBucket {
         switch kind {
@@ -63,6 +85,24 @@ private extension KvasirRepoBucket {
     }
 }
 
+private extension KvasirOverviewSessionRoute {
+    var overviewSessionRoute: OverviewSessionRoute {
+        OverviewSessionRoute(
+            harness: OverviewHarnessName(harness),
+            sessionID: OverviewSessionID(sessionId)
+        )
+    }
+}
+
+private extension KvasirOverviewPromptRoute {
+    var overviewPromptRoute: OverviewPromptRoute {
+        OverviewPromptRoute(
+            session: session.overviewSessionRoute,
+            promptID: OverviewPromptID(promptId)
+        )
+    }
+}
+
 private extension KvasirOverviewSnapshot {
     var overviewSnapshot: OverviewSnapshot {
         OverviewSnapshot(
@@ -70,8 +110,17 @@ private extension KvasirOverviewSnapshot {
             series: series.map { $0.overviewSeriesPoint },
             repoBreakdown: repoBreakdown.map { $0.overviewRepoSummary },
             modelBreakdown: modelBreakdown.map { $0.overviewModelSummary },
+            harnessBreakdown: harnessBreakdown.map { $0.overviewHarnessSummary },
+            sessionBreakdown: sessionBreakdown.map { $0.overviewSessionSummary },
+            sessionBreakdownMoreAvailable: sessionBreakdownMoreAvailable,
+            promptBreakdown: promptBreakdown.map { $0.overviewPromptSummary },
+            promptBreakdownMoreAvailable: promptBreakdownMoreAvailable,
             selectedRepo: selectedRepo?.overviewRepo,
-            selectedModel: selectedModel.map(OverviewModelName.init)
+            selectedHarness: selectedHarness.map(OverviewHarnessName.init),
+            selectedModel: selectedModel.map(OverviewModelName.init),
+            selectedSession: selectedSession?.overviewSessionRoute,
+            selectedPrompt: selectedPrompt?.overviewPromptRoute,
+            dimensions: dimensions.map { $0.overviewDimensionFilter }
         )
     }
 }
@@ -111,9 +160,96 @@ private extension KvasirOverviewModelSummary {
     }
 }
 
+private extension KvasirOverviewHarnessSummary {
+    var overviewHarnessSummary: OverviewHarnessSummary {
+        OverviewHarnessSummary(
+            harness: OverviewHarnessName(harness),
+            totals: totals.overviewTotals,
+            lastActivity: Date(timeIntervalSince1970: TimeInterval(lastActivity.value) / 1_000)
+        )
+    }
+}
+
+private extension KvasirOverviewSessionSummary {
+    var overviewSessionSummary: OverviewSessionSummary {
+        OverviewSessionSummary(
+            route: route.overviewSessionRoute,
+            totals: totals.overviewTotals,
+            attributionStatus: attributionStatus.overviewAttributionStatus,
+            lastActivity: lastActivity.overviewDate
+        )
+    }
+}
+
+private extension KvasirOverviewPromptSummary {
+    var overviewPromptSummary: OverviewPromptSummary {
+        OverviewPromptSummary(
+            route: route.overviewPromptRoute,
+            totals: totals.overviewTotals,
+            attributionStatus: attributionStatus.overviewAttributionStatus,
+            lastActivity: lastActivity.overviewDate
+        )
+    }
+}
+
+private extension KvasirAttributionStatus {
+    var overviewAttributionStatus: OverviewAttributionStatus {
+        switch self {
+        case .direct:
+            return .direct
+        case .traceDerived:
+            return .traceDerived
+        case .partial:
+            return .partial
+        case .unavailable:
+            return .unavailable
+        }
+    }
+}
+
+private extension KvasirOverviewDimensionFilter {
+    var overviewDimensionFilter: OverviewDimensionFilter {
+        OverviewDimensionFilter(
+            kind: kind.overviewDimensionKind,
+            value: OverviewDimensionValue(value)
+        )
+    }
+}
+
+private extension KvasirOverviewDimensionKind {
+    var overviewDimensionKind: OverviewDimensionKind {
+        switch self {
+        case .subagent:
+            return .subagent
+        case .skill:
+            return .skill
+        case .plugin:
+            return .plugin
+        case .mcpServer:
+            return .mcpServer
+        case .mcpTool:
+            return .mcpTool
+        case .effort:
+            return .effort
+        case .speed:
+            return .speed
+        case .querySource:
+            return .querySource
+        case .accountOrg:
+            return .accountOrg
+        }
+    }
+}
+
 private extension KvasirRollupDay {
     var overviewDay: OverviewRollupDay {
         OverviewRollupDay(year: Int(year), month: Int(month), day: Int(day))
+    }
+}
+
+private extension KvasirTimestampMillis {
+    var overviewDate: Date {
+        Date(timeIntervalSince1970: Double(value) / 1_000)
     }
 }
 

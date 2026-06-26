@@ -80,13 +80,28 @@ struct OverviewScreen: View {
                     if let errorMessage = model.errorMessage {
                         errorBanner(errorMessage)
                     }
+                    filterBar(snapshot.filterBarPresentation)
                     totals(
                         snapshot.totals,
                         costDisplay: costPresentation.total,
                         showsToolCalls: snapshot.selectedModel == nil
                     )
-                    modelDashboard(snapshot.modelBreakdown)
                     repoDashboard(snapshot.repoBreakdown, showsToolCalls: snapshot.selectedModel == nil)
+                    modelDashboard(snapshot.modelBreakdown)
+                    harnessDashboard(
+                        snapshot.harnessBreakdown,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
+                    sessionDashboard(
+                        snapshot.sessionBreakdown,
+                        moreAvailable: snapshot.sessionBreakdownMoreAvailable,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
+                    promptDashboard(
+                        snapshot.promptBreakdown,
+                        moreAvailable: snapshot.promptBreakdownMoreAvailable,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
                     charts(
                         snapshot.series,
                         costPresentation: costPresentation,
@@ -115,6 +130,50 @@ struct OverviewScreen: View {
 
     nonisolated static func costDashboardPresentation(for snapshot: OverviewSnapshot) -> OverviewCostDashboardPresentation {
         snapshot.costDashboardPresentation
+    }
+
+    private func filterBar(_ presentation: OverviewFilterBarPresentation) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                FilterChip(title: "Repo", value: presentation.repo ?? "All", systemImage: "folder") {
+                    selectRepo(nil)
+                }
+                .disabled(model.selectedRepo == nil)
+
+                FilterChip(title: "Model", value: presentation.model ?? "All", systemImage: "cpu") {
+                    selectModel(nil)
+                }
+                .disabled(model.selectedModel == nil)
+
+                if let harness = presentation.harness {
+                    FilterChip(title: "Harness", value: harness, systemImage: "terminal") {
+                        selectHarness(nil)
+                    }
+                }
+
+                if let session = presentation.session {
+                    FilterChip(title: "Session", value: session, systemImage: "rectangle.stack") {
+                        clearSessionAndPrompt()
+                    }
+                }
+
+                if let prompt = presentation.prompt {
+                    FilterChip(title: "Prompt", value: prompt, systemImage: "text.bubble") {
+                        clearPrompt()
+                    }
+                }
+
+                ForEach(Array(presentation.dimensions.enumerated()), id: \.offset) { _, dimension in
+                    FilterChip(title: dimension.title, value: dimension.value, systemImage: "tag")
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+        )
     }
 
     private func totals(
@@ -173,7 +232,7 @@ struct OverviewScreen: View {
                             showsToolCalls: showsToolCalls,
                             costFormatter: usd
                         ) {
-                            selectRepo(summary.repo)
+                            drillDown(to: .repo(summary.repo))
                         }
                         Divider()
                     }
@@ -223,7 +282,7 @@ struct OverviewScreen: View {
                             isSelected: model.selectedModel == summary.model,
                             costFormatter: usd
                         ) {
-                            selectModel(summary.model)
+                            drillDown(to: .model(summary.model))
                         }
                         Divider()
                     }
@@ -234,6 +293,141 @@ struct OverviewScreen: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color(nsColor: .separatorColor).opacity(0.35))
             )
+        }
+    }
+
+    private func harnessDashboard(_ harnesses: [OverviewHarnessSummary], showsToolCalls: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Text("Harnesses")
+                    .font(.headline)
+
+                if let selectedHarness = model.selectedHarness {
+                    Text(selectedHarness.displayName())
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(selectedHarness.displayName())
+                }
+
+                Spacer()
+
+                Button {
+                    selectHarness(nil)
+                } label: {
+                    Label("All harnesses", systemImage: "terminal")
+                }
+                .disabled(model.selectedHarness == nil)
+            }
+
+            VStack(spacing: 0) {
+                if harnesses.isEmpty {
+                    HarnessEmptyRow()
+                } else {
+                    HarnessHeaderRow(showsToolCalls: showsToolCalls)
+                    ForEach(harnesses, id: \.harness) { summary in
+                        HarnessSummaryRow(
+                            summary: summary,
+                            isSelected: model.selectedHarness == summary.harness,
+                            showsToolCalls: showsToolCalls,
+                            costFormatter: usd
+                        ) {
+                            drillDown(to: .harness(summary.harness))
+                        }
+                        Divider()
+                    }
+                }
+            }
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+            )
+        }
+    }
+
+    private func sessionDashboard(
+        _ sessions: [OverviewSessionSummary],
+        moreAvailable: UInt64,
+        showsToolCalls: Bool
+    ) -> some View {
+        Group {
+            if !sessions.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text("Sessions")
+                            .font(.headline)
+                        if moreAvailable > 0 {
+                            Text("\(moreAvailable.formatted()) more available")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    VStack(spacing: 0) {
+                        SessionHeaderRow(showsToolCalls: showsToolCalls)
+                        ForEach(sessions, id: \.route) { summary in
+                            SessionSummaryRow(
+                                summary: summary,
+                                isSelected: model.selectedSession == summary.route,
+                                showsToolCalls: showsToolCalls,
+                                costFormatter: usd
+                            ) {
+                                drillDown(to: .session(summary.route))
+                            }
+                            Divider()
+                        }
+                    }
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+                    )
+                }
+            }
+        }
+    }
+
+    private func promptDashboard(
+        _ prompts: [OverviewPromptSummary],
+        moreAvailable: UInt64,
+        showsToolCalls: Bool
+    ) -> some View {
+        Group {
+            if !prompts.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text("Prompts")
+                            .font(.headline)
+                        if moreAvailable > 0 {
+                            Text("\(moreAvailable.formatted()) more available")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    VStack(spacing: 0) {
+                        PromptHeaderRow(showsToolCalls: showsToolCalls)
+                        ForEach(prompts, id: \.route) { summary in
+                            PromptSummaryRow(
+                                summary: summary,
+                                isSelected: model.selectedPrompt == summary.route,
+                                showsToolCalls: showsToolCalls,
+                                costFormatter: usd
+                            ) {
+                                drillDown(to: .prompt(summary.route))
+                            }
+                            Divider()
+                        }
+                    }
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+                    )
+                }
+            }
         }
     }
 
@@ -276,6 +470,46 @@ struct OverviewScreen: View {
         Task {
             do {
                 try await model.selectModel(selectedModel)
+            } catch {
+                model.record(error: error)
+            }
+        }
+    }
+
+    private func selectHarness(_ selectedHarness: OverviewHarnessName?) {
+        Task {
+            do {
+                try await model.selectHarness(selectedHarness)
+            } catch {
+                model.record(error: error)
+            }
+        }
+    }
+
+    private func drillDown(to target: OverviewDrillTarget) {
+        Task {
+            do {
+                try await model.drillDown(to: target)
+            } catch {
+                model.record(error: error)
+            }
+        }
+    }
+
+    private func clearSessionAndPrompt() {
+        Task {
+            do {
+                try await model.clearSessionAndPrompt()
+            } catch {
+                model.record(error: error)
+            }
+        }
+    }
+
+    private func clearPrompt() {
+        Task {
+            do {
+                try await model.clearPrompt()
             } catch {
                 model.record(error: error)
             }
@@ -340,6 +574,52 @@ private struct ModelEmptyRow: View {
     }
 }
 
+private struct HarnessEmptyRow: View {
+    var body: some View {
+        Label("No harness data for this range", systemImage: "tray")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+    }
+}
+
+private struct FilterChip: View {
+    let title: String
+    let value: String
+    let systemImage: String
+    var clearAction: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let clearAction {
+                Button(action: clearAction) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear \(title.lowercased()) filter")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color(nsColor: .textBackgroundColor), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+        )
+        .help("\(title): \(value)")
+    }
+}
+
 private struct RepoHeaderRow: View {
     let showsToolCalls: Bool
 
@@ -372,6 +652,79 @@ private struct ModelHeaderRow: View {
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
                 .frame(width: 132, alignment: .trailing)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct HarnessHeaderRow: View {
+    let showsToolCalls: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Harness")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Tokens")
+                .frame(width: 110, alignment: .trailing)
+            Text("Cost")
+                .frame(width: 132, alignment: .trailing)
+            if showsToolCalls {
+                Text("Tool calls")
+                    .frame(width: 110, alignment: .trailing)
+            }
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct SessionHeaderRow: View {
+    let showsToolCalls: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Session")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Status")
+                .frame(width: 96, alignment: .leading)
+            Text("Tokens")
+                .frame(width: 110, alignment: .trailing)
+            Text("Cost")
+                .frame(width: 132, alignment: .trailing)
+            if showsToolCalls {
+                Text("Tool calls")
+                    .frame(width: 110, alignment: .trailing)
+            }
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct PromptHeaderRow: View {
+    let showsToolCalls: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Prompt")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Status")
+                .frame(width: 96, alignment: .leading)
+            Text("Tokens")
+                .frame(width: 110, alignment: .trailing)
+            Text("Cost")
+                .frame(width: 132, alignment: .trailing)
+            if showsToolCalls {
+                Text("Tool calls")
+                    .frame(width: 110, alignment: .trailing)
+            }
         }
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)
@@ -467,6 +820,177 @@ private struct ModelSummaryRow: View {
         }
         .buttonStyle(.plain)
         .help(summary.model.displayName())
+    }
+}
+
+private struct HarnessSummaryRow: View {
+    let summary: OverviewHarnessSummary
+    let isSelected: Bool
+    let showsToolCalls: Bool
+    let costFormatter: (UInt64) -> String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "terminal")
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    Text(summary.harness.displayName())
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(summary.totals.totalTokens.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                CostValue(
+                    display: summary.totals.costDisplay,
+                    formatter: costFormatter
+                )
+                if showsToolCalls {
+                    Text(summary.totals.toolCalls.formatted())
+                        .monospacedDigit()
+                        .frame(width: 110, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(summary.harness.displayName())
+    }
+}
+
+private struct SessionSummaryRow: View {
+    let summary: OverviewSessionSummary
+    let isSelected: Bool
+    let showsToolCalls: Bool
+    let costFormatter: (UInt64) -> String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "terminal")
+                            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        Text(summary.route.sessionID.displayName())
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Text(summary.route.harness.displayName())
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                AttributionStatusChip(status: summary.attributionStatus)
+                Text(summary.totals.totalTokens.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                CostValue(
+                    display: summary.totals.costDisplay,
+                    formatter: costFormatter
+                )
+                if showsToolCalls {
+                    Text(summary.totals.toolCalls.formatted())
+                        .monospacedDigit()
+                        .frame(width: 110, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(summary.route.sessionID.displayName())
+    }
+}
+
+private struct PromptSummaryRow: View {
+    let summary: OverviewPromptSummary
+    let isSelected: Bool
+    let showsToolCalls: Bool
+    let costFormatter: (UInt64) -> String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "text.bubble")
+                            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        Text(summary.route.promptID.displayName())
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Text(summary.route.session.sessionID.displayName())
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                AttributionStatusChip(status: summary.attributionStatus)
+                Text(summary.totals.totalTokens.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                CostValue(
+                    display: summary.totals.costDisplay,
+                    formatter: costFormatter
+                )
+                if showsToolCalls {
+                    Text(summary.totals.toolCalls.formatted())
+                        .monospacedDigit()
+                        .frame(width: 110, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(summary.route.promptID.displayName())
+    }
+}
+
+private struct AttributionStatusChip: View {
+    let status: OverviewAttributionStatus
+
+    var body: some View {
+        Text(status.displayName)
+            .font(.caption.weight(.medium))
+            .lineLimit(1)
+            .foregroundStyle(foregroundColor)
+            .frame(width: 96, alignment: .leading)
+            .help(status.displayName)
+    }
+
+    private var foregroundColor: Color {
+        switch status {
+        case .direct:
+            return .secondary
+        case .traceDerived:
+            return .teal
+        case .partial:
+            return .orange
+        case .unavailable:
+            return .secondary
+        }
     }
 }
 

@@ -42,6 +42,9 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var setupWarningMessage: String?
     @Published public private(set) var selectedRepo: OverviewRepoBucket?
     @Published public private(set) var selectedModel: OverviewModelName?
+    @Published public private(set) var selectedHarness: OverviewHarnessName?
+    @Published public private(set) var selectedSession: OverviewSessionRoute?
+    @Published public private(set) var selectedPrompt: OverviewPromptRoute?
     @Published public var selectedRangePreset: OverviewRangePreset
 
     private let dashboard: OverviewDashboard
@@ -97,28 +100,88 @@ public final class KvasirViewerModel: ObservableObject {
 
     public func selectRangePreset(_ preset: OverviewRangePreset) async throws {
         selectedRangePreset = preset
-        try await refreshOverview()
+        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
+            selectedSession = nil
+            selectedPrompt = nil
+        }
     }
 
     public func selectRepo(_ repo: OverviewRepoBucket?) async throws {
-        try await refreshOverview(repo: repo, model: selectedModel) {
+        try await refreshOverview(repo: repo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
             selectedRepo = repo
+            selectedSession = nil
+            selectedPrompt = nil
         }
     }
 
     public func selectModel(_ model: OverviewModelName?) async throws {
-        try await refreshOverview(repo: selectedRepo, model: model) {
+        try await refreshOverview(repo: selectedRepo, model: model, harness: selectedHarness, session: nil, prompt: nil) {
             selectedModel = model
+            selectedSession = nil
+            selectedPrompt = nil
+        }
+    }
+
+    public func selectHarness(_ harness: OverviewHarnessName?) async throws {
+        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: harness, session: nil, prompt: nil) {
+            selectedHarness = harness
+            selectedSession = nil
+            selectedPrompt = nil
+        }
+    }
+
+    public func drillDown(to target: OverviewDrillTarget) async throws {
+        switch target {
+        case .repo(let repo):
+            try await selectRepo(repo)
+        case .model(let model):
+            try await selectModel(model)
+        case .harness(let harness):
+            try await selectHarness(harness)
+        case .session(let session):
+            try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: session.harness, session: session, prompt: nil) {
+                selectedHarness = session.harness
+                selectedSession = session
+                selectedPrompt = nil
+            }
+        case .prompt(let prompt):
+            try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: prompt.session.harness, session: prompt.session, prompt: prompt) {
+                selectedHarness = prompt.session.harness
+                selectedSession = prompt.session
+                selectedPrompt = prompt
+            }
+        }
+    }
+
+    public func clearSessionAndPrompt() async throws {
+        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
+            selectedSession = nil
+            selectedPrompt = nil
+        }
+    }
+
+    public func clearPrompt() async throws {
+        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: selectedSession, prompt: nil) {
+            selectedPrompt = nil
         }
     }
 
     public func refreshOverview() async throws {
-        try await refreshOverview(repo: selectedRepo, model: selectedModel)
+        try await refreshOverview(
+            repo: selectedRepo,
+            model: selectedModel,
+            harness: selectedHarness,
+            session: selectedSession,
+            prompt: selectedPrompt
+        )
     }
 
     private func refreshOverview(
         repo: OverviewRepoBucket?,
         model: OverviewModelName?,
+        harness: OverviewHarnessName?,
+        session: OverviewSessionRoute? = nil,
+        prompt: OverviewPromptRoute? = nil,
         beforeCommit: () -> Void = {}
     ) async throws {
         overviewLoadID += 1
@@ -127,7 +190,10 @@ public final class KvasirViewerModel: ObservableObject {
             let snapshot = try await dashboard.load(
                 range: selectedRangePreset.range(containing: now(), calendar: calendar),
                 repo: repo,
-                model: model
+                model: model,
+                harness: harness,
+                session: session,
+                prompt: prompt
             )
             guard loadID == overviewLoadID else {
                 return

@@ -12,12 +12,13 @@ use kvasir_client::{
     KvasirContentKind, KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
     KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
     KvasirCostSource, KvasirCostUsd, KvasirHarnessName, KvasirModelName,
-    KvasirOverviewModelSummary, KvasirOverviewRepoSummary, KvasirOverviewRollup,
-    KvasirOverviewSeriesPoint, KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId,
-    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
-    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
-    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
-    KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
+    KvasirOverviewHarnessSummary, KvasirOverviewModelSummary, KvasirOverviewRepoSummary,
+    KvasirOverviewRollup, KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute,
+    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
+    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
+    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
+    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
+    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
     KvasirTraceSpanKind,
 };
 use kvasir_core::PriceTable;
@@ -61,7 +62,10 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: None,
+        harness: None,
         model: None,
+        session: None,
+        prompt: None,
     };
     let rollups = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1069,7 +1073,10 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        harness: None,
         model: None,
+        session: None,
+        prompt: None,
     };
     let (overview, snapshot) = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1192,6 +1199,36 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     call_count: 2,
                 },
             ],
+            harness_summaries: vec![
+                KvasirOverviewHarnessSummary {
+                    harness: harness("unknown"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 0,
+                        cost_usd_nanos: 1_950_000_000,
+                        cost_source: Some(KvasirCostSource::Native),
+                        tool_calls: 0,
+                    },
+                    last_activity: KvasirTimestampMillis {
+                        value: 1_782_043_200_000,
+                    },
+                },
+                KvasirOverviewHarnessSummary {
+                    harness: harness("claude_code"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 5_000,
+                        cost_usd_nanos: 18_015_000,
+                        cost_source: Some(KvasirCostSource::Estimated),
+                        tool_calls: 3,
+                    },
+                    last_activity: KvasirTimestampMillis {
+                        value: 1_782_043_200_000,
+                    },
+                },
+            ],
+            session_summaries: Vec::new(),
+            session_summaries_more_available: 0,
+            prompt_summaries: Vec::new(),
+            prompt_summaries_more_available: 0,
         }
     );
     assert_eq!(
@@ -1256,8 +1293,42 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
                     },
                 },
             ],
+            harness_breakdown: vec![
+                KvasirOverviewHarnessSummary {
+                    harness: harness("unknown"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 0,
+                        cost_usd_nanos: 1_950_000_000,
+                        cost_source: Some(KvasirCostSource::Native),
+                        tool_calls: 0,
+                    },
+                    last_activity: KvasirTimestampMillis {
+                        value: 1_782_043_200_000,
+                    },
+                },
+                KvasirOverviewHarnessSummary {
+                    harness: harness("claude_code"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 5_000,
+                        cost_usd_nanos: 18_015_000,
+                        cost_source: Some(KvasirCostSource::Estimated),
+                        tool_calls: 3,
+                    },
+                    last_activity: KvasirTimestampMillis {
+                        value: 1_782_043_200_000,
+                    },
+                },
+            ],
+            session_breakdown: vec![],
+            session_breakdown_more_available: 0,
+            prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
             selected_repo: Some(kvasir_repo()),
+            selected_harness: None,
             selected_model: None,
+            selected_session: None,
+            selected_prompt: None,
+            dimensions: vec![],
         }
     );
 
@@ -1313,7 +1384,10 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        harness: None,
         model: Some(selected_model.clone()),
+        session: None,
+        prompt: None,
     };
     let snapshot = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1372,8 +1446,274 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
                     tool_calls: 0,
                 },
             }],
+            harness_breakdown: vec![
+                KvasirOverviewHarnessSummary {
+                    harness: harness("unknown"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 0,
+                        cost_usd_nanos: 200_000_000,
+                        cost_source: Some(KvasirCostSource::Native),
+                        tool_calls: 0,
+                    },
+                    last_activity: KvasirTimestampMillis {
+                        value: 1_781_962_200_000,
+                    },
+                },
+                KvasirOverviewHarnessSummary {
+                    harness: harness("claude_code"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 3_300,
+                        cost_usd_nanos: 18_015_000,
+                        cost_source: Some(KvasirCostSource::Estimated),
+                        tool_calls: 0,
+                    },
+                    last_activity: KvasirTimestampMillis {
+                        value: 1_782_043_200_000,
+                    },
+                },
+            ],
+            session_breakdown: vec![],
+            session_breakdown_more_available: 0,
+            prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
             selected_repo: Some(kvasir_repo()),
+            selected_harness: None,
             selected_model: Some(selected_model),
+            selected_session: None,
+            selected_prompt: None,
+            dimensions: vec![],
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_scopes_overview_snapshot_by_selected_harness() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+    let http_client = reqwest::Client::new();
+
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(native_cost_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    http_client
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_tool_result_logs_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let selected_harness = harness("claude_code");
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: Some(kvasir_repo()),
+        harness: Some(selected_harness.clone()),
+        model: None,
+        session: None,
+        prompt: None,
+    };
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.overview_snapshot(query)
+    })
+    .await??;
+
+    // The native-cost fixture lands under the "unknown" harness, so scoping to
+    // claude_code must drop its 1_950_000_000 nanos and keep only the
+    // claude_code-attributed tokens, estimated cost, and tool calls. Before the
+    // fix these were all zeroed because token/cost rollups bailed out whenever a
+    // harness filter was present.
+    assert_eq!(
+        snapshot,
+        KvasirOverviewSnapshot {
+            totals: KvasirOverviewTotals {
+                total_tokens: 5_000,
+                cost_usd_nanos: 18_015_000,
+                cost_source: Some(KvasirCostSource::Estimated),
+                tool_calls: 3,
+            },
+            series: vec![
+                KvasirOverviewSeriesPoint {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 20,
+                    },
+                    total_tokens: 2_150,
+                    cost_usd_nanos: 0,
+                    cost_source: None,
+                    tool_calls: 3,
+                },
+                KvasirOverviewSeriesPoint {
+                    day: KvasirRollupDay {
+                        year: 2026,
+                        month: 6,
+                        day: 21,
+                    },
+                    total_tokens: 2_850,
+                    cost_usd_nanos: 18_015_000,
+                    cost_source: Some(KvasirCostSource::Estimated),
+                    tool_calls: 0,
+                },
+            ],
+            repo_breakdown: vec![KvasirOverviewRepoSummary {
+                repo: kvasir_repo(),
+                totals: KvasirOverviewTotals {
+                    total_tokens: 5_000,
+                    cost_usd_nanos: 18_015_000,
+                    cost_source: Some(KvasirCostSource::Estimated),
+                    tool_calls: 3,
+                },
+            }],
+            model_breakdown: vec![
+                KvasirOverviewModelSummary {
+                    model: model("claude-sonnet-4-20250514"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 3_300,
+                        cost_usd_nanos: 18_015_000,
+                        cost_source: Some(KvasirCostSource::Estimated),
+                        tool_calls: 0,
+                    },
+                },
+                KvasirOverviewModelSummary {
+                    model: model("claude-opus-4-20250514"),
+                    totals: KvasirOverviewTotals {
+                        total_tokens: 1_700,
+                        cost_usd_nanos: 0,
+                        cost_source: None,
+                        tool_calls: 0,
+                    },
+                },
+            ],
+            harness_breakdown: vec![KvasirOverviewHarnessSummary {
+                harness: harness("claude_code"),
+                totals: KvasirOverviewTotals {
+                    total_tokens: 5_000,
+                    cost_usd_nanos: 18_015_000,
+                    cost_source: Some(KvasirCostSource::Estimated),
+                    tool_calls: 3,
+                },
+                last_activity: KvasirTimestampMillis {
+                    value: 1_782_043_200_000,
+                },
+            }],
+            session_breakdown: vec![],
+            session_breakdown_more_available: 0,
+            prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
+            selected_repo: Some(kvasir_repo()),
+            selected_harness: Some(selected_harness),
+            selected_model: None,
+            selected_session: None,
+            selected_prompt: None,
+            dimensions: vec![],
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_deep_scoped_overview_snapshot_does_not_leak_aggregate_rollups() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+    let http_client = reqwest::Client::new();
+
+    http_client
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let selected_session = KvasirOverviewSessionRoute {
+        harness: harness("claude_code"),
+        session_id: session("session-12"),
+    };
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: Some(kvasir_repo()),
+        harness: None,
+        model: None,
+        session: Some(selected_session.clone()),
+        prompt: None,
+    };
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.overview_snapshot(query)
+    })
+    .await??;
+
+    assert_eq!(
+        snapshot,
+        KvasirOverviewSnapshot {
+            totals: KvasirOverviewTotals {
+                total_tokens: 0,
+                cost_usd_nanos: 0,
+                cost_source: None,
+                tool_calls: 0,
+            },
+            series: vec![],
+            repo_breakdown: vec![],
+            model_breakdown: vec![],
+            harness_breakdown: vec![],
+            session_breakdown: vec![],
+            session_breakdown_more_available: 0,
+            prompt_breakdown: vec![],
+            prompt_breakdown_more_available: 0,
+            selected_repo: Some(kvasir_repo()),
+            selected_harness: Some(harness("claude_code")),
+            selected_model: None,
+            selected_session: Some(selected_session),
+            selected_prompt: None,
+            dimensions: vec![],
         }
     );
 
@@ -1400,7 +1740,10 @@ async fn client_subscription_delivers_live_token_rollup_updates() -> anyhow::Res
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        harness: None,
         model: None,
+        session: None,
+        prompt: None,
     };
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
     let (first_update_sender, first_update_receiver) = tokio::sync::oneshot::channel();
@@ -1533,7 +1876,10 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        harness: None,
         model: None,
+        session: None,
+        prompt: None,
     };
     let rollups = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1614,7 +1960,10 @@ async fn client_queries_tool_call_rollups_through_daemon_socket() -> anyhow::Res
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: Some(kvasir_repo()),
+        harness: None,
         model: None,
+        session: None,
+        prompt: None,
     };
     let rollups = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
@@ -1709,7 +2058,10 @@ async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyho
         start: timestamp(2026, 6, 19),
         end: timestamp(2026, 6, 22),
         repo: None,
+        harness: None,
         model: None,
+        session: None,
+        prompt: None,
     };
     let error = tokio::task::spawn_blocking(move || {
         let client = KvasirClient::connect(socket_path(rpc_socket_path))?;

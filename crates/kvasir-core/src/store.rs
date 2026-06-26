@@ -12,19 +12,22 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::pricing::PriceTable;
 use crate::rpc::{
-    ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay, ContentReplayItem,
-    ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource, HarnessName, ModelName,
-    PromptId, RollupDay, RollupQuery, SessionId, SpanId, SpanName, TimestampMillis, TokenRollup,
+    AttributionStatus, ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay,
+    ContentReplayItem, ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource,
+    HarnessName, HarnessSummary, ModelName, PromptId, PromptRoute, PromptSummary,
+    PromptSummaryPage, RollupDay, RollupQuery, SessionId, SessionRoute, SessionSummary,
+    SessionSummaryPage, SpanId, SpanName, SummaryTotals, TimestampMillis, TokenRollup,
     ToolCallRollup, ToolCallRollupQuery, ToolName, Trace, TraceDurationMeasures, TraceId,
     TraceQuery, TraceSpan, TraceSpanKind,
 };
 use crate::usage::{
-    ContentKind, ContentRecord, ContentText, CostUsageRecord, RawBodyReferenceRecord, RepoBucket,
-    RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageKind, TokenUsageRecord,
-    TokenUsageSignal, ToolCallKind, ToolCallRecord, UsageRecords,
+    ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd, RawBodyReferenceRecord,
+    RepoBucket, RepoIdentity, RepoName, RepoPath, TokenCount, TokenMeasure, TokenUsageKind,
+    TokenUsageRecord, TokenUsageSignal, ToolCallKind, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
+const SUMMARY_PAGE_LIMIT: usize = 10;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
 const NO_REPO_STORAGE_VALUE: &str = "";
@@ -514,10 +517,18 @@ impl UsageStore {
     }
 
     pub fn token_rollups(&self, query: RollupQuery) -> Result<Vec<TokenRollup>, StoreError> {
+        // Session/prompt scope is intentionally dropped here: per-day/repo/model
+        // rollups would be misleading at that depth (see has_deep_scope). A harness
+        // filter, however, is just another WHERE predicate over canonical rows, so
+        // it must scope the data rather than zero it out.
+        if query.has_deep_scope() {
+            return Ok(Vec::new());
+        }
         let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let model_filter = query.model.as_ref().map(ModelName::as_str);
         let input_signal = TokenUsageSignal::authoritative_for(TokenMeasure::Input).storage_name();
         let output_signal =
@@ -546,6 +557,7 @@ impl UsageStore {
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
                 AND (?10 IS NULL OR model = ?10)
+                AND (?11 IS NULL OR harness = ?11)
                 AND (
                     (measure = 'input' AND token_signal IN (?6, ?9))
                     OR (measure = 'output' AND token_signal IN (?7, ?9))
@@ -566,6 +578,7 @@ impl UsageStore {
                 cache_signal,
                 opencode_trace_signal,
                 model_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -625,10 +638,16 @@ impl UsageStore {
     }
 
     pub fn cost_rollups(&self, query: CostRollupQuery) -> Result<Vec<CostRollup>, StoreError> {
+        // See token_rollups: deep (session/prompt) scope is dropped, but a harness
+        // filter must scope the canonical rows instead of zeroing the result.
+        if query.has_deep_scope() {
+            return Ok(Vec::new());
+        }
         let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let model_filter = query.model.as_ref().map(ModelName::as_str);
         let mut statement = self.connection.prepare(
             "SELECT
@@ -648,6 +667,7 @@ impl UsageStore {
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
                 AND (?7 IS NULL OR model = ?7)
+                AND (?8 IS NULL OR harness = ?8)
              GROUP BY day, repo_bucket, repo_name, repo_path, model
              ORDER BY day, repo_bucket, repo_name, repo_path, model",
         )?;
@@ -660,6 +680,7 @@ impl UsageStore {
                 repo_bucket_filter,
                 MIXED_COST_SOURCE,
                 model_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -690,6 +711,9 @@ impl UsageStore {
         &self,
         query: ToolCallRollupQuery,
     ) -> Result<Vec<ToolCallRollup>, StoreError> {
+        if query.has_deep_scope() {
+            return Ok(Vec::new());
+        }
         if query.model.is_some() {
             return Ok(Vec::new());
         }
@@ -707,6 +731,7 @@ impl UsageStore {
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let start_day = query.start.day().as_date().to_string();
         let end_day = query.end.day().as_date().to_string();
         let mut statement = self.connection.prepare(
@@ -723,6 +748,7 @@ impl UsageStore {
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
              ORDER BY day, repo_bucket, repo_name, repo_path, harness, tool_name",
         )?;
         let rows = statement.query_map(
@@ -732,6 +758,7 @@ impl UsageStore {
                 repo_name_filter,
                 repo_path_filter,
                 repo_bucket_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -767,6 +794,7 @@ impl UsageStore {
         let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
         let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let mut statement = self.connection.prepare(
             "SELECT
                 day,
@@ -781,6 +809,7 @@ impl UsageStore {
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
              GROUP BY day, repo_bucket, repo_name, repo_path, harness, tool_name
              ORDER BY day, repo_bucket, repo_name, repo_path, harness, tool_name",
         )?;
@@ -791,6 +820,7 @@ impl UsageStore {
                 repo_name_filter,
                 repo_path_filter,
                 repo_bucket_filter,
+                harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
@@ -816,6 +846,997 @@ impl UsageStore {
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn harness_summaries(&self, query: RollupQuery) -> Result<Vec<HarnessSummary>, StoreError> {
+        let mut summaries: HashMap<HarnessName, SummaryAccumulator> = HashMap::new();
+        self.add_harness_token_summaries(&query, &mut summaries)?;
+        self.add_harness_cost_summaries(&query, &mut summaries)?;
+        self.add_harness_tool_call_summaries(&query, &mut summaries)?;
+        self.add_unavailable_harness_summaries(&query, &mut summaries)?;
+
+        let mut summaries = summaries
+            .into_iter()
+            .map(|(harness, summary)| summary.into_harness_summary(harness))
+            .collect::<Vec<_>>();
+        summaries.sort_by(harness_summary_order);
+        let (summaries, _more_available) = capped_summary_page(summaries);
+        Ok(summaries)
+    }
+
+    fn add_harness_token_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.has_deep_scope() {
+            return self.add_trace_derived_harness_token_summaries(query, summaries);
+        }
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
+        let input_signal = TokenUsageSignal::authoritative_for(TokenMeasure::Input).storage_name();
+        let output_signal =
+            TokenUsageSignal::authoritative_for(TokenMeasure::Output).storage_name();
+        let cache_signal = TokenUsageSignal::authoritative_for(TokenMeasure::Cache).storage_name();
+        let opencode_trace_signal = TokenUsageSignal::OpenCodeTraces.storage_name();
+        let mut statement = self.connection.prepare(
+            "SELECT
+                harness,
+                MAX(occurred_at_ms) AS last_activity,
+                SUM(token_count) AS total_tokens
+             FROM canonical_token_usage
+             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
+                AND (?7 IS NULL OR model = ?7)
+                AND (
+                    (measure = 'input' AND token_signal IN (?8, ?11))
+                    OR (measure = 'output' AND token_signal IN (?9, ?11))
+                    OR (measure = 'cache' AND token_signal IN (?10, ?11))
+                )
+                AND (token_signal != ?11 OR superseded_metric_token_usage_id IS NULL)
+             GROUP BY harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                model_filter,
+                input_signal,
+                output_signal,
+                cache_signal,
+                opencode_trace_signal,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity, total_tokens) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_direct_tokens(total_tokens, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_trace_derived_harness_token_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                spans.harness,
+                MAX(tokens.occurred_at_ms) AS last_activity,
+                SUM(tokens.token_count) AS total_tokens,
+                COALESCE(SUM(costs.cost_usd_nanos), 0) AS cost_usd_nanos
+             FROM canonical_token_usage AS tokens
+             JOIN canonical_trace_spans AS spans
+                ON tokens.trace_id = spans.trace_id
+                AND tokens.span_id = spans.span_id
+             LEFT JOIN canonical_cost_usage AS costs
+                ON costs.estimated_token_usage_id = tokens.id
+             WHERE tokens.occurred_at_ms >= ?1
+                AND tokens.occurred_at_ms < ?2
+                AND tokens.token_signal = ?3
+                AND tokens.superseded_metric_token_usage_id IS NULL
+                AND (?4 IS NULL OR tokens.repo_name = ?4)
+                AND (?5 IS NULL OR tokens.repo_path = ?5)
+                AND (?6 IS NULL OR tokens.repo_bucket = ?6)
+                AND (?7 IS NULL OR spans.harness = ?7)
+                AND (?8 IS NULL OR tokens.model = ?8)
+                AND (?9 IS NULL OR spans.session_id = ?9)
+                AND (?10 IS NULL OR spans.prompt_id = ?10)
+             GROUP BY spans.harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                TokenUsageSignal::OpenCodeTraces.storage_name(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                model_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                    unsigned_token_column(row, 3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity, total_tokens, cost_usd_nanos) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tokens(total_tokens, cost_usd_nanos, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_harness_cost_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.has_deep_scope() {
+            return Ok(());
+        }
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                harness,
+                MAX(occurred_at_ms) AS last_activity,
+                SUM(cost_usd_nanos) AS cost_usd_nanos,
+                CASE
+                    WHEN MIN(cost_source) = MAX(cost_source) THEN MIN(cost_source)
+                    ELSE ?8
+                END AS cost_source
+             FROM canonical_cost_usage
+             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
+                AND (?7 IS NULL OR model = ?7)
+             GROUP BY harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                model_filter,
+                MIXED_COST_SOURCE,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                    cost_source_column(row, 3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity, cost_usd_nanos, cost_source) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_cost(cost_usd_nanos, cost_source, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_harness_tool_call_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.model.is_some() {
+            return Ok(());
+        }
+        if query.has_deep_scope() {
+            return self.add_trace_derived_harness_tool_call_summaries(query, summaries);
+        }
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                harness,
+                MAX(occurred_at_ms) AS last_activity,
+                SUM(call_count) AS tool_calls
+             FROM canonical_tool_calls
+             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
+             GROUP BY harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity, tool_calls) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tool_calls(tool_calls, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_trace_derived_harness_tool_call_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                spans.harness,
+                MAX(tool_calls.occurred_at_ms) AS last_activity,
+                SUM(tool_calls.call_count) AS tool_calls
+             FROM canonical_tool_calls AS tool_calls
+             JOIN canonical_trace_spans AS spans
+                ON tool_calls.trace_id = spans.trace_id
+                AND tool_calls.span_id = spans.span_id
+             WHERE tool_calls.occurred_at_ms >= ?1
+                AND tool_calls.occurred_at_ms < ?2
+                AND tool_calls.harness = ?3
+                AND (?4 IS NULL OR tool_calls.repo_name = ?4)
+                AND (?5 IS NULL OR tool_calls.repo_path = ?5)
+                AND (?6 IS NULL OR tool_calls.repo_bucket = ?6)
+                AND (?7 IS NULL OR spans.harness = ?7)
+                AND (?8 IS NULL OR spans.session_id = ?8)
+                AND (?9 IS NULL OR spans.prompt_id = ?9)
+             GROUP BY spans.harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                HarnessName::new("opencode").as_str(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity, tool_calls) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tool_calls(tool_calls, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_unavailable_harness_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.model.is_some() {
+            return Ok(());
+        }
+        self.add_trace_unavailable_harness_summaries(query, summaries)?;
+        self.add_content_unavailable_harness_summaries(query, summaries)
+    }
+
+    fn add_trace_unavailable_harness_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.repo.is_some() {
+            return Ok(());
+        }
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT harness, MAX(ended_at_ms)
+             FROM canonical_trace_spans
+             WHERE started_at_ms >= ?1
+                AND started_at_ms < ?2
+                AND (?3 IS NULL OR harness = ?3)
+                AND (?4 IS NULL OR session_id = ?4)
+                AND (?5 IS NULL OR prompt_id = ?5)
+             GROUP BY harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .observe_unavailable(last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_content_unavailable_harness_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<HarnessName, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT harness, MAX(occurred_at_ms)
+             FROM canonical_content_records
+             WHERE occurred_at_ms >= ?1
+                AND occurred_at_ms < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
+                AND (?7 IS NULL OR session_id = ?7)
+                AND (?8 IS NULL OR prompt_id = ?8)
+             GROUP BY harness",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    HarnessName::new(row.get::<_, String>(0)?),
+                    TimestampMillis::from_millis(row.get(1)?),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (harness, last_activity) = row?;
+            summaries
+                .entry(harness)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .observe_unavailable(last_activity);
+        }
+        Ok(())
+    }
+
+    pub fn session_summaries(&self, query: RollupQuery) -> Result<SessionSummaryPage, StoreError> {
+        let mut summaries: HashMap<SessionRoute, SummaryAccumulator> = HashMap::new();
+        self.add_attributed_session_summaries(&query, &mut summaries)?;
+        self.add_trace_unavailable_session_summaries(&query, &mut summaries)?;
+        self.add_content_unavailable_session_summaries(&query, &mut summaries)?;
+
+        let mut summaries = summaries
+            .into_iter()
+            .map(|(route, summary)| summary.into_session_summary(route))
+            .collect::<Vec<_>>();
+        summaries.sort_by(session_summary_order);
+        let (summaries, more_available) = capped_summary_page(summaries);
+        Ok(SessionSummaryPage {
+            summaries,
+            more_available,
+        })
+    }
+
+    pub fn prompt_summaries(&self, query: RollupQuery) -> Result<PromptSummaryPage, StoreError> {
+        let (Some(harness), Some(session_id)) = (query.harness.clone(), query.session_id.clone())
+        else {
+            return Ok(PromptSummaryPage {
+                summaries: Vec::new(),
+                more_available: 0,
+            });
+        };
+        let session = SessionRoute {
+            harness,
+            session_id,
+        };
+        let mut summaries: HashMap<PromptRoute, SummaryAccumulator> = HashMap::new();
+        self.add_attributed_prompt_summaries(&query, &session, &mut summaries)?;
+        self.add_trace_unavailable_prompt_summaries(&query, &session, &mut summaries)?;
+        self.add_content_unavailable_prompt_summaries(&query, &session, &mut summaries)?;
+
+        let mut summaries = summaries
+            .into_iter()
+            .map(|(route, summary)| summary.into_prompt_summary(route))
+            .collect::<Vec<_>>();
+        summaries.sort_by(prompt_summary_order);
+        let (summaries, more_available) = capped_summary_page(summaries);
+        Ok(PromptSummaryPage {
+            summaries,
+            more_available,
+        })
+    }
+
+    fn add_attributed_session_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<SessionRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                spans.harness,
+                spans.session_id,
+                MAX(tokens.occurred_at_ms) AS last_activity,
+                SUM(tokens.token_count) AS total_tokens,
+                COALESCE(SUM(costs.cost_usd_nanos), 0) AS cost_usd_nanos
+             FROM canonical_token_usage AS tokens
+             JOIN canonical_trace_spans AS spans
+                ON tokens.trace_id = spans.trace_id
+                AND tokens.span_id = spans.span_id
+             LEFT JOIN canonical_cost_usage AS costs
+                ON costs.estimated_token_usage_id = tokens.id
+             WHERE tokens.occurred_at_ms >= ?1
+                AND tokens.occurred_at_ms < ?2
+                AND tokens.token_signal = ?3
+                AND tokens.superseded_metric_token_usage_id IS NULL
+                AND (?4 IS NULL OR tokens.repo_name = ?4)
+                AND (?5 IS NULL OR tokens.repo_path = ?5)
+                AND (?6 IS NULL OR tokens.repo_bucket = ?6)
+                AND (?7 IS NULL OR tokens.model = ?7)
+                AND (?8 IS NULL OR spans.harness = ?8)
+                AND (?9 IS NULL OR spans.session_id = ?9)
+                AND (?10 IS NULL OR spans.prompt_id = ?10)
+             GROUP BY spans.harness, spans.session_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                TokenUsageSignal::OpenCodeTraces.storage_name(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                model_filter,
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    SessionRoute {
+                        harness: HarnessName::new(row.get::<_, String>(0)?),
+                        session_id: SessionId::new(row.get::<_, String>(1)?),
+                    },
+                    TimestampMillis::from_millis(row.get(2)?),
+                    unsigned_token_column(row, 3)?,
+                    unsigned_token_column(row, 4)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity, total_tokens, cost_usd_nanos) = row?;
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tokens(total_tokens, cost_usd_nanos, last_activity);
+        }
+        self.add_trace_derived_session_tool_calls(query, summaries)
+    }
+
+    fn add_attributed_prompt_summaries(
+        &self,
+        query: &RollupQuery,
+        session: &SessionRoute,
+        summaries: &mut HashMap<PromptRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let model_filter = query.model.as_ref().map(ModelName::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                spans.prompt_id,
+                MAX(tokens.occurred_at_ms) AS last_activity,
+                SUM(tokens.token_count) AS total_tokens,
+                COALESCE(SUM(costs.cost_usd_nanos), 0) AS cost_usd_nanos
+             FROM canonical_token_usage AS tokens
+             JOIN canonical_trace_spans AS spans
+                ON tokens.trace_id = spans.trace_id
+                AND tokens.span_id = spans.span_id
+             LEFT JOIN canonical_cost_usage AS costs
+                ON costs.estimated_token_usage_id = tokens.id
+             WHERE tokens.occurred_at_ms >= ?1
+                AND tokens.occurred_at_ms < ?2
+                AND tokens.token_signal = ?3
+                AND tokens.superseded_metric_token_usage_id IS NULL
+                AND spans.harness = ?4
+                AND spans.session_id = ?5
+                AND (?6 IS NULL OR tokens.repo_name = ?6)
+                AND (?7 IS NULL OR tokens.repo_path = ?7)
+                AND (?8 IS NULL OR tokens.repo_bucket = ?8)
+                AND (?9 IS NULL OR tokens.model = ?9)
+                AND (?10 IS NULL OR spans.prompt_id = ?10)
+             GROUP BY spans.prompt_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                TokenUsageSignal::OpenCodeTraces.storage_name(),
+                session.harness.as_str(),
+                session.session_id.as_str(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                model_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    PromptRoute {
+                        session: session.clone(),
+                        prompt_id: PromptId::new(row.get::<_, String>(0)?),
+                    },
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                    unsigned_token_column(row, 3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity, total_tokens, cost_usd_nanos) = row?;
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tokens(total_tokens, cost_usd_nanos, last_activity);
+        }
+        self.add_trace_derived_prompt_tool_calls(query, session, summaries)
+    }
+
+    fn add_trace_derived_session_tool_calls(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<SessionRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                spans.harness,
+                spans.session_id,
+                MAX(tool_calls.occurred_at_ms) AS last_activity,
+                SUM(tool_calls.call_count) AS tool_calls
+             FROM canonical_tool_calls AS tool_calls
+             JOIN canonical_trace_spans AS spans
+                ON tool_calls.trace_id = spans.trace_id
+                AND tool_calls.span_id = spans.span_id
+             WHERE tool_calls.occurred_at_ms >= ?1
+                AND tool_calls.occurred_at_ms < ?2
+                AND tool_calls.harness = ?3
+                AND (?4 IS NULL OR tool_calls.repo_name = ?4)
+                AND (?5 IS NULL OR tool_calls.repo_path = ?5)
+                AND (?6 IS NULL OR tool_calls.repo_bucket = ?6)
+                AND (?7 IS NULL OR spans.harness = ?7)
+                AND (?8 IS NULL OR spans.session_id = ?8)
+                AND (?9 IS NULL OR spans.prompt_id = ?9)
+             GROUP BY spans.harness, spans.session_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                HarnessName::new("opencode").as_str(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    SessionRoute {
+                        harness: HarnessName::new(row.get::<_, String>(0)?),
+                        session_id: SessionId::new(row.get::<_, String>(1)?),
+                    },
+                    TimestampMillis::from_millis(row.get(2)?),
+                    unsigned_token_column(row, 3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity, tool_calls) = row?;
+            if query.model.is_some() && !summaries.contains_key(&route) {
+                continue;
+            }
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tool_calls(tool_calls, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_trace_derived_prompt_tool_calls(
+        &self,
+        query: &RollupQuery,
+        session: &SessionRoute,
+        summaries: &mut HashMap<PromptRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                spans.prompt_id,
+                MAX(tool_calls.occurred_at_ms) AS last_activity,
+                SUM(tool_calls.call_count) AS tool_calls
+             FROM canonical_tool_calls AS tool_calls
+             JOIN canonical_trace_spans AS spans
+                ON tool_calls.trace_id = spans.trace_id
+                AND tool_calls.span_id = spans.span_id
+             WHERE tool_calls.occurred_at_ms >= ?1
+                AND tool_calls.occurred_at_ms < ?2
+                AND tool_calls.harness = ?3
+                AND spans.harness = ?4
+                AND spans.session_id = ?5
+                AND (?6 IS NULL OR tool_calls.repo_name = ?6)
+                AND (?7 IS NULL OR tool_calls.repo_path = ?7)
+                AND (?8 IS NULL OR tool_calls.repo_bucket = ?8)
+                AND (?9 IS NULL OR spans.prompt_id = ?9)
+             GROUP BY spans.prompt_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                HarnessName::new("opencode").as_str(),
+                session.harness.as_str(),
+                session.session_id.as_str(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    PromptRoute {
+                        session: session.clone(),
+                        prompt_id: PromptId::new(row.get::<_, String>(0)?),
+                    },
+                    TimestampMillis::from_millis(row.get(1)?),
+                    unsigned_token_column(row, 2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity, tool_calls) = row?;
+            if query.model.is_some() && !summaries.contains_key(&route) {
+                continue;
+            }
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .add_trace_derived_tool_calls(tool_calls, last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_trace_unavailable_session_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<SessionRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.repo.is_some() || query.model.is_some() {
+            return Ok(());
+        }
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT harness, session_id, MAX(ended_at_ms)
+             FROM canonical_trace_spans
+             WHERE started_at_ms >= ?1
+                AND started_at_ms < ?2
+                AND (?3 IS NULL OR harness = ?3)
+                AND (?4 IS NULL OR session_id = ?4)
+                AND (?5 IS NULL OR prompt_id = ?5)
+             GROUP BY harness, session_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    SessionRoute {
+                        harness: HarnessName::new(row.get::<_, String>(0)?),
+                        session_id: SessionId::new(row.get::<_, String>(1)?),
+                    },
+                    TimestampMillis::from_millis(row.get(2)?),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity) = row?;
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .observe_unavailable(last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_trace_unavailable_prompt_summaries(
+        &self,
+        query: &RollupQuery,
+        session: &SessionRoute,
+        summaries: &mut HashMap<PromptRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.repo.is_some() || query.model.is_some() {
+            return Ok(());
+        }
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT prompt_id, MAX(ended_at_ms)
+             FROM canonical_trace_spans
+             WHERE started_at_ms >= ?1
+                AND started_at_ms < ?2
+                AND harness = ?3
+                AND session_id = ?4
+                AND (?5 IS NULL OR prompt_id = ?5)
+             GROUP BY prompt_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                session.harness.as_str(),
+                session.session_id.as_str(),
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    PromptRoute {
+                        session: session.clone(),
+                        prompt_id: PromptId::new(row.get::<_, String>(0)?),
+                    },
+                    TimestampMillis::from_millis(row.get(1)?),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity) = row?;
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .observe_unavailable(last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_content_unavailable_session_summaries(
+        &self,
+        query: &RollupQuery,
+        summaries: &mut HashMap<SessionRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.model.is_some() {
+            return Ok(());
+        }
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
+        let session_filter = query.session_id.as_ref().map(SessionId::as_str);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT harness, session_id, MAX(occurred_at_ms)
+             FROM canonical_content_records
+             WHERE occurred_at_ms >= ?1
+                AND occurred_at_ms < ?2
+                AND (?3 IS NULL OR repo_name = ?3)
+                AND (?4 IS NULL OR repo_path = ?4)
+                AND (?5 IS NULL OR repo_bucket = ?5)
+                AND (?6 IS NULL OR harness = ?6)
+                AND (?7 IS NULL OR session_id = ?7)
+                AND (?8 IS NULL OR prompt_id = ?8)
+             GROUP BY harness, session_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                harness_filter,
+                session_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    SessionRoute {
+                        harness: HarnessName::new(row.get::<_, String>(0)?),
+                        session_id: SessionId::new(row.get::<_, String>(1)?),
+                    },
+                    TimestampMillis::from_millis(row.get(2)?),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity) = row?;
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .observe_unavailable(last_activity);
+        }
+        Ok(())
+    }
+
+    fn add_content_unavailable_prompt_summaries(
+        &self,
+        query: &RollupQuery,
+        session: &SessionRoute,
+        summaries: &mut HashMap<PromptRoute, SummaryAccumulator>,
+    ) -> Result<(), StoreError> {
+        if query.model.is_some() {
+            return Ok(());
+        }
+        let repo_filter = query.repo.as_ref().map(StoredRepo::from_bucket);
+        let repo_bucket_filter = repo_filter.as_ref().map(|repo| repo.bucket);
+        let repo_name_filter = repo_filter.as_ref().map(|repo| repo.name);
+        let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
+        let prompt_filter = query.prompt_id.as_ref().map(PromptId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT prompt_id, MAX(occurred_at_ms)
+             FROM canonical_content_records
+             WHERE occurred_at_ms >= ?1
+                AND occurred_at_ms < ?2
+                AND harness = ?3
+                AND session_id = ?4
+                AND (?5 IS NULL OR repo_name = ?5)
+                AND (?6 IS NULL OR repo_path = ?6)
+                AND (?7 IS NULL OR repo_bucket = ?7)
+                AND (?8 IS NULL OR prompt_id = ?8)
+             GROUP BY prompt_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.start.value(),
+                query.end.value(),
+                session.harness.as_str(),
+                session.session_id.as_str(),
+                repo_name_filter,
+                repo_path_filter,
+                repo_bucket_filter,
+                prompt_filter,
+            ],
+            |row| {
+                Ok((
+                    PromptRoute {
+                        session: session.clone(),
+                        prompt_id: PromptId::new(row.get::<_, String>(0)?),
+                    },
+                    TimestampMillis::from_millis(row.get(1)?),
+                ))
+            },
+        )?;
+        for row in rows {
+            let (route, last_activity) = row?;
+            summaries
+                .entry(route)
+                .or_insert_with(SummaryAccumulator::unavailable)
+                .observe_unavailable(last_activity);
+        }
+        Ok(())
     }
 
     pub fn traces(&self, query: TraceQuery) -> Result<Vec<Trace>, StoreError> {
@@ -1056,19 +2077,32 @@ impl UsageStore {
         if schema_version < 13 {
             migrate_v12_to_v13(&transaction)?;
         }
+        if schema_version < 14 {
+            migrate_v13_to_v14(&transaction)?;
+        }
+        if schema_version < 15 {
+            migrate_v14_to_v15(&transaction)?;
+        }
+        if schema_version < 16 {
+            migrate_v15_to_v16(&transaction)?;
+        }
 
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS canonical_token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT,
                 occurred_at_ms INTEGER NOT NULL,
                 day TEXT NOT NULL,
                 repo_bucket TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
                 token_signal TEXT NOT NULL DEFAULT 'metrics',
+                harness TEXT NOT NULL DEFAULT 'unknown',
                 model TEXT NOT NULL,
                 measure TEXT NOT NULL,
                 token_count INTEGER NOT NULL,
+                trace_id TEXT,
+                span_id TEXT,
                 superseded_metric_token_usage_id INTEGER
             );
 
@@ -1077,12 +2111,13 @@ impl UsageStore {
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
                 token_signal TEXT NOT NULL DEFAULT 'metrics',
+                harness TEXT NOT NULL DEFAULT 'unknown',
                 model TEXT NOT NULL,
                 measure TEXT NOT NULL,
                 counter_start_ms INTEGER NOT NULL,
                 last_occurred_at_ms INTEGER NOT NULL,
                 last_value INTEGER NOT NULL,
-                PRIMARY KEY(repo_bucket, repo_name, repo_path, token_signal, model, measure, counter_start_ms)
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, counter_start_ms)
             );
 
             CREATE TABLE IF NOT EXISTS token_delta_events (
@@ -1097,6 +2132,7 @@ impl UsageStore {
                 repo_bucket TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL DEFAULT 'unknown',
                 model TEXT NOT NULL,
                 cost_usd_nanos INTEGER NOT NULL,
                 cost_source INTEGER NOT NULL,
@@ -1109,11 +2145,12 @@ impl UsageStore {
                 repo_bucket TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
                 repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL DEFAULT 'unknown',
                 model TEXT NOT NULL,
                 counter_start_ms INTEGER NOT NULL,
                 last_occurred_at_ms INTEGER NOT NULL,
                 last_value INTEGER NOT NULL,
-                PRIMARY KEY(repo_bucket, repo_name, repo_path, model, counter_start_ms)
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, harness, model, counter_start_ms)
             );
 
             CREATE TABLE IF NOT EXISTS token_rollups (
@@ -1149,7 +2186,9 @@ impl UsageStore {
                 repo_path TEXT NOT NULL,
                 harness TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
-                call_count INTEGER NOT NULL
+                call_count INTEGER NOT NULL,
+                trace_id TEXT,
+                span_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS tool_call_rollups (
@@ -1291,20 +2330,33 @@ impl UsageStore {
             };
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
+            let event_key = match &record.kind {
+                TokenUsageKind::Delta { event_key } => Some(event_key.as_str()),
+                TokenUsageKind::Cumulative => None,
+            };
+            let trace_id = record
+                .trace_link
+                .as_ref()
+                .map(|link| link.trace_id.as_str());
+            let span_id = record.trace_link.as_ref().map(|link| link.span_id.as_str());
             transaction.execute(
                 "INSERT INTO canonical_token_usage (
-                    occurred_at_ms, day, repo_bucket, repo_name, repo_path, token_signal, model, measure, token_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, token_count, trace_id, span_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
+                    event_key,
                     record.occurred_at.value(),
                     day,
                     stored_repo.bucket,
                     stored_repo.name,
                     stored_repo.path,
                     record.signal.storage_name(),
+                    record.harness.as_str(),
                     record.model.as_str(),
                     record.measure.storage_name(),
                     delta,
+                    trace_id,
+                    span_id,
                 ],
             )?;
             let token_usage_id = transaction.last_insert_rowid();
@@ -1404,6 +2456,7 @@ impl UsageStore {
                     occurred_at: record.occurred_at,
                     counter_start: record.counter_start,
                     repo: record.repo.clone(),
+                    harness: record.harness.clone(),
                     model: record.model.clone(),
                     measure: record.measure,
                     token_count: TokenCount::new(u64::try_from(delta).expect("delta is positive")),
@@ -1429,16 +2482,17 @@ impl UsageStore {
                 AND metrics.repo_name = ?3
                 AND metrics.repo_path = ?4
                 AND metrics.token_signal = ?5
-                AND metrics.model = ?6
-                AND metrics.measure = ?7
-                AND metrics.token_count = ?8
+                AND (metrics.harness = ?6 OR metrics.harness = 'unknown')
+                AND metrics.model = ?7
+                AND metrics.measure = ?8
+                AND metrics.token_count = ?9
                 AND NOT EXISTS (
                     SELECT 1
                     FROM canonical_token_usage AS opencode
                     WHERE opencode.superseded_metric_token_usage_id = metrics.id
-                        AND opencode.id != ?9
+                        AND opencode.id != ?10
                 )
-             ORDER BY ABS(metrics.occurred_at_ms - ?10), metrics.id
+             ORDER BY ABS(metrics.occurred_at_ms - ?11), metrics.id
              LIMIT 1",
             params![
                 day,
@@ -1446,6 +2500,7 @@ impl UsageStore {
                 stored_repo.name,
                 stored_repo.path,
                 TokenUsageSignal::Metrics.storage_name(),
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.measure.storage_name(),
                 token_count,
@@ -1477,11 +2532,12 @@ impl UsageStore {
                 AND repo_name = ?3
                 AND repo_path = ?4
                 AND token_signal = ?5
-                AND model = ?6
-                AND measure = ?7
-                AND token_count = ?8
+                AND (?6 = 'unknown' OR harness = ?6)
+                AND model = ?7
+                AND measure = ?8
+                AND token_count = ?9
                 AND superseded_metric_token_usage_id IS NULL
-             ORDER BY ABS(occurred_at_ms - ?9), id
+             ORDER BY ABS(occurred_at_ms - ?10), id
              LIMIT 1",
             params![
                 day,
@@ -1489,6 +2545,7 @@ impl UsageStore {
                 stored_repo.name,
                 stored_repo.path,
                 TokenUsageSignal::OpenCodeTraces.storage_name(),
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.measure.storage_name(),
                 token_count,
@@ -1524,9 +2581,9 @@ impl UsageStore {
             let stored_repo = StoredRepo::from_bucket(&record.repo);
             transaction.execute(
                 "INSERT INTO canonical_cost_usage (
-                    occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, model,
+                    occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, harness, model,
                     cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)",
                 params![
                     record.occurred_at.value(),
                     record.counter_start.value(),
@@ -1534,6 +2591,7 @@ impl UsageStore {
                     stored_repo.bucket,
                     stored_repo.name,
                     stored_repo.path,
+                    record.harness.as_str(),
                     record.model.as_str(),
                     delta,
                     NATIVE_COST_SOURCE,
@@ -1569,10 +2627,15 @@ impl UsageStore {
             let Some(call_count) = Self::tool_call_delta(transaction, record, &stored_repo)? else {
                 continue;
             };
+            let trace_id = record
+                .trace_link
+                .as_ref()
+                .map(|link| link.trace_id.as_str());
+            let span_id = record.trace_link.as_ref().map(|link| link.span_id.as_str());
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO canonical_tool_calls (
-                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    event_key, occurred_at_ms, day, repo_bucket, repo_name, repo_path, harness, tool_name, call_count, trace_id, span_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -1583,6 +2646,8 @@ impl UsageStore {
                     record.harness.as_str(),
                     record.tool_name.as_str(),
                     call_count,
+                    trace_id,
+                    span_id,
                 ],
             )?;
             if inserted == 0 {
@@ -1783,10 +2848,11 @@ impl UsageStore {
              WHERE repo_bucket = ?1
                 AND repo_name = ?2
                 AND repo_path = ?3
-                AND model = ?4
-                AND (counter_start_ms = ?5 OR counter_start_ms IS NULL)
-                AND occurred_at_ms <= ?6
-                AND cost_source = ?7
+                AND (?4 = 'unknown' OR harness = ?4)
+                AND model = ?5
+                AND (counter_start_ms = ?6 OR counter_start_ms IS NULL)
+                AND occurred_at_ms <= ?7
+                AND cost_source = ?8
              GROUP BY day, repo_bucket, repo_name, repo_path, model",
         )?;
         let estimated_rollups = statement
@@ -1795,6 +2861,7 @@ impl UsageStore {
                     stored_repo.bucket,
                     stored_repo.name,
                     stored_repo.path,
+                    record.harness.as_str(),
                     record.model.as_str(),
                     record.counter_start.value(),
                     record.occurred_at.value(),
@@ -1839,14 +2906,16 @@ impl UsageStore {
              WHERE repo_bucket = ?1
                 AND repo_name = ?2
                 AND repo_path = ?3
-                AND model = ?4
-                AND (counter_start_ms = ?5 OR counter_start_ms IS NULL)
-                AND occurred_at_ms <= ?6
-                AND cost_source = ?7",
+                AND (?4 = 'unknown' OR harness = ?4)
+                AND model = ?5
+                AND (counter_start_ms = ?6 OR counter_start_ms IS NULL)
+                AND occurred_at_ms <= ?7
+                AND cost_source = ?8",
             params![
                 stored_repo.bucket,
                 stored_repo.name,
                 stored_repo.path,
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.counter_start.value(),
                 record.occurred_at.value(),
@@ -1877,10 +2946,10 @@ impl UsageStore {
             let stored_repo = StoredRepo::from_bucket(&delta.repo);
             transaction.execute(
                 "INSERT INTO canonical_cost_usage (
-                    occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, model,
+                    occurred_at_ms, counter_start_ms, day, repo_bucket, repo_name, repo_path, harness, model,
                     cost_usd_nanos, cost_source, estimated_token_count, estimated_token_price_nanos,
                     estimated_token_usage_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     delta.occurred_at.value(),
                     delta.counter_start.value(),
@@ -1888,6 +2957,7 @@ impl UsageStore {
                     stored_repo.bucket,
                     stored_repo.name,
                     stored_repo.path,
+                    delta.harness.as_str(),
                     delta.model.as_str(),
                     cost.storage_value(),
                     ESTIMATED_COST_SOURCE,
@@ -1988,14 +3058,16 @@ impl UsageStore {
                 AND repo_name = ?2
                 AND repo_path = ?3
                 AND token_signal = ?4
-                AND model = ?5
-                AND measure = ?6
-                AND counter_start_ms = ?7",
+                AND harness = ?5
+                AND model = ?6
+                AND measure = ?7
+                AND counter_start_ms = ?8",
             params![
                 stored_repo.bucket,
                 stored_repo.name,
                 stored_repo.path,
                 record.signal.storage_name(),
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.measure.storage_name(),
                 record.counter_start.value(),
@@ -2020,9 +3092,9 @@ impl UsageStore {
 
         transaction.execute(
             "INSERT INTO cumulative_counter_snapshots (
-                repo_bucket, repo_name, repo_path, token_signal, model, measure, counter_start_ms, last_occurred_at_ms, last_value
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(repo_bucket, repo_name, repo_path, token_signal, model, measure, counter_start_ms) DO UPDATE SET
+                repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, counter_start_ms, last_occurred_at_ms, last_value
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, counter_start_ms) DO UPDATE SET
                 last_occurred_at_ms = excluded.last_occurred_at_ms,
                 last_value = excluded.last_value",
             params![
@@ -2030,6 +3102,7 @@ impl UsageStore {
                 stored_repo.name,
                 stored_repo.path,
                 record.signal.storage_name(),
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.measure.storage_name(),
                 record.counter_start.value(),
@@ -2074,11 +3147,17 @@ impl UsageStore {
         let previous_value = transaction.query_row(
             "SELECT last_occurred_at_ms, last_value
              FROM cost_counter_snapshots
-             WHERE repo_bucket = ?1 AND repo_name = ?2 AND repo_path = ?3 AND model = ?4 AND counter_start_ms = ?5",
+             WHERE repo_bucket = ?1
+                AND repo_name = ?2
+                AND repo_path = ?3
+                AND (harness = ?4 OR harness = 'unknown')
+                AND model = ?5
+                AND counter_start_ms = ?6",
             params![
                 stored_repo.bucket,
                 stored_repo.name,
                 stored_repo.path,
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.counter_start.value(),
             ],
@@ -2102,15 +3181,16 @@ impl UsageStore {
 
         transaction.execute(
             "INSERT INTO cost_counter_snapshots (
-                repo_bucket, repo_name, repo_path, model, counter_start_ms, last_occurred_at_ms, last_value
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(repo_bucket, repo_name, repo_path, model, counter_start_ms) DO UPDATE SET
+                repo_bucket, repo_name, repo_path, harness, model, counter_start_ms, last_occurred_at_ms, last_value
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(repo_bucket, repo_name, repo_path, harness, model, counter_start_ms) DO UPDATE SET
                 last_occurred_at_ms = excluded.last_occurred_at_ms,
                 last_value = excluded.last_value",
             params![
                 stored_repo.bucket,
                 stored_repo.name,
                 stored_repo.path,
+                record.harness.as_str(),
                 record.model.as_str(),
                 record.counter_start.value(),
                 record.occurred_at.value(),
@@ -3125,6 +4205,183 @@ fn migrate_v12_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), Sto
     Ok(())
 }
 
+fn migrate_v13_to_v14(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_token_usage")?
+        && !table_column_exists(transaction, "canonical_token_usage", "event_key")?
+    {
+        transaction.execute(
+            "ALTER TABLE canonical_token_usage ADD COLUMN event_key TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_v14_to_v15(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_token_usage")?
+        && !table_column_exists(transaction, "canonical_token_usage", "harness")?
+    {
+        transaction.execute(
+            "ALTER TABLE canonical_token_usage
+             ADD COLUMN harness TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        )?;
+    }
+    if table_exists(transaction, "canonical_cost_usage")?
+        && !table_column_exists(transaction, "canonical_cost_usage", "harness")?
+    {
+        transaction.execute(
+            "ALTER TABLE canonical_cost_usage
+             ADD COLUMN harness TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        )?;
+    }
+    if table_exists(transaction, "cumulative_counter_snapshots")?
+        && !table_column_exists(transaction, "cumulative_counter_snapshots", "harness")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE cumulative_counter_snapshots RENAME TO cumulative_counter_snapshots_v14;
+            CREATE TABLE cumulative_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                token_signal TEXT NOT NULL DEFAULT 'metrics',
+                harness TEXT NOT NULL DEFAULT 'unknown',
+                model TEXT NOT NULL,
+                measure TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, token_signal, harness, model, measure, counter_start_ms)
+            );
+            INSERT INTO cumulative_counter_snapshots (
+                repo_bucket,
+                repo_name,
+                repo_path,
+                token_signal,
+                harness,
+                model,
+                measure,
+                counter_start_ms,
+                last_occurred_at_ms,
+                last_value
+            )
+            SELECT
+                repo_bucket,
+                repo_name,
+                repo_path,
+                token_signal,
+                'unknown',
+                model,
+                measure,
+                counter_start_ms,
+                last_occurred_at_ms,
+                last_value
+            FROM cumulative_counter_snapshots_v14;
+            DROP TABLE cumulative_counter_snapshots_v14;",
+        )?;
+    }
+    if table_exists(transaction, "cost_counter_snapshots")?
+        && !table_column_exists(transaction, "cost_counter_snapshots", "harness")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE cost_counter_snapshots RENAME TO cost_counter_snapshots_v14;
+            CREATE TABLE cost_counter_snapshots (
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL DEFAULT 'unknown',
+                model TEXT NOT NULL,
+                counter_start_ms INTEGER NOT NULL,
+                last_occurred_at_ms INTEGER NOT NULL,
+                last_value INTEGER NOT NULL,
+                PRIMARY KEY(repo_bucket, repo_name, repo_path, harness, model, counter_start_ms)
+            );
+            INSERT INTO cost_counter_snapshots (
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                model,
+                counter_start_ms,
+                last_occurred_at_ms,
+                last_value
+            )
+            SELECT
+                repo_bucket,
+                repo_name,
+                repo_path,
+                'unknown',
+                model,
+                counter_start_ms,
+                last_occurred_at_ms,
+                last_value
+            FROM cost_counter_snapshots_v14;
+            DROP TABLE cost_counter_snapshots_v14;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_v15_to_v16(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    // Promote the trace linkage that used to be reconstructed by scanning the
+    // serialized event_key at query time into typed columns. New rows are written
+    // with these columns directly; existing rows are parsed once here, at the
+    // migration boundary, and never re-parsed from the event key again.
+    for table in ["canonical_token_usage", "canonical_tool_calls"] {
+        if !table_exists(transaction, table)? {
+            continue;
+        }
+        if !table_column_exists(transaction, table, "trace_id")? {
+            transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN trace_id TEXT"), [])?;
+        }
+        if !table_column_exists(transaction, table, "span_id")? {
+            transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN span_id TEXT"), [])?;
+        }
+        backfill_trace_link_columns(transaction, table)?;
+    }
+    Ok(())
+}
+
+fn backfill_trace_link_columns(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT id, event_key FROM {table}
+             WHERE event_key IS NOT NULL AND trace_id IS NULL"
+        ))?;
+        let mapped = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    let update = format!("UPDATE {table} SET trace_id = ?1, span_id = ?2 WHERE id = ?3");
+    for (id, event_key) in rows {
+        if let Some(link) = parse_event_key_trace_link(&event_key) {
+            transaction.execute(&update, params![link.0, link.1, id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract `(trace_id, span_id)` from a serialized usage event key. Each is
+/// written as its own `key=value` line, so we match on line prefixes rather than
+/// substrings. Used only at the migration boundary to backfill the typed columns.
+fn parse_event_key_trace_link(event_key: &str) -> Option<(String, String)> {
+    let mut trace_id = None;
+    let mut span_id = None;
+    for line in event_key.lines() {
+        if let Some(value) = line.strip_prefix("trace_id=") {
+            trace_id = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("span_id=") {
+            span_id = Some(value.to_owned());
+        }
+    }
+    Some((trace_id?, span_id?))
+}
+
 fn cost_source_column_type(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<Option<String>, StoreError> {
@@ -3213,6 +4470,7 @@ struct TokenUsageDelta {
     occurred_at: TimestampMillis,
     counter_start: TimestampMillis,
     repo: RepoBucket,
+    harness: HarnessName,
     model: ModelName,
     measure: TokenMeasure,
     token_count: TokenCount,
@@ -3223,6 +4481,7 @@ struct NativeCostKey {
     repo_bucket: &'static str,
     repo_name: String,
     repo_path: String,
+    harness: String,
     model: String,
     counter_start_ms: i64,
 }
@@ -3255,6 +4514,231 @@ struct StoredTraceSpan {
     span: TraceSpan,
 }
 
+struct SummaryAccumulator {
+    total_tokens: u64,
+    cost_usd_nanos: u64,
+    cost_source: Option<CostSource>,
+    tool_calls: u64,
+    attribution_status: AttributionStatus,
+    last_activity: TimestampMillis,
+}
+
+impl SummaryAccumulator {
+    fn unavailable() -> Self {
+        Self {
+            total_tokens: 0,
+            cost_usd_nanos: 0,
+            cost_source: None,
+            tool_calls: 0,
+            attribution_status: AttributionStatus::Unavailable,
+            last_activity: TimestampMillis::from_millis(0),
+        }
+    }
+
+    fn add_trace_derived_tokens(
+        &mut self,
+        total_tokens: u64,
+        cost_usd_nanos: u64,
+        last_activity: TimestampMillis,
+    ) {
+        self.total_tokens = self.total_tokens.saturating_add(total_tokens);
+        self.cost_usd_nanos = self.cost_usd_nanos.saturating_add(cost_usd_nanos);
+        if cost_usd_nanos > 0 {
+            self.cost_source = Some(combined_summary_cost_source(
+                self.cost_source,
+                CostSource::Estimated,
+            ));
+        }
+        self.attribution_status =
+            merge_attribution_status(self.attribution_status, AttributionStatus::TraceDerived);
+        self.observe_unavailable(last_activity);
+    }
+
+    fn add_direct_tokens(&mut self, total_tokens: u64, last_activity: TimestampMillis) {
+        self.total_tokens = self.total_tokens.saturating_add(total_tokens);
+        self.attribution_status =
+            merge_attribution_status(self.attribution_status, AttributionStatus::Direct);
+        self.observe_unavailable(last_activity);
+    }
+
+    fn add_cost(
+        &mut self,
+        cost_usd_nanos: u64,
+        cost_source: CostSource,
+        last_activity: TimestampMillis,
+    ) {
+        self.cost_usd_nanos = self.cost_usd_nanos.saturating_add(cost_usd_nanos);
+        self.cost_source = Some(combined_summary_cost_source(self.cost_source, cost_source));
+        self.attribution_status =
+            merge_attribution_status(self.attribution_status, AttributionStatus::Direct);
+        self.observe_unavailable(last_activity);
+    }
+
+    fn add_trace_derived_tool_calls(&mut self, tool_calls: u64, last_activity: TimestampMillis) {
+        self.tool_calls = self.tool_calls.saturating_add(tool_calls);
+        self.attribution_status =
+            merge_attribution_status(self.attribution_status, AttributionStatus::TraceDerived);
+        self.observe_unavailable(last_activity);
+    }
+
+    fn observe_unavailable(&mut self, last_activity: TimestampMillis) {
+        if last_activity > self.last_activity {
+            self.last_activity = last_activity;
+        }
+    }
+
+    fn into_session_summary(self, route: SessionRoute) -> SessionSummary {
+        SessionSummary {
+            route,
+            totals: self.totals(),
+            attribution_status: self.attribution_status,
+            last_activity: self.last_activity,
+        }
+    }
+
+    fn into_prompt_summary(self, route: PromptRoute) -> PromptSummary {
+        PromptSummary {
+            route,
+            totals: self.totals(),
+            attribution_status: self.attribution_status,
+            last_activity: self.last_activity,
+        }
+    }
+
+    fn into_harness_summary(self, harness: HarnessName) -> HarnessSummary {
+        HarnessSummary {
+            harness,
+            totals: self.totals(),
+            last_activity: self.last_activity,
+        }
+    }
+
+    fn totals(&self) -> SummaryTotals {
+        SummaryTotals {
+            total_tokens: self.total_tokens,
+            cost_usd: CostUsd::from_nanos(self.cost_usd_nanos).unwrap_or_else(|| {
+                CostUsd::from_nanos(u64::MAX).expect("u64::MAX fits cost storage")
+            }),
+            cost_source: self.cost_source,
+            tool_calls: self.tool_calls,
+        }
+    }
+}
+
+fn merge_attribution_status(
+    current: AttributionStatus,
+    incoming: AttributionStatus,
+) -> AttributionStatus {
+    match (current, incoming) {
+        (AttributionStatus::Unavailable, status) => status,
+        (status, AttributionStatus::Unavailable) => status,
+        (left, right) if left == right => left,
+        _ => AttributionStatus::Partial,
+    }
+}
+
+fn combined_summary_cost_source(current: Option<CostSource>, incoming: CostSource) -> CostSource {
+    match current {
+        None => incoming,
+        Some(existing) if existing == incoming => existing,
+        Some(_) => CostSource::Mixed,
+    }
+}
+
+fn capped_summary_page<T>(mut summaries: Vec<T>) -> (Vec<T>, u64) {
+    let more_available = summaries.len().saturating_sub(SUMMARY_PAGE_LIMIT) as u64;
+    summaries.truncate(SUMMARY_PAGE_LIMIT);
+    (summaries, more_available)
+}
+
+fn session_summary_order(left: &SessionSummary, right: &SessionSummary) -> std::cmp::Ordering {
+    summary_order(
+        SummaryOrderKey {
+            cost_usd_nanos: left.totals.cost_usd.as_nanos(),
+            total_tokens: left.totals.total_tokens,
+            last_activity: left.last_activity,
+            route_key: route_key(&left.route.harness, &left.route.session_id, None),
+        },
+        SummaryOrderKey {
+            cost_usd_nanos: right.totals.cost_usd.as_nanos(),
+            total_tokens: right.totals.total_tokens,
+            last_activity: right.last_activity,
+            route_key: route_key(&right.route.harness, &right.route.session_id, None),
+        },
+    )
+}
+
+fn prompt_summary_order(left: &PromptSummary, right: &PromptSummary) -> std::cmp::Ordering {
+    summary_order(
+        SummaryOrderKey {
+            cost_usd_nanos: left.totals.cost_usd.as_nanos(),
+            total_tokens: left.totals.total_tokens,
+            last_activity: left.last_activity,
+            route_key: route_key(
+                &left.route.session.harness,
+                &left.route.session.session_id,
+                Some(&left.route.prompt_id),
+            ),
+        },
+        SummaryOrderKey {
+            cost_usd_nanos: right.totals.cost_usd.as_nanos(),
+            total_tokens: right.totals.total_tokens,
+            last_activity: right.last_activity,
+            route_key: route_key(
+                &right.route.session.harness,
+                &right.route.session.session_id,
+                Some(&right.route.prompt_id),
+            ),
+        },
+    )
+}
+
+fn harness_summary_order(left: &HarnessSummary, right: &HarnessSummary) -> std::cmp::Ordering {
+    summary_order(
+        SummaryOrderKey {
+            cost_usd_nanos: left.totals.cost_usd.as_nanos(),
+            total_tokens: left.totals.total_tokens,
+            last_activity: left.last_activity,
+            route_key: left.harness.as_str().to_owned(),
+        },
+        SummaryOrderKey {
+            cost_usd_nanos: right.totals.cost_usd.as_nanos(),
+            total_tokens: right.totals.total_tokens,
+            last_activity: right.last_activity,
+            route_key: right.harness.as_str().to_owned(),
+        },
+    )
+}
+
+struct SummaryOrderKey {
+    cost_usd_nanos: u64,
+    total_tokens: u64,
+    last_activity: TimestampMillis,
+    route_key: String,
+}
+
+fn summary_order(left: SummaryOrderKey, right: SummaryOrderKey) -> std::cmp::Ordering {
+    right
+        .cost_usd_nanos
+        .cmp(&left.cost_usd_nanos)
+        .then_with(|| right.total_tokens.cmp(&left.total_tokens))
+        .then_with(|| right.last_activity.cmp(&left.last_activity))
+        .then_with(|| left.route_key.cmp(&right.route_key))
+}
+
+fn route_key(
+    harness: &HarnessName,
+    session_id: &SessionId,
+    prompt_id: Option<&PromptId>,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        harness.as_str(),
+        session_id.as_str(),
+        prompt_id.map(PromptId::as_str).unwrap_or("")
+    )
+}
+
 impl NativeCostCoverage {
     fn load(
         transaction: &rusqlite::Transaction<'_>,
@@ -3271,9 +4755,10 @@ impl NativeCostCoverage {
              WHERE repo_bucket = ?1
                 AND repo_name = ?2
                 AND repo_path = ?3
-                AND model = ?4
-                AND (counter_start_ms = ?5 OR counter_start_ms IS NULL)
-                AND cost_source = ?6",
+                AND harness = ?4
+                AND model = ?5
+                AND (counter_start_ms = ?6 OR counter_start_ms IS NULL)
+                AND cost_source = ?7",
         )?;
         let mut latest_occurred_at_by_key = HashMap::new();
         for key in keys {
@@ -3282,6 +4767,7 @@ impl NativeCostCoverage {
                     key.repo_bucket,
                     key.repo_name.as_str(),
                     key.repo_path.as_str(),
+                    key.harness.as_str(),
                     key.model.as_str(),
                     key.counter_start_ms,
                     NATIVE_COST_SOURCE,
@@ -3315,6 +4801,7 @@ impl NativeCostKey {
             repo_bucket: stored_repo.bucket,
             repo_name: stored_repo.name.to_owned(),
             repo_path: stored_repo.path.to_owned(),
+            harness: delta.harness.as_str().to_owned(),
             model: delta.model.as_str().to_owned(),
             counter_start_ms: delta.counter_start.value(),
         }
@@ -4549,6 +6036,293 @@ mod tests {
         assert_eq!(replay.items.len(), 1);
         assert_eq!(replay.items[0].harness, HarnessName::new("opencode"));
         assert_eq!(replay.items[0].content.as_str(), "opencode text");
+
+        Ok(())
+    }
+
+    #[test]
+    fn session_and_prompt_summaries_rank_opencode_trace_attributed_totals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![
+                opencode_trace_token_record(
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_800_000,
+                    "trace-a",
+                    "span-a",
+                    100,
+                ),
+                opencode_trace_token_record(
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Output,
+                    1_781_956_801_000,
+                    "trace-a",
+                    "span-a",
+                    50,
+                ),
+                opencode_trace_token_record(
+                    repo.clone(),
+                    "gpt-4.1",
+                    TokenMeasure::Input,
+                    1_781_956_900_000,
+                    "trace-b",
+                    "span-b",
+                    400,
+                ),
+            ],
+            cost_usage: Vec::new(),
+            tool_calls: vec![opencode_trace_tool_call_record(
+                repo.clone(),
+                "trace-b",
+                "tool-b",
+                1_781_956_902_000,
+            )],
+            trace_spans: vec![
+                trace_span_record(
+                    "opencode",
+                    "session-a",
+                    "prompt-a",
+                    "trace-a",
+                    "span-a",
+                    1_781_956_790_000..1_781_956_801_000,
+                    TraceSpanKind::LlmRequest,
+                ),
+                trace_span_record(
+                    "opencode",
+                    "session-b",
+                    "prompt-b",
+                    "trace-b",
+                    "span-b",
+                    1_781_956_890_000..1_781_956_902_000,
+                    TraceSpanKind::LlmRequest,
+                ),
+                trace_span_record(
+                    "opencode",
+                    "session-b",
+                    "prompt-b",
+                    "trace-b",
+                    "tool-b",
+                    1_781_956_901_000..1_781_956_902_000,
+                    TraceSpanKind::ToolCall,
+                ),
+            ],
+            content: Vec::new(),
+            raw_body_references: Vec::new(),
+        })?;
+
+        let query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        )
+        .with_repo(repo)
+        .with_model(ModelName::new("gpt-4.1"));
+        let session_page = store.session_summaries(query.clone())?;
+        let sessions = session_page.summaries;
+
+        assert_eq!(session_page.more_available, 0);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].route.harness, HarnessName::new("opencode"));
+        assert_eq!(sessions[0].route.session_id, SessionId::new("session-b"));
+        assert_eq!(sessions[0].totals.total_tokens, 400);
+        assert_eq!(
+            sessions[0].totals.cost_usd,
+            CostUsd::from_nanos(800_000).unwrap()
+        );
+        assert_eq!(sessions[0].totals.tool_calls, 1);
+        assert_eq!(
+            sessions[0].attribution_status,
+            AttributionStatus::TraceDerived
+        );
+        assert_eq!(sessions[1].route.session_id, SessionId::new("session-a"));
+        assert_eq!(sessions[1].totals.total_tokens, 150);
+        assert_eq!(
+            sessions[1].attribution_status,
+            AttributionStatus::TraceDerived
+        );
+
+        let prompt_page = store.prompt_summaries(query.with_session_route(SessionRoute {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-b"),
+        }))?;
+        let prompts = prompt_page.summaries;
+
+        assert_eq!(prompt_page.more_available, 0);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].route.session.harness,
+            HarnessName::new("opencode")
+        );
+        assert_eq!(
+            prompts[0].route.session.session_id,
+            SessionId::new("session-b")
+        );
+        assert_eq!(prompts[0].route.prompt_id, PromptId::new("prompt-b"));
+        assert_eq!(prompts[0].totals.total_tokens, 400);
+        assert_eq!(
+            prompts[0].attribution_status,
+            AttributionStatus::TraceDerived
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn session_summaries_include_unavailable_trace_content_rows_only_when_scope_is_proven()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: vec![trace_span_record(
+                "opencode",
+                "session-trace",
+                "prompt-trace",
+                "trace-only",
+                "span-only",
+                1_781_956_800_000..1_781_956_801_000,
+                TraceSpanKind::Interaction,
+            )],
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("content:session-content:prompt-content"),
+                occurred_at: TimestampMillis::new_for_test(1_781_956_802_000),
+                session_id: SessionId::new("session-content"),
+                prompt_id: PromptId::new("prompt-content"),
+                repo: repo.clone(),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("stored").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+
+        let base_query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        );
+        let session_page = store.session_summaries(base_query.clone())?;
+        let sessions = session_page.summaries;
+
+        assert_eq!(session_page.more_available, 0);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|summary| summary.route.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-content", "session-trace"]
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|summary| summary.attribution_status == AttributionStatus::Unavailable)
+        );
+
+        let repo_session_page = store.session_summaries(base_query.clone().with_repo(repo))?;
+        let repo_sessions = repo_session_page.summaries;
+        assert_eq!(repo_session_page.more_available, 0);
+        assert_eq!(repo_sessions.len(), 1);
+        assert_eq!(
+            repo_sessions[0].route.session_id,
+            SessionId::new("session-content")
+        );
+        assert_eq!(
+            repo_sessions[0].attribution_status,
+            AttributionStatus::Unavailable
+        );
+
+        let scoped_session_page = store.session_summaries(
+            base_query
+                .clone()
+                .with_harness(HarnessName::new("opencode"))
+                .with_session(SessionId::new("session-content")),
+        )?;
+        assert_eq!(
+            scoped_session_page
+                .summaries
+                .iter()
+                .map(|summary| summary.route.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-content"]
+        );
+
+        let scoped_prompt_page = store.prompt_summaries(
+            base_query
+                .clone()
+                .with_session_route(SessionRoute {
+                    harness: HarnessName::new("opencode"),
+                    session_id: SessionId::new("session-content"),
+                })
+                .with_prompt(PromptId::new("prompt-content")),
+        )?;
+        assert_eq!(
+            scoped_prompt_page
+                .summaries
+                .iter()
+                .map(|summary| summary.route.prompt_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prompt-content"]
+        );
+
+        let model_session_page =
+            store.session_summaries(base_query.with_model(ModelName::new("gpt-4.1")))?;
+        assert!(model_session_page.summaries.is_empty());
+        assert_eq!(model_session_page.more_available, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn session_summaries_are_capped_with_more_available_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let content = (0..12)
+            .map(|index| ContentRecord {
+                event_key: ContentEventKey::new(format!("content:session-{index}:prompt-{index}")),
+                occurred_at: TimestampMillis::new_for_test(1_781_956_800_000 + index),
+                session_id: SessionId::new(format!("session-{index:02}")),
+                prompt_id: PromptId::new(format!("prompt-{index:02}")),
+                repo: RepoBucket::no_repo(),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new(format!("stored {index}")).unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content,
+            raw_body_references: Vec::new(),
+        })?;
+
+        let page = store.session_summaries(RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        ))?;
+
+        assert_eq!(page.summaries.len(), 10);
+        assert_eq!(page.more_available, 2);
+        assert_eq!(
+            page.summaries[0].route.session_id,
+            SessionId::new("session-11")
+        );
+        assert_eq!(
+            page.summaries[9].route.session_id,
+            SessionId::new("session-02")
+        );
 
         Ok(())
     }
@@ -7697,6 +9471,169 @@ occurred_at_nanos=1781956803000000000
             measure,
             TokenCount::new(token_count),
         )
+    }
+
+    #[test]
+    fn parse_event_key_trace_link_reads_typed_ids_from_serialized_key() {
+        let event_key = trace_token_key(
+            kvasir_repo("/repos/kvasir"),
+            "gpt-4.1",
+            TokenMeasure::Input,
+            "trace-xyz",
+            "span-xyz",
+            100,
+        );
+        assert_eq!(
+            parse_event_key_trace_link(&event_key),
+            Some(("trace-xyz".to_owned(), "span-xyz".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_event_key_trace_link_is_none_when_trace_fields_absent() {
+        assert_eq!(
+            parse_event_key_trace_link("otlp-metric-token-usage\nmodel=gpt-4.1\nmeasure=input\n"),
+            None
+        );
+    }
+
+    fn opencode_trace_token_record(
+        repo: RepoBucket,
+        model: &str,
+        measure: TokenMeasure,
+        occurred_at_ms: i64,
+        trace_id: &str,
+        span_id: &str,
+        token_count: u64,
+    ) -> TokenUsageRecord {
+        let mut record = TokenUsageRecord::new_delta_from_signal(
+            TokenUsageSignal::OpenCodeTraces,
+            TokenUsageEventKey::new(trace_token_key(
+                repo.clone(),
+                model,
+                measure,
+                trace_id,
+                span_id,
+                token_count,
+            )),
+            TimestampMillis::new_for_test(occurred_at_ms),
+            repo,
+            ModelName::new(model),
+            measure,
+            TokenCount::new(token_count),
+        );
+        record.counter_start = TimestampMillis::new_for_test(occurred_at_ms - 1_000);
+        record.trace_link = Some(crate::usage::TraceLink::new(
+            TraceId::new(trace_id),
+            SpanId::new(span_id),
+        ));
+        record
+    }
+
+    fn opencode_trace_tool_call_record(
+        repo: RepoBucket,
+        trace_id: &str,
+        span_id: &str,
+        occurred_at_ms: i64,
+    ) -> ToolCallRecord {
+        ToolCallRecord::new(
+            ToolCallEventKey::new(trace_tool_key(repo.clone(), trace_id, span_id, "Read")),
+            TimestampMillis::new_for_test(occurred_at_ms),
+            repo,
+            HarnessName::new("opencode"),
+            ToolName::new("Read"),
+        )
+        .with_trace_link(crate::usage::TraceLink::new(
+            TraceId::new(trace_id),
+            SpanId::new(span_id),
+        ))
+    }
+
+    fn trace_span_record(
+        harness: &str,
+        session_id: &str,
+        prompt_id: &str,
+        trace_id: &str,
+        span_id: &str,
+        span_ms: std::ops::Range<i64>,
+        kind: TraceSpanKind,
+    ) -> crate::usage::TraceSpanRecord {
+        crate::usage::TraceSpanRecord {
+            harness: HarnessName::new(harness),
+            session_id: SessionId::new(session_id),
+            prompt_id: PromptId::new(prompt_id),
+            trace_id: TraceId::new(trace_id),
+            span_id: SpanId::new(span_id),
+            parent_span_id: None,
+            kind,
+            name: SpanName::new("span"),
+            started_at: TimestampMillis::new_for_test(span_ms.start),
+            ended_at: TimestampMillis::new_for_test(span_ms.end),
+            duration_ms: u64::try_from(span_ms.end - span_ms.start).unwrap(),
+            tool_name: if kind == TraceSpanKind::ToolCall {
+                Some(ToolName::new("Read"))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn trace_token_key(
+        repo: RepoBucket,
+        model: &str,
+        measure: TokenMeasure,
+        trace_id: &str,
+        span_id: &str,
+        token_count: u64,
+    ) -> String {
+        let mut key = String::from("otlp-trace-token-usage\n");
+        append_test_repo_key(&mut key, repo);
+        key.push_str("model=");
+        key.push_str(model);
+        key.push('\n');
+        key.push_str("measure=");
+        key.push_str(measure.storage_name());
+        key.push('\n');
+        key.push_str("trace_id=");
+        key.push_str(trace_id);
+        key.push('\n');
+        key.push_str("span_id=");
+        key.push_str(span_id);
+        key.push('\n');
+        key.push_str("token_count=");
+        key.push_str(&token_count.to_string());
+        key.push('\n');
+        key
+    }
+
+    fn trace_tool_key(repo: RepoBucket, trace_id: &str, span_id: &str, tool_name: &str) -> String {
+        let mut key = String::from("otlp-trace-tool-call\n");
+        append_test_repo_key(&mut key, repo);
+        key.push_str("trace_id=");
+        key.push_str(trace_id);
+        key.push('\n');
+        key.push_str("span_id=");
+        key.push_str(span_id);
+        key.push('\n');
+        key.push_str("tool_name=");
+        key.push_str(tool_name);
+        key.push('\n');
+        key
+    }
+
+    fn append_test_repo_key(key: &mut String, repo: RepoBucket) {
+        match repo {
+            RepoBucket::NoRepo => key.push_str("repo_bucket=no_repo\n"),
+            RepoBucket::Repo(identity) => {
+                key.push_str("repo_bucket=repo\n");
+                key.push_str("repo_name=");
+                key.push_str(identity.name.as_ref().map(RepoName::as_str).unwrap_or(""));
+                key.push('\n');
+                key.push_str("repo_path=");
+                key.push_str(identity.path.as_ref().map(RepoPath::as_str).unwrap_or(""));
+                key.push('\n');
+            }
+        }
     }
 
     fn codex_delta_record(

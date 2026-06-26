@@ -195,6 +195,87 @@ func overviewSnapshotBuildsCostDashboardPresentationForEveryCostSurface() {
 }
 
 @Test
+func overviewSnapshotBuildsFilterBarPresentationFromSelectedScope() {
+    let repo = OverviewRepoBucket.repo(
+        OverviewRepoIdentity(
+            name: OverviewRepoName("kvasir"),
+            path: OverviewRepoPath("/repos/kvasir")
+        )!
+    )
+    let model = OverviewModelName("claude-sonnet-4")
+    let snapshot = OverviewSnapshot(
+        totals: .init(totalTokens: 3_000, costUsdNanos: 7_000, toolCalls: 2),
+        series: [],
+        repoBreakdown: [],
+        modelBreakdown: [],
+        selectedRepo: repo,
+        selectedModel: model
+    )
+
+    #expect(snapshot.filterBarPresentation == OverviewFilterBarPresentation(
+        repo: "kvasir",
+        model: "claude-sonnet-4",
+        harness: nil,
+        session: nil,
+        prompt: nil,
+        dimensions: []
+    ))
+}
+
+@Test
+func overviewSnapshotIncludesHarnessSessionAndPromptInFilterBarPresentation() {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("claude_code"),
+        sessionID: OverviewSessionID("session-12")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("prompt-7")
+    )
+    let snapshot = OverviewSnapshot(
+        totals: .init(totalTokens: 1, costUsdNanos: 2, toolCalls: 3),
+        series: [],
+        repoBreakdown: [],
+        modelBreakdown: [],
+        selectedRepo: nil,
+        selectedSession: session,
+        selectedPrompt: prompt
+    )
+
+    #expect(snapshot.filterBarPresentation.harness == "claude_code")
+    #expect(snapshot.filterBarPresentation.session == "session-12")
+    #expect(snapshot.filterBarPresentation.prompt == "prompt-7")
+}
+
+@Test
+func overviewSnapshotShowsExtendedDimensionsOnlyWhenPresent() {
+    let emptySnapshot = OverviewSnapshot(
+        totals: .init(totalTokens: 1, costUsdNanos: 2, toolCalls: 3),
+        series: [],
+        repoBreakdown: [],
+        modelBreakdown: [],
+        selectedRepo: nil
+    )
+    let snapshotWithDimensions = OverviewSnapshot(
+        totals: .init(totalTokens: 1, costUsdNanos: 2, toolCalls: 3),
+        series: [],
+        repoBreakdown: [],
+        modelBreakdown: [],
+        selectedRepo: nil,
+        dimensions: [
+            .init(kind: .skill, value: OverviewDimensionValue("tdd")),
+            .init(kind: .mcpTool, value: OverviewDimensionValue("github.issue.view"))
+        ]
+    )
+
+    #expect(emptySnapshot.filterBarPresentation.dimensions.isEmpty)
+    #expect(snapshotWithDimensions.filterBarPresentation.dimensions == [
+        .init(title: "Skill", value: "tdd"),
+        .init(title: "MCP tool", value: "github.issue.view")
+    ])
+}
+
+@Test
 func overviewRepoIdentityRejectsEmptyIdentity() {
     #expect(OverviewRepoIdentity(name: nil, path: nil) == nil)
     #expect(OverviewRepoIdentity(name: OverviewRepoName("kvasir"), path: nil) != nil)

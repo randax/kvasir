@@ -4,7 +4,9 @@ use kvasir_core::rpc::{
     ContentKindAvailability as CoreContentKindAvailability, ContentQuery,
     ContentReplay as CoreContentReplay, ContentReplayItem as CoreContentReplayItem,
     ContentUnavailableReason as CoreContentUnavailableReason, CostRollup as CoreCostRollup,
-    CostRollupQuery, OverviewRollup as CoreOverviewRollup, RollupQuery, RpcError, TimestampMillis,
+    CostRollupQuery, HarnessSummary as CoreHarnessSummary, OverviewRollup as CoreOverviewRollup,
+    PromptSummary as CorePromptSummary, RollupQuery, RpcError,
+    SessionSummary as CoreSessionSummary, SummaryTotals as CoreSummaryTotals, TimestampMillis,
     TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
     Trace as CoreTrace, TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery,
     TraceSpan as CoreTraceSpan, TraceSpanKind as CoreTraceSpanKind,
@@ -13,13 +15,15 @@ use kvasir_core::{ContentKind as CoreContentKind, RepoBucket, RepoIdentity};
 
 use crate::error::KvasirClientError;
 use crate::types::{
-    KvasirContentAvailability, KvasirContentKind, KvasirContentKindAvailability,
-    KvasirContentQuery, KvasirContentReplay, KvasirContentReplayItem,
-    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource, KvasirCostUsd,
-    KvasirOverviewRollup, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath,
-    KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures, KvasirTraceQuery,
-    KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirAttributionStatus, KvasirContentAvailability, KvasirContentKind,
+    KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
+    KvasirContentReplayItem, KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource,
+    KvasirCostUsd, KvasirOverviewHarnessSummary, KvasirOverviewPromptRoute,
+    KvasirOverviewPromptSummary, KvasirOverviewRollup, KvasirOverviewSessionRoute,
+    KvasirOverviewSessionSummary, KvasirOverviewTotals, KvasirRepoBucket, KvasirRepoBucketKind,
+    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis,
+    KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures,
+    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -35,6 +39,19 @@ impl TryFrom<KvasirRollupQuery> for RollupQuery {
         }
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
+        }
+        if let Some(harness) = query.harness {
+            core_query = core_query.with_harness(harness.into_core());
+        }
+        if let Some(prompt) = query.prompt {
+            core_query = core_query
+                .with_harness(prompt.session.harness.into_core())
+                .with_session(prompt.session.session_id.into_core())
+                .with_prompt(prompt.prompt_id.into_core());
+        } else if let Some(session) = query.session {
+            core_query = core_query
+                .with_harness(session.harness.into_core())
+                .with_session(session.session_id.into_core());
         }
         Ok(core_query)
     }
@@ -54,6 +71,19 @@ impl TryFrom<KvasirRollupQuery> for CostRollupQuery {
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
         }
+        if let Some(harness) = query.harness {
+            core_query = core_query.with_harness(harness.into_core());
+        }
+        if let Some(prompt) = query.prompt {
+            core_query = core_query
+                .with_harness(prompt.session.harness.into_core())
+                .with_session(prompt.session.session_id.into_core())
+                .with_prompt(prompt.prompt_id.into_core());
+        } else if let Some(session) = query.session {
+            core_query = core_query
+                .with_harness(session.harness.into_core())
+                .with_session(session.session_id.into_core());
+        }
         Ok(core_query)
     }
 }
@@ -71,6 +101,19 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
         }
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
+        }
+        if let Some(harness) = query.harness {
+            core_query = core_query.with_harness(harness.into_core());
+        }
+        if let Some(prompt) = query.prompt {
+            core_query = core_query
+                .with_harness(prompt.session.harness.into_core())
+                .with_session(prompt.session.session_id.into_core())
+                .with_prompt(prompt.prompt_id.into_core());
+        } else if let Some(session) = query.session {
+            core_query = core_query
+                .with_harness(session.harness.into_core())
+                .with_session(session.session_id.into_core());
         }
         Ok(core_query)
     }
@@ -171,6 +214,84 @@ impl TryFrom<CoreToolCallRollup> for KvasirToolCallRollup {
     }
 }
 
+impl From<kvasir_core::rpc::AttributionStatus> for KvasirAttributionStatus {
+    fn from(status: kvasir_core::rpc::AttributionStatus) -> Self {
+        match status {
+            kvasir_core::rpc::AttributionStatus::Direct => Self::Direct,
+            kvasir_core::rpc::AttributionStatus::TraceDerived => Self::TraceDerived,
+            kvasir_core::rpc::AttributionStatus::Partial => Self::Partial,
+            kvasir_core::rpc::AttributionStatus::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl From<CoreSummaryTotals> for KvasirOverviewTotals {
+    fn from(totals: CoreSummaryTotals) -> Self {
+        Self {
+            total_tokens: totals.total_tokens,
+            cost_usd_nanos: totals.cost_usd.as_nanos(),
+            cost_source: totals.cost_source.map(KvasirCostSource::from),
+            tool_calls: totals.tool_calls,
+        }
+    }
+}
+
+impl From<kvasir_core::rpc::SessionRoute> for KvasirOverviewSessionRoute {
+    fn from(route: kvasir_core::rpc::SessionRoute) -> Self {
+        Self {
+            harness: crate::types::KvasirHarnessName::from_core(route.harness),
+            session_id: crate::types::KvasirSessionId::from_core(route.session_id),
+        }
+    }
+}
+
+impl From<kvasir_core::rpc::PromptRoute> for KvasirOverviewPromptRoute {
+    fn from(route: kvasir_core::rpc::PromptRoute) -> Self {
+        Self {
+            session: route.session.into(),
+            prompt_id: crate::types::KvasirPromptId::from_core(route.prompt_id),
+        }
+    }
+}
+
+impl From<CoreSessionSummary> for KvasirOverviewSessionSummary {
+    fn from(summary: CoreSessionSummary) -> Self {
+        Self {
+            route: summary.route.into(),
+            totals: summary.totals.into(),
+            attribution_status: summary.attribution_status.into(),
+            last_activity: KvasirTimestampMillis {
+                value: summary.last_activity.value(),
+            },
+        }
+    }
+}
+
+impl From<CorePromptSummary> for KvasirOverviewPromptSummary {
+    fn from(summary: CorePromptSummary) -> Self {
+        Self {
+            route: summary.route.into(),
+            totals: summary.totals.into(),
+            attribution_status: summary.attribution_status.into(),
+            last_activity: KvasirTimestampMillis {
+                value: summary.last_activity.value(),
+            },
+        }
+    }
+}
+
+impl From<CoreHarnessSummary> for KvasirOverviewHarnessSummary {
+    fn from(summary: CoreHarnessSummary) -> Self {
+        Self {
+            harness: crate::types::KvasirHarnessName::from_core(summary.harness),
+            totals: summary.totals.into(),
+            last_activity: KvasirTimestampMillis {
+                value: summary.last_activity.value(),
+            },
+        }
+    }
+}
+
 impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
     type Error = KvasirClientError;
 
@@ -191,6 +312,23 @@ impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
                 .into_iter()
                 .map(KvasirToolCallRollup::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            harness_summaries: rollup
+                .harness_summaries
+                .into_iter()
+                .map(KvasirOverviewHarnessSummary::from)
+                .collect(),
+            session_summaries: rollup
+                .session_summaries
+                .into_iter()
+                .map(KvasirOverviewSessionSummary::from)
+                .collect(),
+            session_summaries_more_available: rollup.session_summaries_more_available,
+            prompt_summaries: rollup
+                .prompt_summaries
+                .into_iter()
+                .map(KvasirOverviewPromptSummary::from)
+                .collect(),
+            prompt_summaries_more_available: rollup.prompt_summaries_more_available,
         })
     }
 }
@@ -377,4 +515,48 @@ fn rollup_day_from_core(
         month: u8::try_from(date.month()).map_err(|_| KvasirClientError::InvalidQuery)?,
         day: u8::try_from(date.day()).map_err(|_| KvasirClientError::InvalidQuery)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        KvasirHarnessName, KvasirOverviewPromptRoute, KvasirOverviewSessionRoute, KvasirPromptId,
+        KvasirSessionId,
+    };
+
+    #[test]
+    fn overview_deep_scope_conversions_preserve_harness_identity() {
+        let session = KvasirOverviewSessionRoute {
+            harness: KvasirHarnessName::try_from("GitHub-Copilot".to_owned()).unwrap(),
+            session_id: KvasirSessionId::try_from("session-12".to_owned()).unwrap(),
+        };
+        let prompt = KvasirOverviewPromptRoute {
+            session: session.clone(),
+            prompt_id: KvasirPromptId::try_from("prompt-7".to_owned()).unwrap(),
+        };
+        let query = KvasirRollupQuery {
+            start: KvasirTimestampMillis { value: 10 },
+            end: KvasirTimestampMillis { value: 20 },
+            repo: None,
+            harness: None,
+            model: None,
+            session: Some(session),
+            prompt: Some(prompt),
+        };
+
+        let token_query = RollupQuery::try_from(query.clone()).unwrap();
+        let cost_query = CostRollupQuery::try_from(query.clone()).unwrap();
+        let tool_query = ToolCallRollupQuery::try_from(query).unwrap();
+
+        assert_eq!(token_query.harness.unwrap().as_str(), "github_copilot");
+        assert_eq!(token_query.session_id.unwrap().as_str(), "session-12");
+        assert_eq!(token_query.prompt_id.unwrap().as_str(), "prompt-7");
+        assert_eq!(cost_query.harness.unwrap().as_str(), "github_copilot");
+        assert_eq!(cost_query.session_id.unwrap().as_str(), "session-12");
+        assert_eq!(cost_query.prompt_id.unwrap().as_str(), "prompt-7");
+        assert_eq!(tool_query.harness.unwrap().as_str(), "github_copilot");
+        assert_eq!(tool_query.session_id.unwrap().as_str(), "session-12");
+        assert_eq!(tool_query.prompt_id.unwrap().as_str(), "prompt-7");
+    }
 }

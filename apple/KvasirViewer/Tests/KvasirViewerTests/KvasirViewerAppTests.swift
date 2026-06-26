@@ -111,6 +111,10 @@ func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
                     )
                 )
             ],
+            sessionBreakdown: [],
+            sessionBreakdownMoreAvailable: 0,
+            promptBreakdown: [],
+            promptBreakdownMoreAvailable: 0,
             selectedRepo: repo,
             selectedModel: model
         )
@@ -240,6 +244,10 @@ func kvasirOverviewSnapshotMappingPreservesCostSourceVariants() {
                     )
                 ),
             ],
+            sessionBreakdown: [],
+            sessionBreakdownMoreAvailable: 0,
+            promptBreakdown: [],
+            promptBreakdownMoreAvailable: 0,
             selectedRepo: mixedRepo,
             selectedModel: "claude-sonnet-4"
         )
@@ -267,6 +275,10 @@ func kvasirOverviewSnapshotMappingNormalizesInvalidRepoBuckets() {
                 )
             ],
             modelBreakdown: [],
+            sessionBreakdown: [],
+            sessionBreakdownMoreAvailable: 0,
+            promptBreakdown: [],
+            promptBreakdownMoreAvailable: 0,
             selectedRepo: invalidRepo,
             selectedModel: nil
         )
