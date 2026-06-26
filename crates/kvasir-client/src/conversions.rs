@@ -4,12 +4,12 @@ use kvasir_core::rpc::{
     ContentKindAvailability as CoreContentKindAvailability, ContentQuery,
     ContentReplay as CoreContentReplay, ContentReplayItem as CoreContentReplayItem,
     ContentUnavailableReason as CoreContentUnavailableReason, CostRollup as CoreCostRollup,
-    CostRollupQuery, OverviewRollup as CoreOverviewRollup, PromptSummary as CorePromptSummary,
-    RollupQuery, RpcError, SessionSummary as CoreSessionSummary,
-    SummaryTotals as CoreSummaryTotals, TimestampMillis, TokenRollup as CoreTokenRollup,
-    ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery, Trace as CoreTrace,
-    TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery, TraceSpan as CoreTraceSpan,
-    TraceSpanKind as CoreTraceSpanKind,
+    CostRollupQuery, HarnessSummary as CoreHarnessSummary, OverviewRollup as CoreOverviewRollup,
+    PromptSummary as CorePromptSummary, RollupQuery, RpcError,
+    SessionSummary as CoreSessionSummary, SummaryTotals as CoreSummaryTotals, TimestampMillis,
+    TokenRollup as CoreTokenRollup, ToolCallRollup as CoreToolCallRollup, ToolCallRollupQuery,
+    Trace as CoreTrace, TraceDurationMeasures as CoreTraceDurationMeasures, TraceQuery,
+    TraceSpan as CoreTraceSpan, TraceSpanKind as CoreTraceSpanKind,
 };
 use kvasir_core::{ContentKind as CoreContentKind, RepoBucket, RepoIdentity};
 
@@ -18,11 +18,12 @@ use crate::types::{
     KvasirAttributionStatus, KvasirContentAvailability, KvasirContentKind,
     KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
     KvasirContentReplayItem, KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource,
-    KvasirCostUsd, KvasirOverviewPromptRoute, KvasirOverviewPromptSummary, KvasirOverviewRollup,
-    KvasirOverviewSessionRoute, KvasirOverviewSessionSummary, KvasirOverviewTotals,
-    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
-    KvasirRollupQuery, KvasirTimestampMillis, KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace,
-    KvasirTraceDurationMeasures, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirCostUsd, KvasirOverviewHarnessSummary, KvasirOverviewPromptRoute,
+    KvasirOverviewPromptSummary, KvasirOverviewRollup, KvasirOverviewSessionRoute,
+    KvasirOverviewSessionSummary, KvasirOverviewTotals, KvasirRepoBucket, KvasirRepoBucketKind,
+    KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis,
+    KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures,
+    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -38,6 +39,9 @@ impl TryFrom<KvasirRollupQuery> for RollupQuery {
         }
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
+        }
+        if let Some(harness) = query.harness {
+            core_query = core_query.with_harness(harness.into_core());
         }
         if let Some(prompt) = query.prompt {
             core_query = core_query
@@ -67,6 +71,9 @@ impl TryFrom<KvasirRollupQuery> for CostRollupQuery {
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
         }
+        if let Some(harness) = query.harness {
+            core_query = core_query.with_harness(harness.into_core());
+        }
         if let Some(prompt) = query.prompt {
             core_query = core_query
                 .with_harness(prompt.session.harness.into_core())
@@ -94,6 +101,9 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
         }
         if let Some(model) = query.model {
             core_query = core_query.with_model(model.into_core());
+        }
+        if let Some(harness) = query.harness {
+            core_query = core_query.with_harness(harness.into_core());
         }
         if let Some(prompt) = query.prompt {
             core_query = core_query
@@ -270,6 +280,18 @@ impl From<CorePromptSummary> for KvasirOverviewPromptSummary {
     }
 }
 
+impl From<CoreHarnessSummary> for KvasirOverviewHarnessSummary {
+    fn from(summary: CoreHarnessSummary) -> Self {
+        Self {
+            harness: crate::types::KvasirHarnessName::from_core(summary.harness),
+            totals: summary.totals.into(),
+            last_activity: KvasirTimestampMillis {
+                value: summary.last_activity.value(),
+            },
+        }
+    }
+}
+
 impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
     type Error = KvasirClientError;
 
@@ -290,6 +312,11 @@ impl TryFrom<CoreOverviewRollup> for KvasirOverviewRollup {
                 .into_iter()
                 .map(KvasirToolCallRollup::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            harness_summaries: rollup
+                .harness_summaries
+                .into_iter()
+                .map(KvasirOverviewHarnessSummary::from)
+                .collect(),
             session_summaries: rollup
                 .session_summaries
                 .into_iter()
@@ -512,6 +539,7 @@ mod tests {
             start: KvasirTimestampMillis { value: 10 },
             end: KvasirTimestampMillis { value: 20 },
             repo: None,
+            harness: None,
             model: None,
             session: Some(session),
             prompt: Some(prompt),

@@ -164,10 +164,28 @@ pub struct TokenUsageRecord {
     pub counter_start: TimestampMillis,
     pub signal: TokenUsageSignal,
     pub repo: RepoBucket,
+    pub harness: HarnessName,
     pub model: ModelName,
     pub measure: TokenMeasure,
     pub token_count: TokenCount,
     pub kind: TokenUsageKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsageContext {
+    pub repo: RepoBucket,
+    pub harness: HarnessName,
+    pub model: ModelName,
+}
+
+impl TokenUsageContext {
+    pub fn new(repo: RepoBucket, harness: HarnessName, model: ModelName) -> Self {
+        Self {
+            repo,
+            harness,
+            model,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +571,7 @@ pub struct CostUsageRecord {
     pub occurred_at: TimestampMillis,
     pub counter_start: TimestampMillis,
     pub repo: RepoBucket,
+    pub harness: HarnessName,
     pub model: ModelName,
     pub cost_usd: CostUsd,
 }
@@ -565,10 +584,29 @@ impl CostUsageRecord {
         model: ModelName,
         cost_usd: CostUsd,
     ) -> Self {
+        Self::new_with_harness(
+            occurred_at,
+            counter_start,
+            repo,
+            HarnessName::new("unknown"),
+            model,
+            cost_usd,
+        )
+    }
+
+    pub fn new_with_harness(
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        repo: RepoBucket,
+        harness: HarnessName,
+        model: ModelName,
+        cost_usd: CostUsd,
+    ) -> Self {
         Self {
             occurred_at,
             counter_start,
             repo,
+            harness,
             model,
             cost_usd,
         }
@@ -636,6 +674,25 @@ impl TokenUsageRecord {
         )
     }
 
+    pub fn new_with_harness(
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        repo: RepoBucket,
+        harness: HarnessName,
+        model: ModelName,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
+        Self::new_from_signal_with_harness(
+            TokenUsageSignal::Metrics,
+            occurred_at,
+            counter_start,
+            TokenUsageContext::new(repo, harness, model),
+            measure,
+            token_count,
+        )
+    }
+
     pub fn new_from_signal(
         signal: TokenUsageSignal,
         occurred_at: TimestampMillis,
@@ -645,12 +702,31 @@ impl TokenUsageRecord {
         measure: TokenMeasure,
         token_count: TokenCount,
     ) -> Self {
+        Self::new_from_signal_with_harness(
+            signal,
+            occurred_at,
+            counter_start,
+            TokenUsageContext::new(repo, default_harness_for_token_signal(signal), model),
+            measure,
+            token_count,
+        )
+    }
+
+    pub fn new_from_signal_with_harness(
+        signal: TokenUsageSignal,
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        context: TokenUsageContext,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
         Self {
             occurred_at,
             counter_start,
             signal,
-            repo,
-            model,
+            repo: context.repo,
+            harness: context.harness,
+            model: context.model,
             measure,
             token_count,
             kind: TokenUsageKind::Cumulative,
@@ -666,12 +742,31 @@ impl TokenUsageRecord {
         measure: TokenMeasure,
         token_count: TokenCount,
     ) -> Self {
+        Self::new_delta_with_harness(
+            event_key,
+            occurred_at,
+            counter_start,
+            TokenUsageContext::new(repo, HarnessName::new("unknown"), model),
+            measure,
+            token_count,
+        )
+    }
+
+    pub fn new_delta_with_harness(
+        event_key: TokenUsageEventKey,
+        occurred_at: TimestampMillis,
+        counter_start: TimestampMillis,
+        context: TokenUsageContext,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
         Self {
             occurred_at,
             counter_start,
             signal: TokenUsageSignal::Metrics,
-            repo,
-            model,
+            repo: context.repo,
+            harness: context.harness,
+            model: context.model,
             measure,
             token_count,
             kind: TokenUsageKind::Delta { event_key },
@@ -687,16 +782,43 @@ impl TokenUsageRecord {
         measure: TokenMeasure,
         token_count: TokenCount,
     ) -> Self {
+        Self::new_delta_from_signal_with_harness(
+            signal,
+            event_key,
+            occurred_at,
+            TokenUsageContext::new(repo, default_harness_for_token_signal(signal), model),
+            measure,
+            token_count,
+        )
+    }
+
+    pub fn new_delta_from_signal_with_harness(
+        signal: TokenUsageSignal,
+        event_key: TokenUsageEventKey,
+        occurred_at: TimestampMillis,
+        context: TokenUsageContext,
+        measure: TokenMeasure,
+        token_count: TokenCount,
+    ) -> Self {
         Self {
             occurred_at,
             counter_start: occurred_at,
             signal,
-            repo,
-            model,
+            repo: context.repo,
+            harness: context.harness,
+            model: context.model,
             measure,
             token_count,
             kind: TokenUsageKind::Delta { event_key },
         }
+    }
+}
+
+fn default_harness_for_token_signal(signal: TokenUsageSignal) -> HarnessName {
+    match signal {
+        TokenUsageSignal::Metrics => HarnessName::new("unknown"),
+        TokenUsageSignal::Logs => HarnessName::new("claude_code"),
+        TokenUsageSignal::OpenCodeTraces => HarnessName::new("opencode"),
     }
 }
 

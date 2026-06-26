@@ -74,6 +74,17 @@ impl KvasirClient {
         query: KvasirRollupQuery,
     ) -> Result<KvasirOverviewSnapshot, KvasirClientError> {
         let selected_repo = query.repo.clone();
+        let selected_harness = query
+            .prompt
+            .as_ref()
+            .map(|prompt| prompt.session.harness.clone())
+            .or_else(|| {
+                query
+                    .session
+                    .as_ref()
+                    .map(|session| session.harness.clone())
+            })
+            .or_else(|| query.harness.clone());
         let selected_model = query.model.clone();
         let selected_session = query.session.clone();
         let selected_prompt = query.prompt.clone();
@@ -81,6 +92,7 @@ impl KvasirClient {
             KvasirOverviewSnapshot::from_rollup(
                 rollup,
                 selected_repo,
+                selected_harness,
                 selected_model,
                 selected_session,
                 selected_prompt,

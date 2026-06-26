@@ -543,7 +543,8 @@ func failedClearSessionAndPromptKeepsPreviousPromptAndSnapshot() async throws {
     #expect(client.queries == [
         OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC)
             .query(session: session, prompt: prompt),
-        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC)
+            .query(harness: session.harness)
     ])
 }
 
@@ -923,10 +924,20 @@ private extension OverviewTimeRange {
     func query(
         repo: OverviewRepoBucket? = nil,
         model: OverviewModelName? = nil,
+        harness: OverviewHarnessName? = nil,
         session: OverviewSessionRoute? = nil,
         prompt: OverviewPromptRoute? = nil
     ) -> OverviewQuery {
-        OverviewQuery(start: start, end: end, repo: repo, model: model, session: session, prompt: prompt)
+        let effectiveHarness = prompt?.session.harness ?? session?.harness ?? harness
+        return OverviewQuery(
+            start: start,
+            end: end,
+            repo: repo,
+            model: model,
+            harness: effectiveHarness,
+            session: session,
+            prompt: prompt
+        )
     }
 }
 

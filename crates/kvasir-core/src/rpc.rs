@@ -313,6 +313,13 @@ pub struct SummaryTotals {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessSummary {
+    pub harness: HarnessName,
+    pub totals: SummaryTotals,
+    pub last_activity: TimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub route: SessionRoute,
     pub totals: SummaryTotals,
@@ -585,6 +592,7 @@ pub struct OverviewRollup {
     pub token_rollups: Vec<TokenRollup>,
     pub cost_rollups: Vec<CostRollup>,
     pub tool_call_rollups: Vec<ToolCallRollup>,
+    pub harness_summaries: Vec<HarnessSummary>,
     pub session_summaries: Vec<SessionSummary>,
     pub session_summaries_more_available: u64,
     pub prompt_summaries: Vec<PromptSummary>,

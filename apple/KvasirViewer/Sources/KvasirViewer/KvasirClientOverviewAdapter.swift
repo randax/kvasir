@@ -21,6 +21,7 @@ func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
         start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),
         end: KvasirTimestampMillis(value: Int64(query.end.timeIntervalSince1970 * 1_000)),
         repo: query.repo?.kvasirRepoBucket,
+        harness: query.harness?.displayName(),
         model: query.model?.displayName(),
         session: query.session?.kvasirOverviewSessionRoute,
         prompt: query.prompt?.kvasirOverviewPromptRoute
@@ -109,11 +110,13 @@ private extension KvasirOverviewSnapshot {
             series: series.map { $0.overviewSeriesPoint },
             repoBreakdown: repoBreakdown.map { $0.overviewRepoSummary },
             modelBreakdown: modelBreakdown.map { $0.overviewModelSummary },
+            harnessBreakdown: harnessBreakdown.map { $0.overviewHarnessSummary },
             sessionBreakdown: sessionBreakdown.map { $0.overviewSessionSummary },
             sessionBreakdownMoreAvailable: sessionBreakdownMoreAvailable,
             promptBreakdown: promptBreakdown.map { $0.overviewPromptSummary },
             promptBreakdownMoreAvailable: promptBreakdownMoreAvailable,
             selectedRepo: selectedRepo?.overviewRepo,
+            selectedHarness: selectedHarness.map(OverviewHarnessName.init),
             selectedModel: selectedModel.map(OverviewModelName.init),
             selectedSession: selectedSession?.overviewSessionRoute,
             selectedPrompt: selectedPrompt?.overviewPromptRoute,
@@ -154,6 +157,16 @@ private extension KvasirOverviewRepoSummary {
 private extension KvasirOverviewModelSummary {
     var overviewModelSummary: OverviewModelSummary {
         OverviewModelSummary(model: OverviewModelName(model), totals: totals.overviewTotals)
+    }
+}
+
+private extension KvasirOverviewHarnessSummary {
+    var overviewHarnessSummary: OverviewHarnessSummary {
+        OverviewHarnessSummary(
+            harness: OverviewHarnessName(harness),
+            totals: totals.overviewTotals,
+            lastActivity: Date(timeIntervalSince1970: TimeInterval(lastActivity.value) / 1_000)
+        )
     }
 }
 

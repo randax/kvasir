@@ -1007,6 +1007,7 @@ fn overview_rollups(
             session_id: query.session_id.clone(),
             prompt_id: query.prompt_id.clone(),
         })?,
+        harness_summaries: store.harness_summaries(query.clone())?,
         tool_call_rollups: store.tool_call_rollups(ToolCallRollupQuery {
             start: query.start,
             end: query.end,

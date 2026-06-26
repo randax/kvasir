@@ -15,6 +15,7 @@ public struct OverviewQuery: Equatable, Sendable {
     public var end: Date
     public var repo: OverviewRepoBucket?
     public var model: OverviewModelName?
+    public var harness: OverviewHarnessName?
     public var session: OverviewSessionRoute?
     public var prompt: OverviewPromptRoute?
 
@@ -23,6 +24,7 @@ public struct OverviewQuery: Equatable, Sendable {
         end: Date,
         repo: OverviewRepoBucket? = nil,
         model: OverviewModelName? = nil,
+        harness: OverviewHarnessName? = nil,
         session: OverviewSessionRoute? = nil,
         prompt: OverviewPromptRoute? = nil
     ) {
@@ -30,6 +32,7 @@ public struct OverviewQuery: Equatable, Sendable {
         self.end = end
         self.repo = repo
         self.model = model
+        self.harness = harness
         self.session = session
         self.prompt = prompt
     }
@@ -134,6 +137,7 @@ public struct OverviewPromptRoute: Hashable, Sendable {
 public enum OverviewDrillTarget: Equatable, Sendable {
     case repo(OverviewRepoBucket)
     case model(OverviewModelName)
+    case harness(OverviewHarnessName)
     case session(OverviewSessionRoute)
     case prompt(OverviewPromptRoute)
 }
@@ -277,17 +281,20 @@ public struct OverviewCostDashboardPresentation: Equatable, Sendable {
     public var series: [OverviewCostDisplay]
     public var repos: [OverviewCostDisplay]
     public var models: [OverviewCostDisplay]
+    public var harnesses: [OverviewCostDisplay]
 
     public init(
         total: OverviewCostDisplay,
         series: [OverviewCostDisplay],
         repos: [OverviewCostDisplay],
-        models: [OverviewCostDisplay]
+        models: [OverviewCostDisplay],
+        harnesses: [OverviewCostDisplay] = []
     ) {
         self.total = total
         self.series = series
         self.repos = repos
         self.models = models
+        self.harnesses = harnesses
     }
 }
 
@@ -445,11 +452,13 @@ public struct OverviewSnapshot: Equatable, Sendable {
     public var series: [OverviewSeriesPoint]
     public var repoBreakdown: [OverviewRepoSummary]
     public var modelBreakdown: [OverviewModelSummary]
+    public var harnessBreakdown: [OverviewHarnessSummary]
     public var sessionBreakdown: [OverviewSessionSummary]
     public var sessionBreakdownMoreAvailable: UInt64
     public var promptBreakdown: [OverviewPromptSummary]
     public var promptBreakdownMoreAvailable: UInt64
     public var selectedRepo: OverviewRepoBucket?
+    public var selectedHarness: OverviewHarnessName?
     public var selectedModel: OverviewModelName?
     public var selectedSession: OverviewSessionRoute?
     public var selectedPrompt: OverviewPromptRoute?
@@ -460,11 +469,13 @@ public struct OverviewSnapshot: Equatable, Sendable {
         series: [OverviewSeriesPoint],
         repoBreakdown: [OverviewRepoSummary],
         modelBreakdown: [OverviewModelSummary] = [],
+        harnessBreakdown: [OverviewHarnessSummary] = [],
         sessionBreakdown: [OverviewSessionSummary] = [],
         sessionBreakdownMoreAvailable: UInt64 = 0,
         promptBreakdown: [OverviewPromptSummary] = [],
         promptBreakdownMoreAvailable: UInt64 = 0,
         selectedRepo: OverviewRepoBucket?,
+        selectedHarness: OverviewHarnessName? = nil,
         selectedModel: OverviewModelName? = nil,
         selectedSession: OverviewSessionRoute? = nil,
         selectedPrompt: OverviewPromptRoute? = nil,
@@ -474,11 +485,13 @@ public struct OverviewSnapshot: Equatable, Sendable {
         self.series = series
         self.repoBreakdown = repoBreakdown
         self.modelBreakdown = modelBreakdown
+        self.harnessBreakdown = harnessBreakdown
         self.sessionBreakdown = sessionBreakdown
         self.sessionBreakdownMoreAvailable = sessionBreakdownMoreAvailable
         self.promptBreakdown = promptBreakdown
         self.promptBreakdownMoreAvailable = promptBreakdownMoreAvailable
         self.selectedRepo = selectedRepo
+        self.selectedHarness = selectedHarness
         self.selectedModel = selectedModel
         self.selectedSession = selectedSession
         self.selectedPrompt = selectedPrompt
@@ -490,12 +503,14 @@ public struct OverviewSnapshot: Equatable, Sendable {
             total: totals.costDisplay,
             series: series.map(\.costDisplay),
             repos: repoBreakdown.map(\.totals.costDisplay),
-            models: modelBreakdown.map(\.totals.costDisplay)
+            models: modelBreakdown.map(\.totals.costDisplay),
+            harnesses: harnessBreakdown.map(\.totals.costDisplay)
         )
     }
 
     public var filterBarPresentation: OverviewFilterBarPresentation {
-        let selectedHarness = selectedPrompt?.session.harness ?? selectedSession?.harness
+        let selectedHarness =
+            selectedPrompt?.session.harness ?? selectedSession?.harness ?? self.selectedHarness
         let selectedSessionID = selectedPrompt?.session.sessionID ?? selectedSession?.sessionID
         return OverviewFilterBarPresentation(
             repo: selectedRepo?.displayName,
@@ -505,6 +520,22 @@ public struct OverviewSnapshot: Equatable, Sendable {
             prompt: selectedPrompt?.promptID.displayName(),
             dimensions: dimensions.map(\.presentation)
         )
+    }
+}
+
+public struct OverviewHarnessSummary: Equatable, Sendable {
+    public var harness: OverviewHarnessName
+    public var totals: OverviewTotals
+    public var lastActivity: Date
+
+    public init(
+        harness: OverviewHarnessName,
+        totals: OverviewTotals,
+        lastActivity: Date = Date(timeIntervalSince1970: 0)
+    ) {
+        self.harness = harness
+        self.totals = totals
+        self.lastActivity = lastActivity
     }
 }
 
@@ -601,6 +632,7 @@ public struct OverviewDashboard: Sendable {
         range: OverviewTimeRange,
         repo: OverviewRepoBucket? = nil,
         model: OverviewModelName? = nil,
+        harness: OverviewHarnessName? = nil,
         session: OverviewSessionRoute? = nil,
         prompt: OverviewPromptRoute? = nil
     ) async throws -> OverviewSnapshot {
@@ -609,6 +641,7 @@ public struct OverviewDashboard: Sendable {
             end: range.end,
             repo: repo,
             model: model,
+            harness: harness,
             session: session,
             prompt: prompt
         )

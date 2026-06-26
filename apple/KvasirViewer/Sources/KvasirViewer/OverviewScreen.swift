@@ -88,6 +88,10 @@ struct OverviewScreen: View {
                     )
                     repoDashboard(snapshot.repoBreakdown, showsToolCalls: snapshot.selectedModel == nil)
                     modelDashboard(snapshot.modelBreakdown)
+                    harnessDashboard(
+                        snapshot.harnessBreakdown,
+                        showsToolCalls: snapshot.selectedModel == nil
+                    )
                     sessionDashboard(
                         snapshot.sessionBreakdown,
                         moreAvailable: snapshot.sessionBreakdownMoreAvailable,
@@ -143,7 +147,7 @@ struct OverviewScreen: View {
 
                 if let harness = presentation.harness {
                     FilterChip(title: "Harness", value: harness, systemImage: "terminal") {
-                        clearSessionAndPrompt()
+                        selectHarness(nil)
                     }
                 }
 
@@ -292,6 +296,57 @@ struct OverviewScreen: View {
         }
     }
 
+    private func harnessDashboard(_ harnesses: [OverviewHarnessSummary], showsToolCalls: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Text("Harnesses")
+                    .font(.headline)
+
+                if let selectedHarness = model.selectedHarness {
+                    Text(selectedHarness.displayName())
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(selectedHarness.displayName())
+                }
+
+                Spacer()
+
+                Button {
+                    selectHarness(nil)
+                } label: {
+                    Label("All harnesses", systemImage: "terminal")
+                }
+                .disabled(model.selectedHarness == nil)
+            }
+
+            VStack(spacing: 0) {
+                if harnesses.isEmpty {
+                    HarnessEmptyRow()
+                } else {
+                    HarnessHeaderRow(showsToolCalls: showsToolCalls)
+                    ForEach(harnesses, id: \.harness) { summary in
+                        HarnessSummaryRow(
+                            summary: summary,
+                            isSelected: model.selectedHarness == summary.harness,
+                            showsToolCalls: showsToolCalls,
+                            costFormatter: usd
+                        ) {
+                            drillDown(to: .harness(summary.harness))
+                        }
+                        Divider()
+                    }
+                }
+            }
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+            )
+        }
+    }
+
     private func sessionDashboard(
         _ sessions: [OverviewSessionSummary],
         moreAvailable: UInt64,
@@ -421,6 +476,16 @@ struct OverviewScreen: View {
         }
     }
 
+    private func selectHarness(_ selectedHarness: OverviewHarnessName?) {
+        Task {
+            do {
+                try await model.selectHarness(selectedHarness)
+            } catch {
+                model.record(error: error)
+            }
+        }
+    }
+
     private func drillDown(to target: OverviewDrillTarget) {
         Task {
             do {
@@ -509,6 +574,15 @@ private struct ModelEmptyRow: View {
     }
 }
 
+private struct HarnessEmptyRow: View {
+    var body: some View {
+        Label("No harness data for this range", systemImage: "tray")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+    }
+}
+
 private struct FilterChip: View {
     let title: String
     let value: String
@@ -578,6 +652,29 @@ private struct ModelHeaderRow: View {
                 .frame(width: 110, alignment: .trailing)
             Text("Cost")
                 .frame(width: 132, alignment: .trailing)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct HarnessHeaderRow: View {
+    let showsToolCalls: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Harness")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Tokens")
+                .frame(width: 110, alignment: .trailing)
+            Text("Cost")
+                .frame(width: 132, alignment: .trailing)
+            if showsToolCalls {
+                Text("Tool calls")
+                    .frame(width: 110, alignment: .trailing)
+            }
         }
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)
@@ -723,6 +820,49 @@ private struct ModelSummaryRow: View {
         }
         .buttonStyle(.plain)
         .help(summary.model.displayName())
+    }
+}
+
+private struct HarnessSummaryRow: View {
+    let summary: OverviewHarnessSummary
+    let isSelected: Bool
+    let showsToolCalls: Bool
+    let costFormatter: (UInt64) -> String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: isSelected ? "line.3.horizontal.decrease.circle.fill" : "terminal")
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    Text(summary.harness.displayName())
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(summary.totals.totalTokens.formatted())
+                    .monospacedDigit()
+                    .frame(width: 110, alignment: .trailing)
+                CostValue(
+                    display: summary.totals.costDisplay,
+                    formatter: costFormatter
+                )
+                if showsToolCalls {
+                    Text(summary.totals.toolCalls.formatted())
+                        .monospacedDigit()
+                        .frame(width: 110, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(summary.harness.displayName())
     }
 }
 

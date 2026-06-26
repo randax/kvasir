@@ -23,8 +23,9 @@ use crate::rpc::{
 use crate::usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
     RawBodyFileReference, RawBodyReferenceRecord, RepoBucket, RepoIdentity, RepoName, RepoPath,
-    TokenCount, TokenMeasure, TokenUsageEventKey, TokenUsageRecord, TokenUsageSignal,
-    ToolCallCount, ToolCallEventKey, ToolCallRecord, TraceSpanRecord, UsageRecords,
+    TokenCount, TokenMeasure, TokenUsageContext, TokenUsageEventKey, TokenUsageRecord,
+    TokenUsageSignal, ToolCallCount, ToolCallEventKey, ToolCallRecord, TraceSpanRecord,
+    UsageRecords,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +151,7 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
                                 data_point,
                                 &mut codex_point_ordinals,
                                 repo.clone(),
+                                resource_harness.as_deref(),
                             )? {
                                 records.token_usage.push(record);
                             }
@@ -158,9 +160,11 @@ pub fn parse_otlp_json_usage_metrics(bytes: &[u8]) -> Result<UsageRecords, OtlpE
                     Some("cost.usage") => {
                         let data_points = json_data_points(metric)?;
                         for data_point in data_points {
-                            records
-                                .cost_usage
-                                .push(json_cost_record(data_point, repo.clone())?);
+                            records.cost_usage.push(json_cost_record(
+                                data_point,
+                                repo.clone(),
+                                resource_harness.as_deref(),
+                            )?);
                         }
                     }
                     Some(name) if is_codex_tool_call_metric_name(name) => {
@@ -391,9 +395,12 @@ fn records_from_metric(
     match metric_name.as_str() {
         name if is_cumulative_token_metric_name(name) => {
             for data_point in proto_sum_data_points(metric)? {
-                records
-                    .token_usage
-                    .push(record_from_proto_sum_data_point(data_point, repo.clone())?);
+                records.token_usage.push(record_from_proto_sum_data_point(
+                    &metric_name,
+                    data_point,
+                    repo.clone(),
+                    resource_harness,
+                )?);
             }
         }
         "codex.turn.token_usage" => {
@@ -432,9 +439,11 @@ fn records_from_metric(
         }
         "cost.usage" => {
             for data_point in proto_sum_data_points(metric)? {
-                records
-                    .cost_usage
-                    .push(cost_record_from_proto_data_point(data_point, repo.clone())?);
+                records.cost_usage.push(cost_record_from_proto_data_point(
+                    data_point,
+                    repo.clone(),
+                    resource_harness,
+                )?);
             }
         }
         _ => {}
@@ -608,8 +617,10 @@ fn proto_codex_delta_histogram_data_points(
 }
 
 fn record_from_proto_sum_data_point(
+    metric_name: &str,
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     repo: RepoBucket,
+    resource_harness: Option<&str>,
 ) -> Result<TokenUsageRecord, OtlpError> {
     let model = first_meaningful_proto_attribute(
         &data_point.attributes,
@@ -647,10 +658,11 @@ fn record_from_proto_sum_data_point(
         TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
             .ok_or(OtlpError::MissingTimestamp)?
     };
-    Ok(TokenUsageRecord::new(
+    Ok(TokenUsageRecord::new_with_harness(
         occurred_at,
         counter_start,
         repo,
+        token_metric_harness(metric_name, resource_harness),
         ModelName::new(model),
         measure,
         token_count,
@@ -708,12 +720,11 @@ fn record_from_codex_proto_histogram(
         point_ordinal,
         token_count,
     );
-    Ok(Some(TokenUsageRecord::new_delta(
+    Ok(Some(TokenUsageRecord::new_delta_with_harness(
         event_key,
         occurred_at,
         counter_start,
-        repo,
-        ModelName::new(model),
+        TokenUsageContext::new(repo, HarnessName::new("codex"), ModelName::new(model)),
         measure,
         token_count,
     )))
@@ -799,6 +810,7 @@ fn record_from_proto_tool_call_sum_data_point(
 fn cost_record_from_proto_data_point(
     data_point: opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     repo: RepoBucket,
+    resource_harness: Option<&str>,
 ) -> Result<CostUsageRecord, OtlpError> {
     let model = proto_attribute(&data_point.attributes, "model").ok_or(OtlpError::MissingModel)?;
     let cost_usd = match data_point.value.ok_or(OtlpError::MissingCost)? {
@@ -819,10 +831,13 @@ fn cost_record_from_proto_data_point(
     let counter_start = TimestampMillis::try_from_unix_nanos(data_point.start_time_unix_nano)
         .filter(|timestamp| data_point.start_time_unix_nano != 0 && timestamp.value() != 0)
         .ok_or(OtlpError::MissingCounterStart)?;
-    Ok(CostUsageRecord::new(
+    Ok(CostUsageRecord::new_with_harness(
         occurred_at,
         counter_start,
         repo,
+        resource_harness
+            .map(HarnessName::new)
+            .unwrap_or_else(|| HarnessName::new("unknown")),
         ModelName::new(model),
         cost_usd,
     ))
@@ -912,6 +927,7 @@ fn json_token_record(
     data_point: &Value,
     codex_point_ordinals: &mut BTreeMap<String, usize>,
     repo: RepoBucket,
+    resource_harness: Option<&str>,
 ) -> Result<Option<TokenUsageRecord>, OtlpError> {
     let attributes = data_point.get("attributes").and_then(Value::as_array);
     let model = first_meaningful_json_attribute(attributes, &["model", "gen_ai.request.model"])
@@ -964,21 +980,27 @@ fn json_token_record(
             point_ordinal,
             token_count,
         );
-        Ok(Some(TokenUsageRecord::new_delta(
+        Ok(Some(TokenUsageRecord::new_delta_with_harness(
             event_key,
             occurred_at,
             counter_start,
-            repo,
-            ModelName::new(model),
+            TokenUsageContext::new(repo, HarnessName::new("codex"), ModelName::new(model)),
             measure,
             token_count,
         )))
     } else {
         let counter_start = json_timestamp(data_point, "startTimeUnixNano").unwrap_or(occurred_at);
-        Ok(Some(TokenUsageRecord::new(
+        Ok(Some(TokenUsageRecord::new_with_harness(
             occurred_at,
             counter_start,
             repo,
+            token_metric_harness(
+                metric
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                resource_harness,
+            ),
             ModelName::new(model),
             measure,
             token_count,
@@ -1124,6 +1146,18 @@ fn tool_call_metric_harness(metric_name: &str, resource_harness: Option<&str>) -
         .unwrap_or_else(|| HarnessName::new("unknown"))
 }
 
+fn token_metric_harness(metric_name: &str, resource_harness: Option<&str>) -> HarnessName {
+    if metric_name == "codex.turn.token_usage" {
+        return HarnessName::new("codex");
+    }
+    if metric_name.starts_with("github.copilot.") {
+        return HarnessName::new("github_copilot");
+    }
+    resource_harness
+        .map(HarnessName::new)
+        .unwrap_or_else(|| HarnessName::new("unknown"))
+}
+
 fn is_codex_token_metric(metric: &Value) -> bool {
     metric.get("name").and_then(Value::as_str) == Some("codex.turn.token_usage")
 }
@@ -1141,7 +1175,11 @@ fn is_ignored_codex_token_type(value: &str) -> bool {
     matches!(value, "total" | "reasoning_output" | "tool")
 }
 
-fn json_cost_record(data_point: &Value, repo: RepoBucket) -> Result<CostUsageRecord, OtlpError> {
+fn json_cost_record(
+    data_point: &Value,
+    repo: RepoBucket,
+    resource_harness: Option<&str>,
+) -> Result<CostUsageRecord, OtlpError> {
     let attributes = data_point.get("attributes").and_then(Value::as_array);
     let model = json_attribute(attributes, "model").ok_or(OtlpError::MissingModel)?;
     let cost_usd = json_cost(data_point)?;
@@ -1150,10 +1188,13 @@ fn json_cost_record(data_point: &Value, repo: RepoBucket) -> Result<CostUsageRec
         .ok_or(OtlpError::MissingTimestamp)?;
     let counter_start = json_counter_start(data_point, "startTimeUnixNano")
         .ok_or(OtlpError::MissingCounterStart)?;
-    Ok(CostUsageRecord::new(
+    Ok(CostUsageRecord::new_with_harness(
         occurred_at,
         counter_start,
         repo,
+        resource_harness
+            .map(HarnessName::new)
+            .unwrap_or_else(|| HarnessName::new("unknown")),
         ModelName::new(model),
         cost_usd,
     ))
@@ -1195,12 +1236,11 @@ fn proto_token_usage_log_record(
         .ok_or(OtlpError::MissingTimestamp)?;
     let model = ModelName::new(model);
     if let Some(counter_start) = proto_log_counter_start(log_record)? {
-        return Ok(Some(TokenUsageRecord::new_from_signal(
+        return Ok(Some(TokenUsageRecord::new_from_signal_with_harness(
             TokenUsageSignal::Logs,
             occurred_at,
             counter_start,
-            repo,
-            model,
+            TokenUsageContext::new(repo, HarnessName::new("claude_code"), model),
             measure,
             token_count,
         )));
@@ -1212,12 +1252,11 @@ fn proto_token_usage_log_record(
         occurred_at_nanos,
         token_count,
     );
-    Ok(Some(TokenUsageRecord::new_delta_from_signal(
+    Ok(Some(TokenUsageRecord::new_delta_from_signal_with_harness(
         TokenUsageSignal::Logs,
         event_key,
         occurred_at,
-        repo,
-        model,
+        TokenUsageContext::new(repo, HarnessName::new("claude_code"), model),
         measure,
         token_count,
     )))
@@ -1251,12 +1290,11 @@ fn json_token_usage_log_record(
     let (occurred_at_nanos, occurred_at) = json_log_timestamp(log_record)?;
     let model = ModelName::new(model);
     if let Some(counter_start) = json_log_counter_start(log_record, attributes)? {
-        return Ok(Some(TokenUsageRecord::new_from_signal(
+        return Ok(Some(TokenUsageRecord::new_from_signal_with_harness(
             TokenUsageSignal::Logs,
             occurred_at,
             counter_start,
-            repo,
-            model,
+            TokenUsageContext::new(repo, HarnessName::new("claude_code"), model),
             measure,
             token_count,
         )));
@@ -1268,12 +1306,11 @@ fn json_token_usage_log_record(
         occurred_at_nanos,
         token_count,
     );
-    Ok(Some(TokenUsageRecord::new_delta_from_signal(
+    Ok(Some(TokenUsageRecord::new_delta_from_signal_with_harness(
         TokenUsageSignal::Logs,
         event_key,
         occurred_at,
-        repo,
-        model,
+        TokenUsageContext::new(repo, HarnessName::new("claude_code"), model),
         measure,
         token_count,
     )))
@@ -2019,12 +2056,11 @@ fn proto_opencode_token_records(
         );
         records
             .token_usage
-            .push(TokenUsageRecord::new_delta_from_signal(
+            .push(TokenUsageRecord::new_delta_from_signal_with_harness(
                 TokenUsageSignal::OpenCodeTraces,
                 event_key,
                 occurred_at,
-                repo.clone(),
-                model.clone(),
+                TokenUsageContext::new(repo.clone(), HarnessName::new("opencode"), model.clone()),
                 measure,
                 token_count,
             ));
@@ -2065,12 +2101,11 @@ fn json_opencode_token_records(
         );
         records
             .token_usage
-            .push(TokenUsageRecord::new_delta_from_signal(
+            .push(TokenUsageRecord::new_delta_from_signal_with_harness(
                 TokenUsageSignal::OpenCodeTraces,
                 event_key,
                 occurred_at,
-                repo.clone(),
-                model.clone(),
+                TokenUsageContext::new(repo.clone(), HarnessName::new("opencode"), model.clone()),
                 measure,
                 token_count,
             ));
@@ -3677,7 +3712,7 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TokenUsageRecord::new_delta(
+                TokenUsageRecord::new_delta_with_harness(
                     codex_token_usage_event_key(
                         &repo,
                         "gpt-5.4",
@@ -3689,12 +3724,15 @@ mod tests {
                     ),
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_799_000),
-                    repo.clone(),
-                    ModelName::new("gpt-5.4"),
+                    TokenUsageContext::new(
+                        repo.clone(),
+                        HarnessName::new("codex"),
+                        ModelName::new("gpt-5.4"),
+                    ),
                     TokenMeasure::Input,
                     TokenCount::new(1200),
                 ),
-                TokenUsageRecord::new_delta(
+                TokenUsageRecord::new_delta_with_harness(
                     codex_token_usage_event_key(
                         &repo,
                         "gpt-5.4",
@@ -3706,12 +3744,15 @@ mod tests {
                     ),
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_799_000),
-                    repo.clone(),
-                    ModelName::new("gpt-5.4"),
+                    TokenUsageContext::new(
+                        repo.clone(),
+                        HarnessName::new("codex"),
+                        ModelName::new("gpt-5.4"),
+                    ),
                     TokenMeasure::Output,
                     TokenCount::new(450),
                 ),
-                TokenUsageRecord::new_delta(
+                TokenUsageRecord::new_delta_with_harness(
                     codex_token_usage_event_key(
                         &repo,
                         "gpt-5.4",
@@ -3723,8 +3764,11 @@ mod tests {
                     ),
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_799_000),
-                    repo,
-                    ModelName::new("gpt-5.4"),
+                    TokenUsageContext::new(
+                        repo,
+                        HarnessName::new("codex"),
+                        ModelName::new("gpt-5.4"),
+                    ),
                     TokenMeasure::Cache,
                     TokenCount::new(80),
                 ),
@@ -3781,18 +3825,20 @@ mod tests {
         assert_eq!(
             parse_token_usage_json(payload).expect("valid Copilot token usage"),
             vec![
-                TokenUsageRecord::new(
+                TokenUsageRecord::new_with_harness(
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_700_000),
                     repo.clone(),
+                    HarnessName::new("github_copilot"),
                     ModelName::new("gpt-4.1"),
                     TokenMeasure::Input,
                     TokenCount::new(1200),
                 ),
-                TokenUsageRecord::new(
+                TokenUsageRecord::new_with_harness(
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_700_000),
                     repo,
+                    HarnessName::new("github_copilot"),
                     ModelName::new("gpt-4.1"),
                     TokenMeasure::Output,
                     TokenCount::new(450),
@@ -4485,18 +4531,20 @@ mod tests {
         assert_eq!(
             parse_token_usage_protobuf(&payload).expect("valid Copilot token usage"),
             vec![
-                TokenUsageRecord::new(
+                TokenUsageRecord::new_with_harness(
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_700_000),
                     repo.clone(),
+                    HarnessName::new("github_copilot"),
                     ModelName::new("gpt-4.1"),
                     TokenMeasure::Input,
                     TokenCount::new(1200),
                 ),
-                TokenUsageRecord::new(
+                TokenUsageRecord::new_with_harness(
                     TimestampMillis::new_for_test(1_781_956_800_000),
                     TimestampMillis::new_for_test(1_781_956_700_000),
                     repo,
+                    HarnessName::new("github_copilot"),
                     ModelName::new("gpt-4.1"),
                     TokenMeasure::Output,
                     TokenCount::new(450),
