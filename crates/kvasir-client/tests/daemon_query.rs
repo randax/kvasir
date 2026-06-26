@@ -674,7 +674,7 @@ async fn client_queries_protobuf_content_replay_by_session_and_prompt() -> anyho
 }
 
 #[tokio::test]
-async fn client_does_not_replay_opencode_content_logs() -> anyhow::Result<()> {
+async fn client_queries_opencode_content_replay_from_opted_in_logs() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
     let daemon = start_with_store_key_source(
@@ -714,9 +714,41 @@ async fn client_does_not_replay_opencode_content_logs() -> anyhow::Result<()> {
         KvasirContentReplay {
             session_id: session("opencode-session-1"),
             prompt_id: prompt("opencode-turn-1"),
-            items: Vec::new(),
-            availability: KvasirContentAvailability::Unavailable {
-                reason: KvasirContentUnavailableReason::PromptNotFound,
+            items: vec![KvasirContentReplayItem {
+                occurred_at: KvasirTimestampMillis {
+                    value: 1_781_956_802_180,
+                },
+                harness: harness("opencode"),
+                kind: KvasirContentKind::AssistantMessage,
+                content: content_text("stored assistant text"),
+            }],
+            availability: KvasirContentAvailability::Captured {
+                harness: harness("opencode"),
+                kinds: vec![
+                    KvasirContentKindAvailability::Captured {
+                        kind: KvasirContentKind::AssistantMessage,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::UserPrompt,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolInput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::ToolOutput,
+                        reason: KvasirContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiRequest,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    KvasirContentKindAvailability::Unavailable {
+                        kind: KvasirContentKind::RawApiResponse,
+                        reason: KvasirContentUnavailableReason::NotProvidedByHarness,
+                    },
+                ],
             },
         }
     );

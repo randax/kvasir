@@ -1405,8 +1405,8 @@ fn proto_content_record(
     let Some(content) = log_record
         .body
         .as_ref()
-        .and_then(proto_string_value)
-        .and_then(ContentText::new)
+        .and_then(proto_content_value)
+        .and_then(OtlpContentValue::into_content_text)
     else {
         return Ok(None);
     };
@@ -1469,8 +1469,8 @@ fn json_content_record(
     };
     let Some(content) = log_record
         .get("body")
-        .and_then(json_string_any_value)
-        .and_then(ContentText::new)
+        .and_then(json_content_any_value)
+        .and_then(OtlpContentValue::into_content_text)
     else {
         return Ok(None);
     };
@@ -2263,7 +2263,7 @@ fn proto_opencode_span_content(
                 })
                 .flatten()
         })
-        .and_then(ContentText::new)
+        .and_then(OtlpContentValue::into_content_text)
 }
 
 fn json_opencode_span_content(
@@ -2282,7 +2282,7 @@ fn json_opencode_span_content(
                 })
                 .flatten()
         })
-        .and_then(ContentText::new)
+        .and_then(OtlpContentValue::into_content_text)
 }
 
 fn opencode_explicit_content_attribute_keys(kind: ContentKind) -> &'static [&'static str] {
@@ -2334,22 +2334,22 @@ fn opencode_json_content_opted_in(attributes: Option<&Vec<Value>>) -> bool {
 fn proto_typed_span_content(attributes: &[KeyValue]) -> Option<(ContentKind, ContentText)> {
     let kind = first_meaningful_proto_attribute(attributes, &["content.type", "content.kind"])
         .and_then(|value| ContentKind::from_inline_content_attribute(&value))?;
-    let content = first_meaningful_proto_attribute(
+    let content = first_meaningful_proto_content_attribute(
         attributes,
         &["content", "content.value", "content.text", "content.body"],
     )
-    .and_then(ContentText::new)?;
+    .and_then(OtlpContentValue::into_content_text)?;
     Some((kind, content))
 }
 
 fn json_typed_span_content(attributes: Option<&Vec<Value>>) -> Option<(ContentKind, ContentText)> {
     let kind = first_meaningful_json_attribute(attributes, &["content.type", "content.kind"])
         .and_then(|value| ContentKind::from_inline_content_attribute(&value))?;
-    let content = first_meaningful_json_attribute(
+    let content = first_meaningful_json_content_attribute(
         attributes,
         &["content", "content.value", "content.text", "content.body"],
     )
-    .and_then(ContentText::new)?;
+    .and_then(OtlpContentValue::into_content_text)?;
     Some((kind, content))
 }
 
@@ -2403,7 +2403,7 @@ fn proto_opencode_token_records(
         let token_count = match proto_token_count_attribute(&span.attributes, keys).transpose() {
             Ok(Some(token_count)) => token_count,
             Ok(None) => continue,
-            Err(_) => return Ok(UsageRecords::default()),
+            Err(_) => continue,
         };
         let event_key = trace_token_usage_event_key(
             &repo,
@@ -2461,7 +2461,7 @@ fn json_opencode_token_records(
         let token_count = match json_token_count_attribute(attributes, keys).transpose() {
             Ok(Some(token_count)) => token_count,
             Ok(None) => continue,
-            Err(_) => return Ok(UsageRecords::default()),
+            Err(_) => continue,
         };
         let event_key = trace_token_usage_event_key(
             &repo,
@@ -2944,9 +2944,9 @@ fn first_meaningful_proto_attribute(attributes: &[KeyValue], keys: &[&str]) -> O
 fn first_meaningful_proto_content_attribute(
     attributes: &[KeyValue],
     keys: &[&str],
-) -> Option<String> {
+) -> Option<OtlpContentValue> {
     keys.iter()
-        .find_map(|key| meaningful_attribute(proto_content_attribute(attributes, key)))
+        .find_map(|key| meaningful_content_value(proto_content_attribute(attributes, key)))
 }
 
 fn first_json_attribute(attributes: Option<&Vec<Value>>, keys: &[&str]) -> Option<String> {
@@ -2964,9 +2964,9 @@ fn first_meaningful_json_attribute(
 fn first_meaningful_json_content_attribute(
     attributes: Option<&Vec<Value>>,
     keys: &[&str],
-) -> Option<String> {
+) -> Option<OtlpContentValue> {
     keys.iter()
-        .find_map(|key| meaningful_attribute(json_content_attribute(attributes, key)))
+        .find_map(|key| meaningful_content_value(json_content_attribute(attributes, key)))
 }
 
 fn canonical_proto_trace_id(bytes: Vec<u8>) -> Result<String, OtlpError> {
@@ -3462,7 +3462,7 @@ fn content_record_harness(resource_harness: Option<&str>) -> Option<String> {
 fn content_harness_provides_logs(harness: &str) -> bool {
     matches!(
         harness,
-        "claude" | "claude_code" | "codex" | "github_copilot"
+        "claude" | "claude_code" | "codex" | "github_copilot" | "opencode"
     )
 }
 
@@ -3535,7 +3535,7 @@ fn proto_attribute(attributes: &[KeyValue], key: &str) -> Option<String> {
         .and_then(proto_string_value)
 }
 
-fn proto_content_attribute(attributes: &[KeyValue], key: &str) -> Option<String> {
+fn proto_content_attribute(attributes: &[KeyValue], key: &str) -> Option<OtlpContentValue> {
     attributes
         .iter()
         .find(|attribute| attribute.key == key)
@@ -3550,10 +3550,36 @@ fn proto_string_value(value: &AnyValue) -> Option<String> {
     }
 }
 
-fn proto_content_value(value: &AnyValue) -> Option<String> {
+#[derive(Debug, Clone, PartialEq)]
+enum OtlpContentValue {
+    Text(String),
+    Json(Value),
+}
+
+impl OtlpContentValue {
+    fn into_content_text(self) -> Option<ContentText> {
+        match self {
+            Self::Text(value) => ContentText::new(value),
+            Self::Json(value) => serde_json::to_string(&value)
+                .ok()
+                .and_then(ContentText::new),
+        }
+    }
+}
+
+fn meaningful_content_value(value: Option<OtlpContentValue>) -> Option<OtlpContentValue> {
+    match value? {
+        OtlpContentValue::Text(value) => {
+            meaningful_attribute(Some(value)).map(OtlpContentValue::Text)
+        }
+        OtlpContentValue::Json(value) => meaningful_content_json(value).map(OtlpContentValue::Json),
+    }
+}
+
+fn proto_content_value(value: &AnyValue) -> Option<OtlpContentValue> {
     match value.value.as_ref()? {
-        any_value::Value::StringValue(value) => Some(value.clone()),
-        _ => content_json_to_string(proto_any_value_to_json(value)),
+        any_value::Value::StringValue(value) => Some(OtlpContentValue::Text(value.clone())),
+        _ => meaningful_content_json(proto_any_value_to_json(value)).map(OtlpContentValue::Json),
     }
 }
 
@@ -3628,7 +3654,7 @@ fn json_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<String> 
         .map(ToOwned::to_owned)
 }
 
-fn json_content_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<String> {
+fn json_content_attribute(attributes: Option<&Vec<Value>>, key: &str) -> Option<OtlpContentValue> {
     attributes?
         .iter()
         .find(|attribute| attribute.get("key").and_then(Value::as_str) == Some(key))
@@ -3666,15 +3692,11 @@ fn json_string_any_value(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn json_content_any_value(value: &Value) -> Option<String> {
+fn json_content_any_value(value: &Value) -> Option<OtlpContentValue> {
     if let Some(value) = json_string_any_value(value) {
-        return Some(value);
+        return Some(OtlpContentValue::Text(value));
     }
-    content_json_to_string(json_any_value_to_json(value))
-}
-
-fn content_json_to_string(value: Value) -> Option<String> {
-    meaningful_content_json(value).and_then(|value| serde_json::to_string(&value).ok())
+    meaningful_content_json(json_any_value_to_json(value)).map(OtlpContentValue::Json)
 }
 
 fn meaningful_content_json(value: Value) -> Option<Value> {
@@ -4030,6 +4052,110 @@ mod tests {
         assert_eq!(records.trace_spans.len(), 0);
         assert_eq!(records.token_usage.len(), 1);
         assert_eq!(records.tool_calls.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_tokens_skip_only_malformed_measure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.generate",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956801800000000",
+                        "attributes": [
+                            { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                            { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
+                            { "key": "ai.usage.promptTokens", "value": { "intValue": "100" } },
+                            { "key": "ai.usage.completionTokens", "value": { "intValue": "25" } },
+                            { "key": "ai.usage.cachedInputTokens", "value": { "stringValue": "not-a-number" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert_eq!(
+            records
+                .token_usage
+                .iter()
+                .map(|record| (record.measure, record.token_count))
+                .collect::<Vec<_>>(),
+            vec![
+                (TokenMeasure::Input, TokenCount::new(100)),
+                (TokenMeasure::Output, TokenCount::new(25)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_tokens_skip_only_malformed_measure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![string_attribute("service.name", "opencode")],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "opencode.generate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_801_800_000_000,
+                        attributes: vec![
+                            string_attribute("ai.operationId", "chat"),
+                            string_attribute("ai.model.id", "gpt-4.1"),
+                            int_attribute("ai.usage.promptTokens", 100),
+                            int_attribute("ai.usage.completionTokens", 25),
+                            string_attribute("ai.usage.cachedInputTokens", "not-a-number"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert_eq!(
+            records
+                .token_usage
+                .iter()
+                .map(|record| (record.measure, record.token_count))
+                .collect::<Vec<_>>(),
+            vec![
+                (TokenMeasure::Input, TokenCount::new(100)),
+                (TokenMeasure::Output, TokenCount::new(25)),
+            ]
+        );
         Ok(())
     }
 
@@ -6544,7 +6670,7 @@ mod tests {
     }
 
     #[test]
-    fn json_opencode_content_logs_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
+    fn json_opencode_content_logs_are_captured() -> Result<(), Box<dyn std::error::Error>> {
         let payload = br#"{
             "resourceLogs": [{
                 "resource": {
@@ -6574,6 +6700,21 @@ mod tests {
                             "attributes": [
                                 { "key": "content.type", "value": { "stringValue": "assistant_message" } }
                             ]
+                        },
+                        {
+                            "timeUnixNano": "1781956802000000000",
+                            "eventName": "opencode.content",
+                            "body": {
+                                "kvlistValue": {
+                                    "values": [
+                                        { "key": "path", "value": { "stringValue": "src/lib.rs" } }
+                                    ]
+                                }
+                            },
+                            "attributes": [
+                                { "key": "content.opt_in", "value": { "boolValue": true } },
+                                { "key": "content.type", "value": { "stringValue": "tool_input" } }
+                            ]
                         }
                     ]
                 }]
@@ -6582,7 +6723,15 @@ mod tests {
 
         let records = parse_otlp_json_usage_logs(payload)?;
 
-        assert!(records.content.is_empty());
+        assert_eq!(records.content.len(), 2);
+        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
+        assert_eq!(records.content[0].content.as_str(), "stored assistant text");
+        assert_eq!(records.content[1].kind, ContentKind::ToolInput);
+        assert_eq!(
+            records.content[1].content.as_str(),
+            r#"{"path":"src/lib.rs"}"#
+        );
 
         Ok(())
     }
@@ -6874,7 +7023,7 @@ mod tests {
     }
 
     #[test]
-    fn protobuf_opencode_content_logs_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
+    fn protobuf_opencode_content_logs_are_captured() -> Result<(), Box<dyn std::error::Error>> {
         let payload = protobuf_logs_payload_with_resource_attributes(
             vec![
                 string_attribute("service.name", "opencode"),
@@ -6926,13 +7075,15 @@ mod tests {
                     severity_number: 0,
                     severity_text: String::new(),
                     body: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(
-                            "authorization: bearer secret".to_owned(),
+                        value: Some(any_value::Value::KvlistValue(
+                            opentelemetry_proto::tonic::common::v1::KeyValueList {
+                                values: vec![string_attribute("path", "src/lib.rs")],
+                            },
                         )),
                     }),
                     attributes: vec![
                         bool_attribute("content.opt_in", true),
-                        string_attribute("content.type", "raw_api_request"),
+                        string_attribute("content.type", "tool_input"),
                     ],
                     dropped_attributes_count: 0,
                     flags: 0,
@@ -6945,7 +7096,15 @@ mod tests {
 
         let records = parse_otlp_protobuf_usage_logs(&payload)?;
 
-        assert!(records.content.is_empty());
+        assert_eq!(records.content.len(), 2);
+        assert_eq!(records.content[0].harness, HarnessName::new("opencode"));
+        assert_eq!(records.content[0].kind, ContentKind::AssistantMessage);
+        assert_eq!(records.content[0].content.as_str(), "stored assistant text");
+        assert_eq!(records.content[1].kind, ContentKind::ToolInput);
+        assert_eq!(
+            records.content[1].content.as_str(),
+            r#"{"path":"src/lib.rs"}"#
+        );
 
         Ok(())
     }
