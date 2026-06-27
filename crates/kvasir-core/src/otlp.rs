@@ -2137,6 +2137,9 @@ fn proto_opencode_content_records(
     let Some(occurred_at) = TimestampMillis::try_from_unix_nanos(span.end_time_unix_nano) else {
         return Ok(Vec::new());
     };
+    if occurred_at.value() == 0 {
+        return Ok(Vec::new());
+    }
     let trace_id = match canonical_proto_trace_id(span.trace_id.clone()) {
         Ok(trace_id) => trace_id,
         Err(OtlpError::MissingTraceId | OtlpError::InvalidTraceId) => return Ok(Vec::new()),
@@ -2212,6 +2215,9 @@ fn json_opencode_content_records(
     let Some(occurred_at) = TimestampMillis::try_from_unix_nanos(occurred_at_nanos) else {
         return Ok(Vec::new());
     };
+    if occurred_at.value() == 0 {
+        return Ok(Vec::new());
+    }
     let trace_id = match canonical_json_trace_id(span.get("traceId").and_then(Value::as_str)) {
         Ok(trace_id) => trace_id,
         Err(OtlpError::MissingTraceId | OtlpError::InvalidTraceId) => return Ok(Vec::new()),
@@ -4206,6 +4212,90 @@ mod tests {
         );
         assert_eq!(records.content[3].kind, ContentKind::ToolOutput);
         assert_eq!(records.content[3].content.as_str(), "pub mod store;");
+        Ok(())
+    }
+
+    #[test]
+    fn json_opencode_trace_content_ignores_zero_end_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "opencode" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "opencode.generate",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "0",
+                        "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "prompt-7" } },
+                            { "key": "ai.operationId", "value": { "stringValue": "chat" } },
+                            { "key": "ai.prompt.messages", "value": { "stringValue": "show src/lib.rs" } }
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+
+        let records = parse_otlp_json_traces(payload.as_bytes())?;
+
+        assert!(records.content.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn protobuf_opencode_trace_content_ignores_zero_end_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", "opencode"),
+                        string_attribute("session.id", "session-12"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "opencode.generate".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 0,
+                        attributes: vec![
+                            string_attribute("message.id", "prompt-7"),
+                            string_attribute("ai.operationId", "chat"),
+                            string_attribute("ai.prompt.messages", "show src/lib.rs"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        let records = parse_otlp_protobuf_traces(&payload)?;
+
+        assert!(records.content.is_empty());
         Ok(())
     }
 
