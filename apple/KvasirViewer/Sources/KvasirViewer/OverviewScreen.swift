@@ -6,6 +6,13 @@ import KvasirViewerCore
 struct OverviewScreen: View {
     @ObservedObject var model: KvasirViewerModel
 
+    static func showsTraceInspectorDashboard(
+        isTraceInspectorEnabled: Bool,
+        selectedPrompt: OverviewPromptRoute?
+    ) -> Bool {
+        isTraceInspectorEnabled && selectedPrompt != nil
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -103,7 +110,10 @@ struct OverviewScreen: View {
                         moreAvailable: snapshot.promptBreakdownMoreAvailable,
                         showsToolCalls: snapshot.selectedModel == nil
                     )
-                    if model.selectedPrompt != nil {
+                    if Self.showsTraceInspectorDashboard(
+                        isTraceInspectorEnabled: model.isTraceInspectorEnabled,
+                        selectedPrompt: model.selectedPrompt
+                    ) {
                         traceInspectorDashboard(
                             model.traceInspectorSnapshot,
                             errorMessage: model.traceInspectorErrorMessage

@@ -190,15 +190,20 @@ fn load_kvasir_content_replay_from_source(
     ) -> Result<KvasirContentReplay, KvasirClientError>,
 ) -> Result<KvasirContentReplay, KvasirClientError> {
     let bearer_token = resolve_kvasir_bearer_token_from_source(config, environment_token)?;
-    content_replay(
-        socket_path,
-        KvasirContentQuery {
-            harness: query.harness,
-            session_id: query.session_id,
-            prompt_id: query.prompt_id,
-            bearer_token,
-        },
-    )
+    let query = content_replay_query_with_token(query, bearer_token);
+    content_replay(socket_path, query)
+}
+
+fn content_replay_query_with_token(
+    query: KvasirContentReplayQuery,
+    bearer_token: KvasirBearerToken,
+) -> KvasirContentQuery {
+    KvasirContentQuery {
+        harness: query.harness,
+        session_id: query.session_id,
+        prompt_id: query.prompt_id,
+        bearer_token,
+    }
 }
 
 #[cfg(test)]
@@ -833,6 +838,8 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let config = full_harness_setup_config(temp.path());
         let socket_path = KvasirSocketPath::try_from("/tmp/kvasird.sock".to_owned())?;
+        let token_reads = Rc::new(Cell::new(0));
+        let replay_calls = Rc::new(Cell::new(0));
         let replay = KvasirContentReplay {
             session_id: KvasirSessionId::try_from("opencode-session-1".to_owned())?,
             prompt_id: KvasirPromptId::try_from("opencode-turn-1".to_owned())?,
@@ -850,8 +857,15 @@ mod tests {
                 session_id: KvasirSessionId::try_from("opencode-session-1".to_owned())?,
                 prompt_id: KvasirPromptId::try_from("opencode-turn-1".to_owned())?,
             },
-            || Some("operator-token".to_owned()),
+            {
+                let token_reads = Rc::clone(&token_reads);
+                move || {
+                    token_reads.set(token_reads.get() + 1);
+                    Some("operator-token".to_owned())
+                }
+            },
             |received_socket_path, received_query| {
+                replay_calls.set(replay_calls.get() + 1);
                 assert_eq!(received_socket_path, socket_path);
                 assert_eq!(
                     received_query.harness,
@@ -871,6 +885,8 @@ mod tests {
         )?;
 
         assert_eq!(loaded, replay);
+        assert_eq!(token_reads.get(), 1);
+        assert_eq!(replay_calls.get(), 1);
         Ok(())
     }
 

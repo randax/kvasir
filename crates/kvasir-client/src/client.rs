@@ -52,9 +52,9 @@ const OVERVIEW_REFRESH_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 impl KvasirClient {
     #[uniffi::constructor]
     pub fn connect(socket_path: KvasirSocketPath) -> Result<Self, KvasirClientError> {
-        let socket_path = PathBuf::from(socket_path.into_string());
-        connect_with_retries(&socket_path)?;
-        Ok(Self { socket_path })
+        Ok(Self {
+            socket_path: PathBuf::from(socket_path.into_string()),
+        })
     }
 
     pub fn token_rollups(

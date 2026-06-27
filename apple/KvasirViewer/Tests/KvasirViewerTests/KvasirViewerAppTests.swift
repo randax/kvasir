@@ -61,6 +61,31 @@ func productionFactoryUsesInjectedTraceInspectorClientForPromptDrillDown() async
     #expect(model.errorMessage == nil)
 }
 
+@MainActor
+@Test
+func overviewScreenShowsTraceInspectorOnlyWhenEnabledAndPromptSelected() {
+    let prompt = OverviewPromptRoute(
+        session: OverviewSessionRoute(
+            harness: OverviewHarnessName("opencode"),
+            sessionID: OverviewSessionID("opencode-session-1")
+        ),
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+
+    #expect(OverviewScreen.showsTraceInspectorDashboard(
+        isTraceInspectorEnabled: true,
+        selectedPrompt: prompt
+    ))
+    #expect(!OverviewScreen.showsTraceInspectorDashboard(
+        isTraceInspectorEnabled: false,
+        selectedPrompt: prompt
+    ))
+    #expect(!OverviewScreen.showsTraceInspectorDashboard(
+        isTraceInspectorEnabled: true,
+        selectedPrompt: nil
+    ))
+}
+
 @Test
 func overviewScreenCostPresentationCarriesVisibleEstimateMarkers() {
     let snapshot = OverviewSnapshot(
