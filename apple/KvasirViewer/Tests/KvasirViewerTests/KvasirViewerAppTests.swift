@@ -569,8 +569,9 @@ func harnessTelemetrySetupConfigHonorsDaemonEnvironmentOverrides() {
 @MainActor
 @Test
 func viewerStartupShowsFriendlyHarnessTelemetryWarningAndContinues() async throws {
-    let rawError = RawHarnessTelemetrySetupError()
-    let warning = HarnessTelemetrySetupWarning(reason: .invalidClaudeSettings)
+    let setupWarningReason = HarnessTelemetrySetupWarning.Reason.invalidClaudeSettings
+    let rawError = RawHarnessTelemetrySetupError(reason: setupWarningReason)
+    let expectedWarning = HarnessTelemetrySetupWarning(reason: setupWarningReason)
     let primary = SequenceOverviewClient(results: [
         .success(overviewSnapshot(totalTokens: 12))
     ])
@@ -580,7 +581,10 @@ func viewerStartupShowsFriendlyHarnessTelemetryWarningAndContinues() async throw
             config: ProductionModelFactory.resolvedHarnessTelemetrySetupConfig(environment: [:]),
             configure: { _ in throw rawError },
             warningForError: { error in
-                error.localizedDescription == rawError.localizedDescription ? warning : nil
+                guard let error = error as? RawHarnessTelemetrySetupError else {
+                    return nil
+                }
+                return HarnessTelemetrySetupWarning(reason: error.reason)
             }
         ),
         launchAgent: DaemonLaunchAgent(registry: RecordingLaunchAgentRegistry(status: .enabled))
@@ -588,7 +592,10 @@ func viewerStartupShowsFriendlyHarnessTelemetryWarningAndContinues() async throw
 
     try await model.start()
 
-    #expect(model.setupWarningMessage == warning.localizedDescription)
+    #expect(
+        model.setupWarningMessage
+            == expectedWarning.localizedDescription
+    )
     #expect(model.setupWarningMessage != rawError.localizedDescription)
     #expect(await primary.loadCount == 1)
     #expect(model.overviewSnapshot?.totals.totalTokens == 12)
@@ -936,6 +943,16 @@ func bundledDaemonEnvironmentPreservesExistingHome() {
     #expect(environment["HOME"] == "/custom/home")
 }
 
+@Test
+func bundledDaemonKillPatternMatchesOnlyExactDaemonPath() {
+    let daemonURL = URL(fileURLWithPath: "/tmp/Kvasir.app/Contents/MacOS/kvasird")
+    let pattern = BundledDaemonProcess.daemonCommandPattern(for: daemonURL)
+
+    #expect("/tmp/Kvasir.app/Contents/MacOS/kvasird".range(of: pattern, options: .regularExpression) != nil)
+    #expect("/tmp/Kvasir.app/Contents/MacOS/kvasird --flag".range(of: pattern, options: .regularExpression) == nil)
+    #expect("/other/Kvasir.app/Contents/MacOS/kvasird".range(of: pattern, options: .regularExpression) == nil)
+}
+
 private enum DaemonFallbackTestError: Error, Equatable {
     case recoverable
     case nonrecoverable
@@ -991,7 +1008,9 @@ private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked
     }
 }
 
-private struct RawHarnessTelemetrySetupError: LocalizedError {
+private struct RawHarnessTelemetrySetupError: LocalizedError, Sendable {
+    let reason: HarnessTelemetrySetupWarning.Reason
+
     var errorDescription: String? {
         "Kvasir_client.KvasirClientError:harnessTelemetrySetup RPC serialization error"
     }

@@ -99,6 +99,7 @@ final class BundledDaemonProcess: DaemonProcessStarter, @unchecked Sendable {
         }
 
         let daemonURL = try Self.daemonURL()
+        Self.terminateExistingDaemon(at: daemonURL)
         let process = Process()
         process.executableURL = daemonURL
         process.environment = daemonEnvironment()
@@ -115,6 +116,18 @@ final class BundledDaemonProcess: DaemonProcessStarter, @unchecked Sendable {
             throw BundledDaemonProcessError.missingDaemon(url.path)
         }
         return url
+    }
+
+    private static func terminateExistingDaemon(at daemonURL: URL) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        process.arguments = ["-f", daemonCommandPattern(for: daemonURL)]
+        try? process.run()
+        process.waitUntilExit()
+    }
+
+    static func daemonCommandPattern(for daemonURL: URL) -> String {
+        "^\(NSRegularExpression.escapedPattern(for: daemonURL.path))$"
     }
 
     private func daemonEnvironment() -> [String: String] {
