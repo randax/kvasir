@@ -219,20 +219,14 @@ public final class KvasirViewerModel: ObservableObject {
         guard liveOverviewUpdates == nil else {
             return
         }
-        liveOverviewUpdates = Task { [weak self] in
-            guard let self else {
-                return
-            }
-            var isFirstUpdateEvent = true
-            for await update in dashboard.overviewUpdateEvents() {
+        liveOverviewUpdates = Task { [weak self, dashboard] in
+            for await _ in dashboard.overviewRefreshEvents() {
+                guard let self else {
+                    return
+                }
                 guard !Task.isCancelled else {
                     return
                 }
-                if isFirstUpdateEvent, update == .initial {
-                    isFirstUpdateEvent = false
-                    continue
-                }
-                isFirstUpdateEvent = false
                 do {
                     try await refreshOverview()
                 } catch {

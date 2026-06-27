@@ -5,7 +5,10 @@ mod setup;
 mod transport;
 mod types;
 
-pub use client::{KvasirClient, KvasirTokenRollupSubscription, KvasirUsageUpdateSubscription};
+pub use client::{
+    KvasirClient, KvasirOverviewRefreshSubscription, KvasirTokenRollupSubscription,
+    KvasirUsageUpdateSubscription,
+};
 pub use error::KvasirClientError;
 pub use setup::{
     KvasirClaudeSettingsPath, KvasirCodexConfigPath, KvasirHarnessTelemetrySetup,

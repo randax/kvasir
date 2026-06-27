@@ -101,34 +101,26 @@ func failedLiveOverviewUpdateKeepsSnapshotAndListenerRecovers() async throws {
 
 @MainActor
 @Test
-func initialLiveOverviewBootstrapAfterRefreshDoesNotReloadUntilReconnect() async throws {
+func liveOverviewListenerDoesNotRetainModel() async throws {
     let updateSource = ManualOverviewUpdateSource()
     let client = RecordingResultOverviewClient(
         results: [
-            .success(overviewSnapshot(totalTokens: 35)),
-            .success(overviewSnapshot(totalTokens: 42))
+            .success(overviewSnapshot(totalTokens: 35))
         ]
     )
-    let model = KvasirViewerModel(
+    var model: KvasirViewerModel? = KvasirViewerModel(
         dashboard: OverviewDashboard(client: client, updateSource: updateSource),
         launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
     )
+    let releasedModel = WeakKvasirViewerModelReference(model)
 
-    try await model.start()
-    updateSource.send(.initial)
-    for _ in 0..<10 {
-        await Task.yield()
-    }
+    try await model?.start()
+    #expect(releasedModel.model?.overviewSnapshot?.totals.totalTokens == 35)
 
-    #expect(client.queries.count == 1)
-    #expect(model.overviewSnapshot?.totals.totalTokens == 35)
-    #expect(model.errorMessage == nil)
+    model = nil
+    await waitUntil(releasedModel.model == nil)
 
-    updateSource.send(.initial)
-    await client.waitForQueries(count: 2)
-    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
-
-    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+    #expect(releasedModel.model == nil)
 }
 
 @MainActor
@@ -1006,22 +998,30 @@ private final class RecordingOverviewRecoveryGate: @unchecked Sendable {
     }
 }
 
+private final class WeakKvasirViewerModelReference {
+    weak var model: KvasirViewerModel?
+
+    init(_ model: KvasirViewerModel?) {
+        self.model = model
+    }
+}
+
 private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
-    private let continuation: AsyncStream<OverviewUpdateKind>.Continuation
-    private let stream: AsyncStream<OverviewUpdateKind>
+    private let continuation: AsyncStream<Void>.Continuation
+    private let stream: AsyncStream<Void>
 
     init() {
-        var continuation: AsyncStream<OverviewUpdateKind>.Continuation!
+        var continuation: AsyncStream<Void>.Continuation!
         stream = AsyncStream { continuation = $0 }
         self.continuation = continuation
     }
 
-    func overviewUpdateEvents() -> AsyncStream<OverviewUpdateKind> {
+    func overviewRefreshEvents() -> AsyncStream<Void> {
         stream
     }
 
-    func send(_ update: OverviewUpdateKind = .changed) {
-        continuation.yield(update)
+    func send() {
+        continuation.yield(())
     }
 }
 

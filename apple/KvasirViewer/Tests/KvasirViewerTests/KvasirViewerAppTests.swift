@@ -660,21 +660,21 @@ private actor SequenceOverviewClient: OverviewClient {
 }
 
 private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
-    private let continuation: AsyncStream<OverviewUpdateKind>.Continuation
-    private let stream: AsyncStream<OverviewUpdateKind>
+    private let continuation: AsyncStream<Void>.Continuation
+    private let stream: AsyncStream<Void>
 
     init() {
-        var continuation: AsyncStream<OverviewUpdateKind>.Continuation!
+        var continuation: AsyncStream<Void>.Continuation!
         stream = AsyncStream { continuation = $0 }
         self.continuation = continuation
     }
 
-    func overviewUpdateEvents() -> AsyncStream<OverviewUpdateKind> {
+    func overviewRefreshEvents() -> AsyncStream<Void> {
         stream
     }
 
-    func send(_ update: OverviewUpdateKind = .changed) {
-        continuation.yield(update)
+    func send() {
+        continuation.yield(())
     }
 }
 

@@ -19,26 +19,19 @@ struct KvasirClientRollupSource: OverviewRollupSource {
 struct KvasirClientUsageUpdateSource: OverviewUpdateSource {
     let socketPath: String
 
-    func overviewUpdateEvents() -> AsyncStream<OverviewUpdateKind> {
+    func overviewRefreshEvents() -> AsyncStream<Void> {
         AsyncStream { continuation in
-            let subscriptionBox = KvasirUsageUpdateSubscriptionBox()
+            let subscriptionBox = KvasirOverviewRefreshSubscriptionBox()
             let task = Task.detached(priority: .background) {
-                while !Task.isCancelled {
-                    do {
-                        let client = try KvasirClient.connect(socketPath: socketPath)
-                        let subscription = try client.subscribeUsageUpdates()
-                        subscriptionBox.replace(with: subscription)
-                        while !Task.isCancelled {
-                            let update = try subscription.next()
-                            continuation.yield(update.overviewUpdateKind)
-                        }
-                    } catch {
-                        subscriptionBox.clear()
-                        guard !Task.isCancelled else {
-                            break
-                        }
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                do {
+                    let subscription = try KvasirOverviewRefreshSubscription.connect(socketPath: socketPath)
+                    subscriptionBox.replace(with: subscription)
+                    while !Task.isCancelled {
+                        try subscription.next()
+                        continuation.yield(())
                     }
+                } catch {
+                    subscriptionBox.clear()
                 }
                 continuation.finish()
             }
@@ -50,22 +43,11 @@ struct KvasirClientUsageUpdateSource: OverviewUpdateSource {
     }
 }
 
-private extension KvasirUsageUpdateKind {
-    var overviewUpdateKind: OverviewUpdateKind {
-        switch self {
-        case .initial:
-            return .initial
-        case .changed:
-            return .changed
-        }
-    }
-}
-
-private final class KvasirUsageUpdateSubscriptionBox: @unchecked Sendable {
+private final class KvasirOverviewRefreshSubscriptionBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var subscription: KvasirUsageUpdateSubscription?
+    private var subscription: KvasirOverviewRefreshSubscription?
 
-    func replace(with subscription: KvasirUsageUpdateSubscription) {
+    func replace(with subscription: KvasirOverviewRefreshSubscription) {
         lock.withLock {
             self.subscription = subscription
         }

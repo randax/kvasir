@@ -621,13 +621,8 @@ public protocol OverviewClient: Sendable {
     func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot
 }
 
-public enum OverviewUpdateKind: Equatable, Sendable {
-    case initial
-    case changed
-}
-
 public protocol OverviewUpdateSource: Sendable {
-    func overviewUpdateEvents() -> AsyncStream<OverviewUpdateKind>
+    func overviewRefreshEvents() -> AsyncStream<Void>
 }
 
 public struct OverviewDashboard: Sendable {
@@ -659,12 +654,12 @@ public struct OverviewDashboard: Sendable {
         return try await client.loadOverviewSnapshot(query: query)
     }
 
-    public func overviewUpdateEvents() -> AsyncStream<OverviewUpdateKind> {
+    public func overviewRefreshEvents() -> AsyncStream<Void> {
         guard let updateSource else {
             return AsyncStream { continuation in
                 continuation.finish()
             }
         }
-        return updateSource.overviewUpdateEvents()
+        return updateSource.overviewRefreshEvents()
     }
 }
