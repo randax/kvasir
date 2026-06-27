@@ -18,7 +18,7 @@ use axum::routing::post;
 use kvasir_core::rpc::{
     BearerToken, ContentQuery, ContentReplay, CostRollup, CostRollupQuery, OverviewRollup,
     RollupQuery, RpcError, RpcRequest, RpcResponse, RpcStreamEvent, TokenRollup, ToolCallRollup,
-    ToolCallRollupQuery, Trace, TraceQuery,
+    ToolCallRollupQuery, Trace, TraceQuery, UsageUpdateKind,
 };
 use kvasir_core::{
     PriceTable, RawBodyImportFailure, RawBodyImportFailureKind, RawBodyImportPreparation,
@@ -289,6 +289,7 @@ struct DaemonState {
     store: Arc<Mutex<UsageStore>>,
     bearer_token: BearerToken,
     raw_body_directory: PathBuf,
+    overview_updates: broadcast::Sender<()>,
     usage_updates: broadcast::Sender<()>,
     shutdown: broadcast::Sender<()>,
 }
@@ -310,12 +311,14 @@ pub async fn start_with_store_key_source(
         config.price_table.clone(),
     )?;
     let raw_body_directory = prepare_raw_body_directory(&config.database_path)?;
+    let (overview_updates, _overview_update_receiver) = broadcast::channel(32);
     let (usage_updates, _usage_update_receiver) = broadcast::channel(32);
     let (shutdown, _shutdown_receiver) = broadcast::channel(1);
     let state = DaemonState {
         store: Arc::new(Mutex::new(store)),
         bearer_token: config.bearer_token,
         raw_body_directory,
+        overview_updates,
         usage_updates,
         shutdown: shutdown.clone(),
     };
@@ -696,7 +699,7 @@ async fn ingest_otlp(
             .map_err(|_| IngestError::StoreWriteFailed)?;
     }
     import_available_raw_bodies(&state).await?;
-    let _ = state.usage_updates.send(());
+    let _ = state.overview_updates.send(());
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -940,7 +943,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::SubscribeTokenRollup { query }) => {
-            let mut updates = state.usage_updates.subscribe();
+            let mut updates = state.overview_updates.subscribe();
             let mut shutdown = state.shutdown.subscribe();
             let mut disconnect_probe = [0_u8; 1];
             let mut last_event = None;
@@ -972,6 +975,46 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                                     last_event.as_ref(),
                                 ).await {
                                     Ok(StreamWriteOutcome::Written(event)) => last_event = Some(event),
+                                    Ok(StreamWriteOutcome::Unchanged) => {}
+                                    Ok(StreamWriteOutcome::Shutdown) | Err(_) => return Ok(()),
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(RpcRequest::SubscribeUsageUpdates) => {
+            let mut updates = state.overview_updates.subscribe();
+            let mut shutdown = state.shutdown.subscribe();
+            let mut disconnect_probe = [0_u8; 1];
+            match write_usage_update_event(&mut writer, &mut shutdown, UsageUpdateKind::Initial)
+                .await?
+            {
+                StreamWriteOutcome::Written(_) => {}
+                StreamWriteOutcome::Unchanged => {}
+                StreamWriteOutcome::Shutdown => return Ok(()),
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => return Ok(()),
+                    disconnected = reader.read(&mut disconnect_probe) => {
+                        match disconnected {
+                            Ok(0) | Err(_) => return Ok(()),
+                            Ok(_) => return Ok(()),
+                        }
+                    }
+                    update = updates.recv() => {
+                        match update {
+                            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                match write_usage_update_event(
+                                    &mut writer,
+                                    &mut shutdown,
+                                    UsageUpdateKind::Changed,
+                                ).await {
+                                    Ok(StreamWriteOutcome::Written(_)) => {}
                                     Ok(StreamWriteOutcome::Unchanged) => {}
                                     Ok(StreamWriteOutcome::Shutdown) | Err(_) => return Ok(()),
                                 }
@@ -1087,6 +1130,19 @@ where
         event_bytes = serde_json::to_vec(&bounded_error)?;
         return write_rpc_stream_event(writer, shutdown, bounded_error, event_bytes).await;
     }
+    write_rpc_stream_event(writer, shutdown, event, event_bytes).await
+}
+
+async fn write_usage_update_event<W>(
+    writer: &mut W,
+    shutdown: &mut broadcast::Receiver<()>,
+    kind: UsageUpdateKind,
+) -> anyhow::Result<StreamWriteOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    let event = RpcStreamEvent::UsageUpdate { kind };
+    let event_bytes = serde_json::to_vec(&event)?;
     write_rpc_stream_event(writer, shutdown, event, event_bytes).await
 }
 

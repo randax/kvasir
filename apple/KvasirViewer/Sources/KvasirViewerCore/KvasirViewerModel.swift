@@ -55,6 +55,7 @@ public final class KvasirViewerModel: ObservableObject {
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
+    private var liveOverviewUpdates: Task<Void, Never>?
 
     public init(
         dashboard: OverviewDashboard,
@@ -201,6 +202,7 @@ public final class KvasirViewerModel: ObservableObject {
             beforeCommit()
             overviewSnapshot = snapshot
             errorMessage = nil
+            startLiveOverviewUpdatesIfNeeded()
         } catch {
             guard loadID == overviewLoadID else {
                 return
@@ -211,6 +213,37 @@ public final class KvasirViewerModel: ObservableObject {
 
     public func record(error: any Error) {
         errorMessage = error.localizedDescription
+    }
+
+    private func startLiveOverviewUpdatesIfNeeded() {
+        guard liveOverviewUpdates == nil else {
+            return
+        }
+        liveOverviewUpdates = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            var isFirstUpdateEvent = true
+            for await update in dashboard.overviewUpdateEvents() {
+                guard !Task.isCancelled else {
+                    return
+                }
+                if isFirstUpdateEvent, update == .initial {
+                    isFirstUpdateEvent = false
+                    continue
+                }
+                isFirstUpdateEvent = false
+                do {
+                    try await refreshOverview()
+                } catch {
+                    record(error: error)
+                }
+            }
+        }
+    }
+
+    deinit {
+        liveOverviewUpdates?.cancel()
     }
 }
 

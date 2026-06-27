@@ -744,6 +744,7 @@ pub enum RpcRequest {
     SubscribeTokenRollup {
         query: RollupQuery,
     },
+    SubscribeUsageUpdates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -762,7 +763,15 @@ pub enum RpcResponse {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcStreamEvent {
     TokenRollup { rollups: Vec<TokenRollup> },
+    UsageUpdate { kind: UsageUpdateKind },
     Error { error: RpcError },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageUpdateKind {
+    Initial,
+    Changed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -880,6 +889,42 @@ mod tests {
                         "output_tokens": 500u64,
                         "cache_tokens": 100u64
                     }]
+                }
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn usage_update_subscription_rpc_contract_is_typed() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            serde_json::to_value(RpcRequest::SubscribeUsageUpdates)?,
+            json!({
+                "type": "subscribe_usage_updates"
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RpcStreamEvent::UsageUpdate {
+                kind: UsageUpdateKind::Initial
+            })?,
+            json!({
+                "type": "usage_update",
+                "payload": {
+                    "kind": "initial"
+                }
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RpcStreamEvent::UsageUpdate {
+                kind: UsageUpdateKind::Changed
+            })?,
+            json!({
+                "type": "usage_update",
+                "payload": {
+                    "kind": "changed"
                 }
             })
         );

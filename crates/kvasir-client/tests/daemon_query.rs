@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
@@ -19,7 +20,7 @@ use kvasir_client::{
     KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
     KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
     KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind,
+    KvasirTraceSpanKind, KvasirUsageUpdateKind,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::{BearerToken, RpcResponse};
@@ -2139,6 +2140,118 @@ async fn client_subscription_delivers_live_token_rollup_updates() -> anyhow::Res
             },],
         }
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_subscription_delivers_live_usage_update_notifications() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (first_update_sender, first_update_receiver) = tokio::sync::oneshot::channel();
+    let subscription_task = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        let subscription = client.subscribe_usage_updates()?;
+        assert_eq!(subscription.next()?, KvasirUsageUpdateKind::Initial);
+        ready_sender.send(()).expect("test receiver is alive");
+        assert_eq!(subscription.next()?, KvasirUsageUpdateKind::Changed);
+        first_update_sender
+            .send(())
+            .expect("test receiver is alive");
+        assert_eq!(subscription.next()?, KvasirUsageUpdateKind::Changed);
+        Ok::<(), KvasirClientError>(())
+    });
+
+    match tokio::time::timeout(Duration::from_secs(2), ready_receiver).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if subscription_task.is_finished() => {
+            let result = subscription_task.await?;
+            return Err(anyhow::anyhow!(
+                "subscription task ended before readiness: {result:?}; receiver: {err}"
+            ));
+        }
+        Ok(Err(err)) => return Err(err.into()),
+        Err(err) if subscription_task.is_finished() => {
+            let result = subscription_task.await?;
+            return Err(anyhow::anyhow!(
+                "subscription task ended before readiness: {result:?}; timeout: {err}"
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(repo_and_other_token_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    tokio::time::timeout(Duration::from_secs(2), first_update_receiver).await??;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(other_repo_token_usage_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    tokio::time::timeout(Duration::from_secs(2), subscription_task).await???;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_update_subscription_close_unblocks_waiting_reader() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    let subscription = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.subscribe_usage_updates().map(Arc::new)
+    })
+    .await??;
+    let reader_subscription = Arc::clone(&subscription);
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let reader_task = tokio::task::spawn_blocking(move || {
+        assert_eq!(reader_subscription.next()?, KvasirUsageUpdateKind::Initial);
+        ready_sender.send(()).expect("test receiver is alive");
+        reader_subscription.next()
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), ready_receiver).await??;
+    subscription.close()?;
+
+    let result = tokio::time::timeout(Duration::from_secs(2), reader_task).await??;
+    assert!(matches!(result, Err(KvasirClientError::SocketIo)));
 
     Ok(())
 }

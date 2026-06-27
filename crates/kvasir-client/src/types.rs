@@ -125,6 +125,12 @@ pub struct KvasirTokenRollupUpdate {
     pub rollups: Vec<KvasirTokenRollup>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirUsageUpdateKind {
+    Initial,
+    Changed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirCostUsd {
     pub nanos: u64,

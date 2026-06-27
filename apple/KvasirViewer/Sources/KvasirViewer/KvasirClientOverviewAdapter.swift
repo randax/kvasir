@@ -16,6 +16,77 @@ struct KvasirClientRollupSource: OverviewRollupSource {
     }
 }
 
+struct KvasirClientUsageUpdateSource: OverviewUpdateSource {
+    let socketPath: String
+
+    func overviewUpdateEvents() -> AsyncStream<OverviewUpdateKind> {
+        AsyncStream { continuation in
+            let subscriptionBox = KvasirUsageUpdateSubscriptionBox()
+            let task = Task.detached(priority: .background) {
+                while !Task.isCancelled {
+                    do {
+                        let client = try KvasirClient.connect(socketPath: socketPath)
+                        let subscription = try client.subscribeUsageUpdates()
+                        subscriptionBox.replace(with: subscription)
+                        while !Task.isCancelled {
+                            let update = try subscription.next()
+                            continuation.yield(update.overviewUpdateKind)
+                        }
+                    } catch {
+                        subscriptionBox.clear()
+                        guard !Task.isCancelled else {
+                            break
+                        }
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+                subscriptionBox.close()
+            }
+        }
+    }
+}
+
+private extension KvasirUsageUpdateKind {
+    var overviewUpdateKind: OverviewUpdateKind {
+        switch self {
+        case .initial:
+            return .initial
+        case .changed:
+            return .changed
+        }
+    }
+}
+
+private final class KvasirUsageUpdateSubscriptionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var subscription: KvasirUsageUpdateSubscription?
+
+    func replace(with subscription: KvasirUsageUpdateSubscription) {
+        lock.withLock {
+            self.subscription = subscription
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            subscription = nil
+        }
+    }
+
+    func close() {
+        let subscription = lock.withLock {
+            let subscription = self.subscription
+            self.subscription = nil
+            return subscription
+        }
+        try? subscription?.close()
+    }
+}
+
 func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
     KvasirRollupQuery(
         start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),

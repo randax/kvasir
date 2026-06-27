@@ -1,4 +1,5 @@
 use std::io::BufReader;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -11,6 +12,7 @@ use crate::types::{
     KvasirContentQuery, KvasirContentReplay, KvasirCostRollup, KvasirOverviewRollup,
     KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
     KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
+    KvasirUsageUpdateKind,
 };
 
 #[derive(Debug, uniffi::Object)]
@@ -21,6 +23,12 @@ pub struct KvasirClient {
 #[derive(uniffi::Object)]
 pub struct KvasirTokenRollupSubscription {
     reader: Mutex<BufReader<UnixStream>>,
+}
+
+#[derive(uniffi::Object)]
+pub struct KvasirUsageUpdateSubscription {
+    reader: Mutex<Option<BufReader<UnixStream>>>,
+    shutdown_stream: Mutex<Option<UnixStream>>,
 }
 
 #[uniffi::export]
@@ -192,6 +200,24 @@ impl KvasirClient {
             reader: Mutex::new(BufReader::new(stream)),
         })
     }
+
+    pub fn subscribe_usage_updates(
+        &self,
+    ) -> Result<KvasirUsageUpdateSubscription, KvasirClientError> {
+        let mut stream = connect_with_retries(&self.socket_path)?;
+        let mut request_bytes = serde_json::to_vec(&RpcRequest::SubscribeUsageUpdates)
+            .map_err(|_| KvasirClientError::RpcSerialization)?;
+        request_bytes.push(b'\n');
+        std::io::Write::write_all(&mut stream, &request_bytes)
+            .map_err(|_| KvasirClientError::SocketIo)?;
+        let shutdown_stream = stream
+            .try_clone()
+            .map_err(|_| KvasirClientError::SocketIo)?;
+        Ok(KvasirUsageUpdateSubscription {
+            reader: Mutex::new(Some(BufReader::new(stream))),
+            shutdown_stream: Mutex::new(Some(shutdown_stream)),
+        })
+    }
 }
 
 #[uniffi::export]
@@ -209,7 +235,39 @@ impl KvasirTokenRollupSubscription {
                     .map(KvasirTokenRollup::try_from)
                     .collect::<Result<Vec<_>, _>>()?,
             }),
+            RpcStreamEvent::UsageUpdate { .. } => Err(KvasirClientError::WrongResponseType),
             RpcStreamEvent::Error { error } => Err(error.into()),
         }
+    }
+}
+
+#[uniffi::export]
+impl KvasirUsageUpdateSubscription {
+    pub fn next(&self) -> Result<KvasirUsageUpdateKind, KvasirClientError> {
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| KvasirClientError::SocketIo)?;
+        let reader = reader.as_mut().ok_or(KvasirClientError::SocketIo)?;
+        let event = read_rpc_stream_event(reader)?;
+        match event {
+            RpcStreamEvent::UsageUpdate { kind } => Ok(match kind {
+                kvasir_core::rpc::UsageUpdateKind::Initial => KvasirUsageUpdateKind::Initial,
+                kvasir_core::rpc::UsageUpdateKind::Changed => KvasirUsageUpdateKind::Changed,
+            }),
+            RpcStreamEvent::TokenRollup { .. } => Err(KvasirClientError::WrongResponseType),
+            RpcStreamEvent::Error { error } => Err(error.into()),
+        }
+    }
+
+    pub fn close(&self) -> Result<(), KvasirClientError> {
+        let mut stream = self
+            .shutdown_stream
+            .lock()
+            .map_err(|_| KvasirClientError::SocketIo)?;
+        if let Some(stream) = stream.take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Ok(())
     }
 }
