@@ -190,7 +190,7 @@ enum ProductionModelFactory {
         guard let clientError = error as? KvasirClientError else {
             return false
         }
-        return clientError == .SocketIo
+        return clientError == .SocketIo || clientError == .RpcSerialization
         #else
         return false
         #endif
@@ -218,28 +218,157 @@ struct HarnessTelemetrySetupConfig: Sendable {
     let otlpEndpoint: String
 }
 
-#if canImport(kvasir_client)
-struct KvasirClientHarnessTelemetrySetup: HarnessTelemetrySetup {
+struct HarnessTelemetrySetupWarning: LocalizedError, Equatable, Sendable {
+    enum Reason: Equatable, Sendable {
+        case invalidClaudeSettings
+        case invalidCodexConfig
+        case invalidOpenCodeConfig
+        case invalidStoredSecret
+        case setupFailed
+        case rollbackFailed
+        case stateUnknown
+        case uninstallConflict
+        case filesystem
+        case rpcSerialization
+        case socketIo
+        case rpcResponseTooLarge
+        case daemonError
+        case wrongResponseType
+        case invalidQuery
+    }
+
+    let reason: Reason
+
+    var errorDescription: String? {
+        switch reason {
+        case .invalidClaudeSettings:
+            "Claude Code settings are not valid JSON. Fix ~/.claude/settings.json and restart Kvasir."
+        case .invalidCodexConfig:
+            "Codex telemetry config could not be updated automatically. Check ~/.codex/config.toml for malformed kvasir managed blocks or conflicting [otel] settings."
+        case .invalidOpenCodeConfig:
+            "OpenCode config is not valid JSON. Fix ~/.config/opencode/opencode.json and restart Kvasir."
+        case .invalidStoredSecret:
+            "Kvasir's stored telemetry setup secret is invalid. Re-run telemetry setup or remove the stale kvasir setup secret."
+        case .setupFailed:
+            "Kvasir could not configure Codex telemetry. Check keychain access and your harness config files, then restart Kvasir."
+        case .rollbackFailed:
+            "Kvasir could not roll back a failed telemetry setup. Check your harness config files before retrying."
+        case .stateUnknown:
+            "Kvasir could not determine whether telemetry setup completed. Check your harness config files before retrying."
+        case .uninstallConflict:
+            "Kvasir telemetry uninstall would overwrite local changes."
+        case .filesystem:
+            "Kvasir could not write telemetry configuration files. Check file permissions for your harness config directories."
+        case .rpcSerialization:
+            "Kvasir could not serialize telemetry setup data. Check generated kvasir-client bindings and rebuild Kvasir.app."
+        case .socketIo:
+            "Kvasir could not connect to the daemon socket."
+        case .rpcResponseTooLarge:
+            "Kvasir daemon returned an unexpectedly large response."
+        case .daemonError:
+            "Kvasir daemon returned an error."
+        case .wrongResponseType:
+            "Kvasir daemon returned an unexpected response."
+        case .invalidQuery:
+            "Kvasir could not build a valid daemon query."
+        }
+    }
+}
+
+struct ConfiguringHarnessTelemetrySetup: HarnessTelemetrySetup {
     let config: HarnessTelemetrySetupConfig
+    let configure: @Sendable (HarnessTelemetrySetupConfig) throws -> Void
+    let warningForError: @Sendable (any Error) -> HarnessTelemetrySetupWarning?
 
     func ensureConfigured() async throws {
+        let config = config
+        let configure = configure
+        let warningForError = warningForError
         try await Task.detached(priority: .userInitiated) {
-            try configureKvasirHarnessTelemetry(
-                config: KvasirHarnessTelemetrySetup(
-                    codexConfigPath: config.codexConfigPath,
-                    claudeSettingsPath: config.claudeSettingsPath,
-                    copilotProfilePath: config.copilotProfilePath,
-                    opencodeConfigPath: config.opencodeConfigPath,
-                    opencodeEnvPath: config.opencodeEnvPath,
-                    zshProfilePath: config.zshProfilePath,
-                    bashProfilePath: config.bashProfilePath,
-                    zshRepoHookPath: config.zshRepoHookPath,
-                    bashRepoHookPath: config.bashRepoHookPath,
-                    rawBodyDirectory: config.rawBodyDirectory,
-                    otlpEndpoint: config.otlpEndpoint
-                )
-            )
+            do {
+                try configure(config)
+            } catch {
+                if let warning = warningForError(error) {
+                    throw warning
+                }
+                throw error
+            }
         }.value
+    }
+}
+
+#if canImport(kvasir_client)
+struct KvasirClientHarnessTelemetrySetup: HarnessTelemetrySetup {
+    private let setup: ConfiguringHarnessTelemetrySetup
+
+    init(config: HarnessTelemetrySetupConfig) {
+        setup = ConfiguringHarnessTelemetrySetup(
+            config: config,
+            configure: { config in
+                try configureKvasirHarnessTelemetry(
+                    config: KvasirHarnessTelemetrySetup(
+                        codexConfigPath: config.codexConfigPath,
+                        claudeSettingsPath: config.claudeSettingsPath,
+                        copilotProfilePath: config.copilotProfilePath,
+                        opencodeConfigPath: config.opencodeConfigPath,
+                        opencodeEnvPath: config.opencodeEnvPath,
+                        zshProfilePath: config.zshProfilePath,
+                        bashProfilePath: config.bashProfilePath,
+                        zshRepoHookPath: config.zshRepoHookPath,
+                        bashRepoHookPath: config.bashRepoHookPath,
+                        rawBodyDirectory: config.rawBodyDirectory,
+                        otlpEndpoint: config.otlpEndpoint
+                    )
+                )
+            },
+            warningForError: { error in
+                guard let error = error as? KvasirClientError else {
+                    return nil
+                }
+                return HarnessTelemetrySetupWarning(error: error)
+            }
+        )
+    }
+
+    func ensureConfigured() async throws {
+        try await setup.ensureConfigured()
+    }
+}
+
+extension HarnessTelemetrySetupWarning {
+    init(error: KvasirClientError) {
+        switch error {
+        case .HarnessTelemetryInvalidClaudeSettings:
+            self.init(reason: .invalidClaudeSettings)
+        case .HarnessTelemetryInvalidCodexConfig:
+            self.init(reason: .invalidCodexConfig)
+        case .HarnessTelemetryInvalidOpenCodeConfig:
+            self.init(reason: .invalidOpenCodeConfig)
+        case .HarnessTelemetryInvalidStoredSecret:
+            self.init(reason: .invalidStoredSecret)
+        case .HarnessTelemetrySetup:
+            self.init(reason: .setupFailed)
+        case .HarnessTelemetryRollback:
+            self.init(reason: .rollbackFailed)
+        case .HarnessTelemetryStateUnknown:
+            self.init(reason: .stateUnknown)
+        case .HarnessTelemetryUninstallConflict:
+            self.init(reason: .uninstallConflict)
+        case .Filesystem:
+            self.init(reason: .filesystem)
+        case .RpcSerialization:
+            self.init(reason: .rpcSerialization)
+        case .SocketIo:
+            self.init(reason: .socketIo)
+        case .RpcResponseTooLarge:
+            self.init(reason: .rpcResponseTooLarge)
+        case .DaemonError:
+            self.init(reason: .daemonError)
+        case .WrongResponseType:
+            self.init(reason: .wrongResponseType)
+        case .InvalidQuery:
+            self.init(reason: .invalidQuery)
+        }
     }
 }
 #endif

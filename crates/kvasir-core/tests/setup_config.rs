@@ -331,10 +331,12 @@ view_image = true
 }
 
 #[test]
-fn codex_config_toml_rejects_unmanaged_otel_exporter_assignment() {
-    let err = CodexConfigToml::generate(
+fn codex_config_toml_replaces_unmanaged_otel_assignments() -> Result<(), Box<dyn std::error::Error>>
+{
+    let generated = CodexConfigToml::generate(
         r#"[otel]
 environment = "dev"
+log_user_prompt = false
 exporter = "none"
 "#,
         &SetupConfig::new(
@@ -342,13 +344,81 @@ exporter = "none"
             BearerToken::new("test-token"),
             RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
         ),
-    )
-    .expect_err("unmanaged Codex OTEL keys must not be silently removed");
+    )?;
 
-    assert!(matches!(
-        err,
-        kvasir_core::SetupError::ConflictingCodexOtelKeys
-    ));
+    assert!(generated.as_str().contains("environment = \"dev\""));
+    assert!(generated.as_str().contains("log_user_prompt = true"));
+    assert!(
+        generated
+            .as_str()
+            .contains("endpoint = \"http://127.0.0.1:4318/v1/logs\"")
+    );
+    assert!(!generated.as_str().contains("exporter = \"none\""));
+    Ok(())
+}
+
+#[test]
+fn codex_config_toml_replaces_unmanaged_otel_subtables() -> Result<(), Box<dyn std::error::Error>> {
+    let generated = CodexConfigToml::generate(
+        r#"[otel]
+log_user_prompt = true
+environment = "dev"
+
+[otel.exporter.otlp-http]
+endpoint = "http://old.example/v1/logs"
+protocol = "binary"
+
+[otel.exporter.otlp-http.headers]
+Authorization = "Bearer old-token"
+
+[otel.trace_exporter.otlp-http]
+endpoint = "http://old.example/v1/traces"
+protocol = "binary"
+
+[otel.metrics_exporter.otlp-http]
+endpoint = "http://old.example/v1/metrics"
+protocol = "binary"
+
+[tools]
+view_image = true
+"#,
+        &SetupConfig::new(
+            KvasirEndpoint::new("http://127.0.0.1:4318"),
+            BearerToken::new("test-token"),
+            RawBodyDirectory::new(PathBuf::from("/tmp/kvasir/raw-bodies")),
+        ),
+    )?;
+
+    assert!(generated.as_str().contains("environment = \"dev\""));
+    assert!(generated.as_str().contains("[tools]\nview_image = true"));
+    assert!(
+        generated
+            .as_str()
+            .contains("endpoint = \"http://127.0.0.1:4318/v1/logs\"")
+    );
+    assert!(
+        generated
+            .as_str()
+            .contains("endpoint = \"http://127.0.0.1:4318/v1/traces\"")
+    );
+    assert!(
+        generated
+            .as_str()
+            .contains("endpoint = \"http://127.0.0.1:4318/v1/metrics\"")
+    );
+    assert!(!generated.as_str().contains("[otel.exporter.otlp-http]"));
+    assert!(
+        !generated
+            .as_str()
+            .contains("[otel.trace_exporter.otlp-http]")
+    );
+    assert!(
+        !generated
+            .as_str()
+            .contains("[otel.metrics_exporter.otlp-http]")
+    );
+    assert!(!generated.as_str().contains("old-token"));
+    Ok(())
 }
 
 #[test]

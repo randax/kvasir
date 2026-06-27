@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use kvasir_core::{
-    CodexConfigToml, KvasirEndpoint, RawBodyDirectory, SetupConfig, SetupSecretSource,
+    CodexConfigToml, KvasirEndpoint, RawBodyDirectory, SetupConfig, SetupError, SetupSecretSource,
 };
 #[cfg(test)]
 use kvasir_core::{SetupCredential, prepare_setup_config};
@@ -22,7 +22,10 @@ use generated_files::{
     generated_harness_files_are_current, install_generated_harness_files,
     prepare_generated_harness_files,
 };
-use managed_state::{ensure_installable_state, managed_file_is_current, write_installed_state};
+use managed_state::{
+    ensure_installable_state, ensure_refreshable_state, managed_file_is_current,
+    write_installed_state,
+};
 use uninstall::{setup_managed_paths, uninstall_managed_file};
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -84,7 +87,7 @@ pub fn configure_kvasir_harness_telemetry(
             config.otlp_endpoint.to_core(),
             config.raw_body_directory.to_core(),
         )
-        .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+        .map_err(setup_error_to_client_error)?;
     let setup_config = pending_setup_config.config().clone();
     let prepared_config = prepare_codex_telemetry_config(config.clone(), &setup_config)?;
     let generated_files = prepare_generated_harness_files(&config, &setup_config)?;
@@ -149,7 +152,7 @@ fn configure_kvasir_harness_telemetry_with_credential_and_install_hook(
         config.otlp_endpoint.to_core(),
         config.raw_body_directory.to_core(),
     )
-    .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+    .map_err(setup_error_to_client_error)?;
     let setup_config = pending_setup_config.config().clone();
     let prepared_config = prepare_codex_telemetry_config(config.clone(), &setup_config)?;
     let generated_files = prepare_generated_harness_files(&config, &setup_config)?;
@@ -204,6 +207,43 @@ fn handle_install_error(
     }
 }
 
+pub(super) fn setup_error_to_client_error(error: SetupError) -> KvasirClientError {
+    match error {
+        SetupError::SettingsNotObject
+        | SetupError::EnvNotObject
+        | SetupError::InvalidSettingsJson(_) => {
+            KvasirClientError::HarnessTelemetryInvalidClaudeSettings
+        }
+        SetupError::OpenCodeConfigNotObject
+        | SetupError::OpenCodeExperimentalNotObject
+        | SetupError::OpenCodeManagedBlockNotObject
+        | SetupError::InvalidOpenCodeConfigJson(_)
+        | SetupError::InvalidOpenCodeOtlpEndpointEnvValue
+        | SetupError::InvalidOpenCodeOtlpHeadersEnvValue => {
+            KvasirClientError::HarnessTelemetryInvalidOpenCodeConfig
+        }
+        SetupError::InvalidSetupSecretJson(_) | SetupError::SetupSecretSerialization(_) => {
+            KvasirClientError::HarnessTelemetryInvalidStoredSecret
+        }
+        SetupError::SetupKeychain(_)
+        | SetupError::BearerTokenGeneration(_)
+        | SetupError::SetupCredentialRead(_)
+        | SetupError::SetupCredentialWrite(_)
+        | SetupError::MalformedManagedBlock
+        | SetupError::ConflictingCodexOtelKeys => KvasirClientError::HarnessTelemetrySetup,
+        _ => KvasirClientError::HarnessTelemetrySetup,
+    }
+}
+
+fn codex_setup_error_to_client_error(error: SetupError) -> KvasirClientError {
+    match error {
+        SetupError::MalformedManagedBlock | SetupError::ConflictingCodexOtelKeys => {
+            KvasirClientError::HarnessTelemetryInvalidCodexConfig
+        }
+        other => setup_error_to_client_error(other),
+    }
+}
+
 enum PreparedCodexTelemetryConfig {
     Unchanged {
         target_path: PathBuf,
@@ -239,7 +279,7 @@ impl PreparedCodexTelemetryConfig {
                 previous_config,
                 desired_contents,
             } => {
-                if ensure_installable_state(&target_path).is_err() {
+                if ensure_refreshable_state(&target_path).is_err() {
                     let _ = fs::remove_file(&temp_path);
                     return Err(ConfigInstallError::ConfigPreserved);
                 }
@@ -304,7 +344,7 @@ fn prepare_codex_telemetry_config(
     let existing_config =
         read_previous_file(&codex_config_path).map_err(|_| KvasirClientError::Filesystem)?;
     let generated = CodexConfigToml::generate(existing_config.contents(), setup_config)
-        .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+        .map_err(codex_setup_error_to_client_error)?;
 
     if generated.as_str() == existing_config.contents() {
         return Ok(PreparedCodexTelemetryConfig::Unchanged {
@@ -741,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_harness_telemetry_refuses_to_overwrite_user_edits_on_rerun()
+    fn configure_harness_telemetry_preserves_codex_user_edits_on_rerun()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let credential = MemorySetupCredential::default();
@@ -755,14 +795,15 @@ mod tests {
             "model = \"gpt-5\"\n# user edit after setup\n",
         )?;
 
-        let error = configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)
-            .unwrap_err();
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
 
-        assert!(matches!(error, KvasirClientError::Filesystem));
-        assert!(
-            fs::read_to_string(config.codex_config_path.as_path())?
-                .contains("user edit after setup")
-        );
+        assert!(generated.contains("user edit after setup"));
+        assert!(generated.contains("# BEGIN KVASIR MANAGED CODEX OTEL"));
+        assert!(managed_file_is_current(
+            config.codex_config_path.as_path(),
+            &generated
+        )?);
         Ok(())
     }
 
@@ -1037,6 +1078,99 @@ mod tests {
 metrics_exporter = { otlp-http = { endpoint = "http://old.example/v1/metrics", protocol = "binary" } }
 # END KVASIR MANAGED CODEX OTEL
 "#,
+        )?;
+
+        let error =
+            configure_kvasir_harness_telemetry_with_credential(config, &credential).unwrap_err();
+
+        assert!(matches!(
+            error,
+            KvasirClientError::HarnessTelemetryInvalidCodexConfig
+        ));
+        assert_eq!(*credential.write_count.borrow(), 0);
+        assert!(credential.password.borrow().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_adopts_existing_codex_otel_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(temp.path().join(".codex"))?;
+        fs::write(
+            config.codex_config_path.as_path(),
+            "[otel]\nexporter = \"none\"\n",
+        )?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
+
+        assert!(generated.contains("# BEGIN KVASIR MANAGED CODEX OTEL"));
+        assert!(generated.contains("http://127.0.0.1:4318/v1/logs"));
+        assert!(!generated.contains("exporter = \"none\""));
+        assert_eq!(*credential.write_count.borrow(), 1);
+        assert!(credential.password.borrow().is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_reports_invalid_claude_settings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(config.claude_settings_path.as_path().parent().unwrap())?;
+        fs::write(config.claude_settings_path.as_path(), "{not json")?;
+
+        let error =
+            configure_kvasir_harness_telemetry_with_credential(config, &credential).unwrap_err();
+
+        assert!(matches!(
+            error,
+            KvasirClientError::HarnessTelemetryInvalidClaudeSettings
+        ));
+        assert_eq!(*credential.write_count.borrow(), 0);
+        assert!(credential.password.borrow().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_reports_invalid_opencode_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(config.opencode_config_path.as_path().parent().unwrap())?;
+        fs::write(config.opencode_config_path.as_path(), "{not json")?;
+
+        let error =
+            configure_kvasir_harness_telemetry_with_credential(config, &credential).unwrap_err();
+
+        assert!(matches!(
+            error,
+            KvasirClientError::HarnessTelemetryInvalidOpenCodeConfig
+        ));
+        assert_eq!(*credential.write_count.borrow(), 0);
+        assert!(credential.password.borrow().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_keeps_shell_profile_errors_generic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(config.zsh_profile_path.as_path().parent().unwrap())?;
+        fs::write(
+            config.zsh_profile_path.as_path(),
+            "# BEGIN KVASIR MANAGED REPO OTEL\n",
         )?;
 
         let error =

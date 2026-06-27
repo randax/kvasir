@@ -473,6 +473,7 @@ impl CodexConfigToml {
             CODEX_OTEL_BLOCK_START,
             CODEX_OTEL_BLOCK_END,
         )?;
+        let unmanaged_config = remove_existing_codex_otel_values(&unmanaged_config);
         let line_ending = preferred_line_ending(&unmanaged_config, existing_config);
         let toml = insert_codex_otel_block(&unmanaged_config, config, line_ending)?;
         Ok(Self { toml })
@@ -945,20 +946,10 @@ fn insert_codex_otel_block(
 ) -> Result<String, SetupError> {
     let mut output = String::with_capacity(existing.len() + 512);
     let mut inserted = false;
-    let mut inside_otel_table = false;
 
     for line in existing.split_inclusive('\n') {
         let trimmed_line = line.trim_end_matches(['\r', '\n']).trim();
         let table_header = toml_table_header_name(trimmed_line);
-        if table_header == Some("otel") {
-            inside_otel_table = true;
-        } else if table_header.is_some() {
-            inside_otel_table = false;
-        }
-
-        if inside_otel_table && inserted && is_codex_managed_otel_assignment(line) {
-            return Err(SetupError::ConflictingCodexOtelKeys);
-        }
 
         push_line_with_ending(&mut output, line, line_ending);
         if !inserted && table_header == Some("otel") {
@@ -987,6 +978,32 @@ fn insert_codex_otel_block(
     Ok(toml)
 }
 
+fn remove_existing_codex_otel_values(existing: &str) -> String {
+    let mut output = String::with_capacity(existing.len());
+    let mut inside_otel_table = false;
+    let mut inside_managed_otel_subtable = false;
+
+    for line in existing.split_inclusive('\n') {
+        let trimmed_line = line.trim_end_matches(['\r', '\n']).trim();
+        let table_header = toml_table_header_name(trimmed_line);
+        if let Some(table_name) = table_header {
+            inside_otel_table = table_name == "otel";
+            inside_managed_otel_subtable = is_codex_managed_otel_subtable(table_name);
+        }
+
+        if inside_managed_otel_subtable {
+            continue;
+        }
+        if inside_otel_table && is_codex_managed_otel_assignment(line) {
+            continue;
+        }
+
+        output.push_str(line);
+    }
+
+    output
+}
+
 fn is_codex_managed_otel_assignment(line: &str) -> bool {
     [
         "log_user_prompt",
@@ -996,6 +1013,21 @@ fn is_codex_managed_otel_assignment(line: &str) -> bool {
     ]
     .into_iter()
     .any(|key| is_assignment_for_key(line, key))
+}
+
+fn is_codex_managed_otel_subtable(table_name: &str) -> bool {
+    [
+        "otel.exporter",
+        "otel.trace_exporter",
+        "otel.metrics_exporter",
+    ]
+    .into_iter()
+    .any(|prefix| {
+        table_name == prefix
+            || table_name
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })
 }
 
 fn is_assignment_for_key(line: &str, key: &str) -> bool {

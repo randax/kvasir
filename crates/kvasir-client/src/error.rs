@@ -14,6 +14,14 @@ pub enum KvasirClientError {
     WrongResponseType,
     #[error("harness telemetry setup failed")]
     HarnessTelemetrySetup,
+    #[error("Claude Code settings JSON is invalid")]
+    HarnessTelemetryInvalidClaudeSettings,
+    #[error("Codex telemetry config cannot be updated automatically")]
+    HarnessTelemetryInvalidCodexConfig,
+    #[error("OpenCode config JSON is invalid")]
+    HarnessTelemetryInvalidOpenCodeConfig,
+    #[error("stored harness telemetry setup secret is invalid")]
+    HarnessTelemetryInvalidStoredSecret,
     #[error("harness telemetry setup rollback failed")]
     HarnessTelemetryRollback,
     #[error("harness telemetry setup state is unknown")]

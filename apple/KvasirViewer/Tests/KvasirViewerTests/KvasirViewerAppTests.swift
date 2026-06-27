@@ -338,6 +338,34 @@ func harnessTelemetrySetupConfigHonorsDaemonEnvironmentOverrides() {
     #expect(config.otlpEndpoint == "http://127.0.0.1:54318")
 }
 
+@MainActor
+@Test
+func viewerStartupShowsFriendlyHarnessTelemetryWarningAndContinues() async throws {
+    let rawError = RawHarnessTelemetrySetupError()
+    let warning = HarnessTelemetrySetupWarning(reason: .invalidClaudeSettings)
+    let primary = SequenceOverviewClient(results: [
+        .success(overviewSnapshot(totalTokens: 12))
+    ])
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: primary),
+        telemetrySetup: ConfiguringHarnessTelemetrySetup(
+            config: ProductionModelFactory.resolvedHarnessTelemetrySetupConfig(environment: [:]),
+            configure: { _ in throw rawError },
+            warningForError: { error in
+                error.localizedDescription == rawError.localizedDescription ? warning : nil
+            }
+        ),
+        launchAgent: DaemonLaunchAgent(registry: RecordingLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await model.start()
+
+    #expect(model.setupWarningMessage == warning.localizedDescription)
+    #expect(model.setupWarningMessage != rawError.localizedDescription)
+    #expect(await primary.loadCount == 1)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 12)
+}
+
 @Test
 func daemonFallbackOverviewClientStartsDaemonAndRetriesRecoverableFailure() async throws {
     let expected = overviewSnapshot(totalTokens: 6)
@@ -567,6 +595,26 @@ func daemonFallbackOverviewClientStopsRetryingAfterBoundedRecoverableFailures() 
 #if canImport(kvasir_client)
 @MainActor
 @Test
+func productionFactoryRefreshesLaunchAgentForRpcSerializationDuringStartup() async throws {
+    let primary = SequenceOverviewClient(results: [
+        .failure(KvasirClientError.RpcSerialization),
+        .success(
+            overviewSnapshot(totalTokens: 15)
+        ),
+    ])
+    let model = ProductionModelFactory.make(
+        overviewClient: primary,
+        launchAgent: DaemonLaunchAgent(registry: RecordingLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await model.start()
+
+    #expect(await primary.loadCount == 2)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 15)
+}
+
+@MainActor
+@Test
 func productionFactoryStartsBundledDaemonForSocketIoAfterStartupGateOpens() async throws {
     let primary = SequenceOverviewClient(results: [
         .failure(KvasirClientError.SocketIo),
@@ -590,9 +638,32 @@ func productionFactoryStartsBundledDaemonForSocketIoAfterStartupGateOpens() asyn
 
 @MainActor
 @Test
-func productionFactoryDoesNotStartBundledDaemonForNonSocketClientError() async throws {
+func productionFactoryStartsBundledDaemonForRpcSerializationAfterStartupGateOpens() async throws {
     let primary = SequenceOverviewClient(results: [
         .failure(KvasirClientError.RpcSerialization),
+        .success(
+            overviewSnapshot(totalTokens: 17)
+        ),
+    ])
+    let starter = RecordingDaemonProcessStarter()
+    let model = ProductionModelFactory.make(
+        overviewClient: primary,
+        daemonStarter: starter,
+        daemonFallbackGate: DaemonFallbackGate(enabled: true)
+    )
+
+    try await model.refreshOverview()
+
+    #expect(await primary.loadCount == 2)
+    #expect(starter.startCount == 1)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 17)
+}
+
+@MainActor
+@Test
+func productionFactoryDoesNotStartBundledDaemonForNonrecoverableClientError() async throws {
+    let primary = SequenceOverviewClient(results: [
+        .failure(KvasirClientError.DaemonError),
     ])
     let starter = RecordingDaemonProcessStarter()
     let model = ProductionModelFactory.make(
@@ -603,9 +674,9 @@ func productionFactoryDoesNotStartBundledDaemonForNonSocketClientError() async t
 
     do {
         try await model.refreshOverview()
-        Issue.record("expected non-socket client error")
+        Issue.record("expected nonrecoverable client error")
     } catch {
-        #expect(error as? KvasirClientError == .RpcSerialization)
+        #expect(error as? KvasirClientError == .DaemonError)
     }
 
     #expect(await primary.loadCount == 1)
@@ -675,6 +746,12 @@ private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked
 
     func send() {
         continuation.yield(())
+    }
+}
+
+private struct RawHarnessTelemetrySetupError: LocalizedError {
+    var errorDescription: String? {
+        "Kvasir_client.KvasirClientError:harnessTelemetrySetup RPC serialization error"
     }
 }
 
