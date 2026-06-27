@@ -14,7 +14,10 @@ func productionViewerTargetBuildsOverviewScreenAndFactoryModel() async throws {
     let model = ProductionModelFactory.make()
     _ = OverviewScreen(model: model)
 
-    #if !canImport(kvasir_client)
+    #if canImport(kvasir_client)
+    #expect(model.isTraceInspectorEnabled)
+    #else
+    #expect(!model.isTraceInspectorEnabled)
     do {
         try await model.refreshOverview()
         Issue.record("expected missing kvasir-client error from package-test build")

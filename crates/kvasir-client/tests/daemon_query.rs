@@ -3,25 +3,26 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
-    KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
-    KvasirContentKind, KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
-    KvasirContentReplayItem, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
-    KvasirCostSource, KvasirCostUsd, KvasirHarnessName, KvasirModelName,
-    KvasirOverviewHarnessSummary, KvasirOverviewModelSummary, KvasirOverviewRefreshSubscription,
-    KvasirOverviewRepoSummary, KvasirOverviewRollup, KvasirOverviewSeriesPoint,
-    KvasirOverviewSessionRoute, KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId,
-    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
-    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
-    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
-    KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind, KvasirUsageUpdateKind,
+    KvasirClient, KvasirClientError, KvasirContentAvailability, KvasirContentKind,
+    KvasirContentKindAvailability, KvasirContentReplay, KvasirContentReplayItem,
+    KvasirContentReplayQuery, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
+    KvasirCostSource, KvasirCostUsd, KvasirHarnessName, KvasirHarnessTelemetrySetup,
+    KvasirModelName, KvasirOverviewHarnessSummary, KvasirOverviewModelSummary,
+    KvasirOverviewRefreshSubscription, KvasirOverviewRepoSummary, KvasirOverviewRollup,
+    KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute, KvasirOverviewSnapshot,
+    KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
+    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath,
+    KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
+    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures,
+    KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind, KvasirUsageUpdateKind,
+    load_kvasir_content_replay,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::{BearerToken, RpcRequest, RpcResponse, RpcStreamEvent, UsageUpdateKind};
@@ -32,6 +33,8 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use tempfile::tempdir;
+
+static CONTENT_REPLAY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<()> {
@@ -489,13 +492,12 @@ async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("opencode"),
-            session_id: session("opencode-session-1"),
-            prompt_id: prompt("opencode-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("opencode"),
+            session("opencode-session-1"),
+            prompt("opencode-turn-1"),
+        )
     })
     .await??;
 
@@ -595,13 +597,12 @@ async fn client_queries_protobuf_content_replay_by_session_and_prompt() -> anyho
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("opencode"),
-            session_id: session("opencode-session-1"),
-            prompt_id: prompt("opencode-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("opencode"),
+            session("opencode-session-1"),
+            prompt("opencode-turn-1"),
+        )
     })
     .await??;
 
@@ -701,13 +702,12 @@ async fn client_queries_opencode_content_replay_from_opted_in_logs() -> anyhow::
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("opencode"),
-            session_id: session("opencode-session-1"),
-            prompt_id: prompt("opencode-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("opencode"),
+            session("opencode-session-1"),
+            prompt("opencode-turn-1"),
+        )
     })
     .await??;
 
@@ -899,13 +899,12 @@ async fn client_queries_claude_content_replay_from_opted_in_logs() -> anyhow::Re
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("claude"),
-            session_id: session("claude-session-1"),
-            prompt_id: prompt("claude-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("claude"),
+            session("claude-session-1"),
+            prompt("claude-turn-1"),
+        )
     })
     .await??;
 
@@ -991,13 +990,12 @@ async fn client_queries_codex_content_replay_from_opted_in_logs() -> anyhow::Res
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("codex"),
-            session_id: session("codex-session-1"),
-            prompt_id: prompt("codex-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("codex"),
+            session("codex-session-1"),
+            prompt("codex-turn-1"),
+        )
     })
     .await??;
 
@@ -1074,13 +1072,12 @@ async fn client_ignores_content_logs_from_unknown_harnesses() -> anyhow::Result<
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("random_service"),
-            session_id: session("unknown-session-1"),
-            prompt_id: prompt("unknown-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("random_service"),
+            session("unknown-session-1"),
+            prompt("unknown-turn-1"),
+        )
     })
     .await??;
 
@@ -1116,13 +1113,12 @@ async fn client_reports_prompt_not_found_for_empty_content_replay() -> anyhow::R
     .await?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("opencode"),
-            session_id: session("missing-session"),
-            prompt_id: prompt("missing-prompt"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("opencode"),
+            session("missing-session"),
+            prompt("missing-prompt"),
+        )
     })
     .await??;
 
@@ -1168,13 +1164,12 @@ async fn client_reports_known_harness_content_kinds_when_prompt_has_no_content()
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("claude"),
-            session_id: session("session-12"),
-            prompt_id: prompt("prompt-7"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("claude"),
+            session("session-12"),
+            prompt("prompt-7"),
+        )
     })
     .await??;
 
@@ -1246,13 +1241,12 @@ async fn client_reports_not_provided_for_existing_unsupported_harness_prompt() -
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("unknown-harness"),
-            session_id: session("unknown-session-1"),
-            prompt_id: prompt("unknown-turn-1"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("unknown-harness"),
+            session("unknown-session-1"),
+            prompt("unknown-turn-1"),
+        )
     })
     .await??;
 
@@ -1298,13 +1292,12 @@ async fn client_does_not_report_content_capability_for_another_harness_prompt() 
         .error_for_status()?;
 
     let replay = tokio::task::spawn_blocking(move || {
-        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
-        client.content_replay(KvasirContentQuery {
-            harness: harness("codex"),
-            session_id: session("session-12"),
-            prompt_id: prompt("prompt-7"),
-            bearer_token: bearer_token("test-token"),
-        })
+        load_content_replay(
+            rpc_socket_path,
+            harness("codex"),
+            session("session-12"),
+            prompt("prompt-7"),
+        )
     })
     .await??;
 
@@ -2842,8 +2835,55 @@ fn content_text(value: &str) -> KvasirContentText {
     KvasirContentText::try_from(value.to_owned()).unwrap()
 }
 
-fn bearer_token(value: &str) -> KvasirBearerToken {
-    KvasirBearerToken::try_from(value.to_owned()).unwrap()
+fn load_content_replay(
+    rpc_socket_path: std::path::PathBuf,
+    harness: KvasirHarnessName,
+    session_id: KvasirSessionId,
+    prompt_id: KvasirPromptId,
+) -> Result<KvasirContentReplay, KvasirClientError> {
+    let _guard = CONTENT_REPLAY_ENV_LOCK
+        .lock()
+        .expect("content replay env lock");
+    let previous_token = std::env::var_os("KVASIR_BEARER_TOKEN");
+    unsafe {
+        std::env::set_var("KVASIR_BEARER_TOKEN", "test-token");
+    }
+    let result = load_kvasir_content_replay(
+        socket_path(rpc_socket_path),
+        replay_setup_config(),
+        KvasirContentReplayQuery {
+            harness,
+            session_id,
+            prompt_id,
+        },
+    );
+    restore_bearer_token(previous_token);
+    result
+}
+
+fn restore_bearer_token(previous_token: Option<std::ffi::OsString>) {
+    unsafe {
+        match previous_token {
+            Some(token) => std::env::set_var("KVASIR_BEARER_TOKEN", token),
+            None => std::env::remove_var("KVASIR_BEARER_TOKEN"),
+        }
+    }
+}
+
+fn replay_setup_config() -> KvasirHarnessTelemetrySetup {
+    KvasirHarnessTelemetrySetup {
+        codex_config_path: "/tmp/kvasir-client-test/config.toml".to_owned().into(),
+        claude_settings_path: "/tmp/kvasir-client-test/settings.json".to_owned().into(),
+        copilot_profile_path: "/tmp/kvasir-client-test/profile".to_owned().into(),
+        opencode_config_path: "/tmp/kvasir-client-test/opencode.json".to_owned().into(),
+        opencode_env_path: "/tmp/kvasir-client-test/kvasir.env".to_owned().into(),
+        zsh_profile_path: "/tmp/kvasir-client-test/zshrc".to_owned().into(),
+        bash_profile_path: "/tmp/kvasir-client-test/bashrc".to_owned().into(),
+        zsh_repo_hook_path: "/tmp/kvasir-client-test/repo-hook.zsh".to_owned().into(),
+        bash_repo_hook_path: "/tmp/kvasir-client-test/repo-hook.bash".to_owned().into(),
+        raw_body_directory: "/tmp/kvasir-client-test/raw-bodies".to_owned().into(),
+        otlp_endpoint: "http://127.0.0.1:4318".to_owned().into(),
+    }
 }
 
 fn trace_id(value: &str) -> KvasirTraceId {

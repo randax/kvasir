@@ -132,15 +132,16 @@ pub fn load_kvasir_content_replay(
     config: KvasirHarnessTelemetrySetup,
     query: KvasirContentReplayQuery,
 ) -> Result<KvasirContentReplay, KvasirClientError> {
-    let bearer_token =
-        resolve_kvasir_bearer_token_from_source(config, bearer_token_from_environment)?;
-    let client = KvasirClient::connect(socket_path)?;
-    client.content_replay(KvasirContentQuery {
-        harness: query.harness,
-        session_id: query.session_id,
-        prompt_id: query.prompt_id,
-        bearer_token,
-    })
+    load_kvasir_content_replay_from_source(
+        socket_path,
+        config,
+        query,
+        bearer_token_from_environment,
+        |socket_path, query| {
+            let client = KvasirClient::connect(socket_path)?;
+            client.content_replay(query)
+        },
+    )
 }
 
 #[uniffi::export]
@@ -176,6 +177,28 @@ fn bearer_token_from_environment() -> Option<String> {
     std::env::var("KVASIR_BEARER_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
+}
+
+fn load_kvasir_content_replay_from_source(
+    socket_path: KvasirSocketPath,
+    config: KvasirHarnessTelemetrySetup,
+    query: KvasirContentReplayQuery,
+    environment_token: impl FnOnce() -> Option<String>,
+    content_replay: impl FnOnce(
+        KvasirSocketPath,
+        KvasirContentQuery,
+    ) -> Result<KvasirContentReplay, KvasirClientError>,
+) -> Result<KvasirContentReplay, KvasirClientError> {
+    let bearer_token = resolve_kvasir_bearer_token_from_source(config, environment_token)?;
+    content_replay(
+        socket_path,
+        KvasirContentQuery {
+            harness: query.harness,
+            session_id: query.session_id,
+            prompt_id: query.prompt_id,
+            bearer_token,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -571,6 +594,7 @@ impl From<KvasirOtlpEndpoint> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{KvasirHarnessName, KvasirPromptId, KvasirSessionId};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -686,6 +710,53 @@ mod tests {
 
         assert_eq!(String::from(token), "operator-token");
         assert_eq!(*credential.write_count.borrow(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn load_content_replay_resolves_token_and_forwards_typed_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = full_harness_setup_config(temp.path());
+        let socket_path = KvasirSocketPath::try_from("/tmp/kvasird.sock".to_owned())?;
+        let replay = KvasirContentReplay {
+            session_id: KvasirSessionId::try_from("opencode-session-1".to_owned())?,
+            prompt_id: KvasirPromptId::try_from("opencode-turn-1".to_owned())?,
+            items: Vec::new(),
+            availability: crate::types::KvasirContentAvailability::Unavailable {
+                reason: crate::types::KvasirContentUnavailableReason::NotCapturedForPrompt,
+            },
+        };
+
+        let loaded = load_kvasir_content_replay_from_source(
+            socket_path.clone(),
+            config,
+            KvasirContentReplayQuery {
+                harness: KvasirHarnessName::try_from("opencode".to_owned())?,
+                session_id: KvasirSessionId::try_from("opencode-session-1".to_owned())?,
+                prompt_id: KvasirPromptId::try_from("opencode-turn-1".to_owned())?,
+            },
+            || Some("operator-token".to_owned()),
+            |received_socket_path, received_query| {
+                assert_eq!(received_socket_path, socket_path);
+                assert_eq!(
+                    received_query.harness,
+                    KvasirHarnessName::try_from("opencode".to_owned())?
+                );
+                assert_eq!(
+                    received_query.session_id,
+                    KvasirSessionId::try_from("opencode-session-1".to_owned())?
+                );
+                assert_eq!(
+                    received_query.prompt_id,
+                    KvasirPromptId::try_from("opencode-turn-1".to_owned())?
+                );
+                assert_eq!(String::from(received_query.bearer_token), "operator-token");
+                Ok(replay.clone())
+            },
+        )?;
+
+        assert_eq!(loaded, replay);
         Ok(())
     }
 

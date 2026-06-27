@@ -648,6 +648,47 @@ func traceInspectorFailureDoesNotOverwriteOverviewRefreshSuccess() async throws 
 
 @MainActor
 @Test
+func traceInspectorRefreshFailureKeepsPreviousSnapshot() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let inspectorSnapshot = TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [],
+        content: [],
+        contentAvailability: .unavailable(reason: .notCapturedForPrompt)
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt)),
+            .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: prompt)),
+        ]
+    )
+    let traceInspectorClient = SequenceTraceInspectorClient(results: [
+        .success(inspectorSnapshot),
+        .failure(TraceInspectorTestError.replayUnavailable),
+    ])
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+    try await viewer.refreshOverview()
+
+    #expect(viewer.overviewSnapshot?.totals.totalTokens == 8)
+    #expect(viewer.traceInspectorSnapshot == inspectorSnapshot)
+    #expect(viewer.traceInspectorErrorMessage == TraceInspectorTestError.replayUnavailable.localizedDescription)
+}
+
+@MainActor
+@Test
 func failedSessionDrillDownKeepsPreviousPromptAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let session = OverviewSessionRoute(
@@ -978,6 +1019,18 @@ private final class FailingTraceInspectorClient: TraceInspectorClient, @unchecke
     func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
         queries.append(query)
         throw error
+    }
+}
+
+private final class SequenceTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private var results: [Result<TraceInspectorSnapshot, any Error>]
+
+    init(results: [Result<TraceInspectorSnapshot, any Error>]) {
+        self.results = results
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        try results.removeFirst().get()
     }
 }
 

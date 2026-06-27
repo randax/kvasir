@@ -57,7 +57,6 @@ uniffi::custom_type!(KvasirSpanName, String);
 uniffi::custom_type!(KvasirRepoName, String);
 uniffi::custom_type!(KvasirRepoPath, String);
 uniffi::custom_type!(KvasirContentText, String);
-uniffi::custom_type!(KvasirBearerToken, String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum KvasirRepoBucketKind {
@@ -102,7 +101,7 @@ pub struct KvasirTraceQuery {
     pub prompt_id: KvasirPromptId,
 }
 
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KvasirContentQuery {
     pub harness: KvasirHarnessName,
     pub session_id: KvasirSessionId,

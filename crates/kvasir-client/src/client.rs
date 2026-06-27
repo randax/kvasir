@@ -182,25 +182,6 @@ impl KvasirClient {
         }
     }
 
-    pub fn content_replay(
-        &self,
-        query: KvasirContentQuery,
-    ) -> Result<KvasirContentReplay, KvasirClientError> {
-        let (query, bearer_token) = query.into();
-        let response = send_rpc_request(
-            &self.socket_path,
-            RpcRequest::Content {
-                query,
-                bearer_token,
-            },
-        )?;
-        match response {
-            RpcResponse::Content { replay } => replay.try_into(),
-            RpcResponse::Error { error } => Err(error.into()),
-            _ => Err(KvasirClientError::WrongResponseType),
-        }
-    }
-
     pub fn subscribe_token_rollups(
         &self,
         query: KvasirRollupQuery,
@@ -230,6 +211,27 @@ impl KvasirClient {
         Ok(KvasirOverviewRefreshSubscription::new(
             self.socket_path.clone(),
         ))
+    }
+}
+
+impl KvasirClient {
+    pub(crate) fn content_replay(
+        &self,
+        query: KvasirContentQuery,
+    ) -> Result<KvasirContentReplay, KvasirClientError> {
+        let (query, bearer_token) = query.into();
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::Content {
+                query,
+                bearer_token,
+            },
+        )?;
+        match response {
+            RpcResponse::Content { replay } => replay.try_into(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
     }
 }
 

@@ -467,7 +467,8 @@ struct OverviewScreen: View {
 
             if let errorMessage {
                 warningBanner(errorMessage)
-            } else if let snapshot {
+            }
+            if let snapshot {
                 VStack(alignment: .leading, spacing: 16) {
                     if snapshot.traces.isEmpty {
                         TraceInspectorEmptyState(title: "No spans captured")
@@ -488,7 +489,7 @@ struct OverviewScreen: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color(nsColor: .separatorColor).opacity(0.35))
                 )
-            } else {
+            } else if errorMessage == nil {
                 TraceInspectorEmptyState(title: "No trace loaded")
                     .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                     .overlay(

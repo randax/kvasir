@@ -49,6 +49,10 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var selectedPrompt: OverviewPromptRoute?
     @Published public var selectedRangePreset: OverviewRangePreset
 
+    public var isTraceInspectorEnabled: Bool {
+        traceInspector != nil
+    }
+
     private let dashboard: OverviewDashboard
     private let traceInspector: TraceInspector?
     private let telemetrySetup: any HarnessTelemetrySetup
