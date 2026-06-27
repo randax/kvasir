@@ -165,6 +165,7 @@ public final class KvasirViewerModel: ObservableObject {
                 selectedHarness = prompt.session.harness
                 selectedSession = prompt.session
                 selectedPrompt = prompt
+                clearTraceInspector()
             }
             await refreshTraceInspector(for: prompt)
         }

@@ -689,6 +689,94 @@ func traceInspectorRefreshFailureKeepsPreviousSnapshot() async throws {
 
 @MainActor
 @Test
+func switchingPromptsClearsPreviousTraceInspectorWhileNewTraceLoads() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let firstPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let secondPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-2")
+    )
+    let firstInspectorSnapshot = TraceInspectorSnapshot(
+        prompt: firstPrompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("first prompt")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.userPrompt)]
+        )
+    )
+    let secondInspectorSnapshot = TraceInspectorSnapshot(
+        prompt: secondPrompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_901),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("second prompt")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.userPrompt)]
+        )
+    )
+    let overviewClient = OrderedOverviewResultClient(results: [
+        .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: firstPrompt)),
+        .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: secondPrompt)),
+    ])
+    let traceInspectorClient = OrderedTraceInspectorClient(responses: [
+        firstInspectorSnapshot,
+        secondInspectorSnapshot,
+    ])
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    let firstDrillDown = Task {
+        try await viewer.drillDown(to: .prompt(firstPrompt))
+    }
+    await overviewClient.waitForPendingLoads(count: 1)
+    overviewClient.completeLoad(at: 0)
+    await traceInspectorClient.waitForPendingLoads(count: 1)
+    traceInspectorClient.completeLoad(at: 0)
+    try await firstDrillDown.value
+    #expect(viewer.traceInspectorSnapshot == firstInspectorSnapshot)
+
+    let secondDrillDown = Task {
+        try await viewer.drillDown(to: .prompt(secondPrompt))
+    }
+    await overviewClient.waitForPendingLoads(count: 2)
+    overviewClient.completeLoad(at: 1)
+    await traceInspectorClient.waitForPendingLoads(count: 2)
+
+    #expect(viewer.selectedPrompt == secondPrompt)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.traceInspectorErrorMessage == nil)
+
+    traceInspectorClient.completeLoad(at: 1)
+    try await secondDrillDown.value
+
+    #expect(viewer.traceInspectorSnapshot == secondInspectorSnapshot)
+}
+
+@MainActor
+@Test
 func failedSessionDrillDownKeepsPreviousPromptAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let session = OverviewSessionRoute(
@@ -1031,6 +1119,41 @@ private final class SequenceTraceInspectorClient: TraceInspectorClient, @uncheck
 
     func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
         try results.removeFirst().get()
+    }
+}
+
+private final class OrderedTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private let responses: [TraceInspectorSnapshot]
+    private var pendingContinuations: [CheckedContinuation<Void, Never>?] = []
+
+    init(responses: [TraceInspectorSnapshot]) {
+        self.responses = responses
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        let index = lock.withLock {
+            let index = pendingContinuations.count
+            pendingContinuations.append(nil)
+            return index
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.withLock {
+                pendingContinuations[index] = continuation
+            }
+        }
+        return responses[index]
+    }
+
+    func waitForPendingLoads(count: Int) async {
+        while !lock.withLock({ pendingContinuations.count >= count && pendingContinuations.prefix(count).allSatisfy { $0 != nil } }) {
+            await Task.yield()
+        }
+    }
+
+    func completeLoad(at index: Int) {
+        let continuation = lock.withLock { pendingContinuations[index] }
+        continuation?.resume()
     }
 }
 
