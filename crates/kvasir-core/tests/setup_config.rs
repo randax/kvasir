@@ -601,6 +601,11 @@ fn opencode_setup_generates_otlp_env_and_enables_open_telemetry()
     let opencode_json: serde_json::Value = serde_json::from_str(generated.opencode_json())?;
     assert_eq!(opencode_json["theme"], "system");
     assert_eq!(opencode_json["experimental"]["openTelemetry"], true);
+    let experimental = opencode_json["experimental"]
+        .as_object()
+        .expect("experimental config is an object");
+    assert!(!experimental.contains_key("recordInputs"));
+    assert!(!experimental.contains_key("recordOutputs"));
     assert_eq!(
         opencode_json["kvasirManaged"]["experimental"],
         json!(generated.managed_experimental_keys())

@@ -436,24 +436,6 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         .await?
         .error_for_status()?;
 
-    client
-        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
-        .header(AUTHORIZATION, "Bearer test-token")
-        .header(CONTENT_TYPE, "application/json")
-        .body(opencode_content_logs_fixture())
-        .send()
-        .await?
-        .error_for_status()?;
-
-    client
-        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
-        .header(AUTHORIZATION, "Bearer test-token")
-        .header(CONTENT_TYPE, "application/json")
-        .body(opencode_content_logs_fixture())
-        .send()
-        .await?
-        .error_for_status()?;
-
     let token_query = RollupQuery::new(
         TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
         TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
@@ -542,32 +524,54 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         ContentReplay {
             session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
             prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
-            items: vec![ContentReplayItem {
-                occurred_at: TimestampMillis::from_millis(1_781_956_802_180),
-                harness: HarnessName::new("opencode"),
-                kind: ContentKind::AssistantMessage,
-                content: ContentText::new(
-                    "content capture is opt-in and intentionally ignored by this rollup fixture",
-                )
-                .unwrap(),
-            }],
+            items: vec![
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_801_920),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::UserPrompt,
+                    content: ContentText::new("summarize README.md").unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_801_920),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new("I need to read it first.").unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_802_170),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::ToolInput,
+                    content: ContentText::new(r#"{"path":"README.md"}"#).unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_802_170),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::ToolOutput,
+                    content: ContentText::new("kvasir is a local telemetry daemon").unwrap(),
+                },
+            ],
             availability: ContentAvailability::Captured {
                 harness: HarnessName::new("opencode"),
                 kinds: vec![
                     ContentKindAvailability::Captured {
+                        kind: ContentKind::UserPrompt,
+                    },
+                    ContentKindAvailability::Captured {
                         kind: ContentKind::AssistantMessage,
                     },
-                    ContentKindAvailability::Unavailable {
-                        kind: ContentKind::UserPrompt,
-                        reason: ContentUnavailableReason::NotCapturedForPrompt,
-                    },
-                    ContentKindAvailability::Unavailable {
+                    ContentKindAvailability::Captured {
                         kind: ContentKind::ToolInput,
-                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                    },
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::ToolOutput,
                     },
                     ContentKindAvailability::Unavailable {
-                        kind: ContentKind::ToolOutput,
-                        reason: ContentUnavailableReason::NotCapturedForPrompt,
+                        kind: ContentKind::RawApiRequest,
+                        reason: ContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::RawApiResponse,
+                        reason: ContentUnavailableReason::NotProvidedByHarness,
                     },
                 ],
             },
@@ -577,11 +581,28 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
     drop(daemon);
     assert_eq!(
         persisted_opencode_content_rows(&database_path)?,
-        vec![(
-            "opencode".to_owned(),
-            "assistant_message".to_owned(),
-            "content capture is opt-in and intentionally ignored by this rollup fixture".to_owned()
-        )]
+        vec![
+            (
+                "opencode".to_owned(),
+                "user_prompt".to_owned(),
+                "summarize README.md".to_owned(),
+            ),
+            (
+                "opencode".to_owned(),
+                "assistant_message".to_owned(),
+                "I need to read it first.".to_owned(),
+            ),
+            (
+                "opencode".to_owned(),
+                "tool_input".to_owned(),
+                r#"{"path":"README.md"}"#.to_owned(),
+            ),
+            (
+                "opencode".to_owned(),
+                "tool_output".to_owned(),
+                "kvasir is a local telemetry daemon".to_owned(),
+            ),
+        ]
     );
 
     Ok(())
@@ -1332,7 +1353,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
     );
 
     let traces = query_trace(
-        rpc_socket_path,
+        rpc_socket_path.clone(),
         kvasir_core::rpc::TraceQuery {
             harness: HarnessName::new("opencode"),
             session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
@@ -1345,6 +1366,74 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
     assert_eq!(traces[0].durations.ttft_ms, Some(120));
     assert_eq!(traces[0].durations.request_ms, Some(1800));
     assert_eq!(traces[0].durations.tool_ms, Some(250));
+
+    assert_eq!(
+        query_content(
+            rpc_socket_path,
+            ContentQuery {
+                harness: HarnessName::new("opencode"),
+                session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+                prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+            },
+            BearerToken::new("test-token"),
+        )
+        .await?,
+        ContentReplay {
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+            items: vec![
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_801_920),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::UserPrompt,
+                    content: ContentText::new("summarize README.md").unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_801_920),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new("I need to read it first.").unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_802_170),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::ToolInput,
+                    content: ContentText::new(r#"{"path":"README.md"}"#).unwrap(),
+                },
+                ContentReplayItem {
+                    occurred_at: TimestampMillis::from_millis(1_781_956_802_170),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::ToolOutput,
+                    content: ContentText::new("kvasir is a local telemetry daemon").unwrap(),
+                },
+            ],
+            availability: ContentAvailability::Captured {
+                harness: HarnessName::new("opencode"),
+                kinds: vec![
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::UserPrompt,
+                    },
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::AssistantMessage,
+                    },
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::ToolInput,
+                    },
+                    ContentKindAvailability::Captured {
+                        kind: ContentKind::ToolOutput,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::RawApiRequest,
+                        reason: ContentUnavailableReason::NotProvidedByHarness,
+                    },
+                    ContentKindAvailability::Unavailable {
+                        kind: ContentKind::RawApiResponse,
+                        reason: ContentUnavailableReason::NotProvidedByHarness,
+                    },
+                ],
+            },
+        }
+    );
 
     Ok(())
 }
@@ -2546,8 +2635,7 @@ fn opencode_trace_fixture() -> &'static str {
                     { "key": "service.name", "value": { "stringValue": "opencode" } },
                     { "key": "repo.name", "value": { "stringValue": "kvasir" } },
                     { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
-                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
-                    { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } }
+                    { "key": "session.id", "value": { "stringValue": "opencode-session-1" } }
                 ]
             },
             "scopeSpans": [{
@@ -2559,6 +2647,7 @@ fn opencode_trace_fixture() -> &'static str {
                         "startTimeUnixNano": "1781956800000000000",
                         "endTimeUnixNano": "1781956802170000000",
                         "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "opencode-turn-1" } },
                             { "key": "opencode.span.kind", "value": { "stringValue": "interaction" } }
                         ]
                     },
@@ -2570,11 +2659,14 @@ fn opencode_trace_fixture() -> &'static str {
                         "startTimeUnixNano": "1781956800120000000",
                         "endTimeUnixNano": "1781956801920000000",
                         "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "opencode-turn-1" } },
                             { "key": "ai.operationId", "value": { "stringValue": "ai.generateText" } },
                             { "key": "ai.model.id", "value": { "stringValue": "gpt-4.1" } },
                             { "key": "ai.usage.promptTokens", "value": { "intValue": "1200" } },
                             { "key": "ai.usage.completionTokens", "value": { "intValue": "450" } },
-                            { "key": "ai.usage.cachedInputTokens", "value": { "intValue": "80" } }
+                            { "key": "ai.usage.cachedInputTokens", "value": { "intValue": "80" } },
+                            { "key": "ai.prompt.messages", "value": { "stringValue": "summarize README.md" } },
+                            { "key": "ai.response.text", "value": { "stringValue": "I need to read it first." } }
                         ]
                     },
                     {
@@ -2585,38 +2677,14 @@ fn opencode_trace_fixture() -> &'static str {
                         "startTimeUnixNano": "1781956801920000000",
                         "endTimeUnixNano": "1781956802170000000",
                         "attributes": [
+                            { "key": "message.id", "value": { "stringValue": "opencode-turn-1" } },
                             { "key": "ai.operationId", "value": { "stringValue": "toolCall" } },
-                            { "key": "ai.toolCall.name", "value": { "stringValue": "Read" } }
+                            { "key": "ai.toolCall.name", "value": { "stringValue": "Read" } },
+                            { "key": "ai.toolCall.args", "value": { "stringValue": "{\"path\":\"README.md\"}" } },
+                            { "key": "ai.toolCall.result", "value": { "stringValue": "kvasir is a local telemetry daemon" } }
                         ]
                     }
                 ]
-            }]
-        }]
-    }"#
-}
-
-fn opencode_content_logs_fixture() -> &'static str {
-    r#"{
-        "resourceLogs": [{
-            "resource": {
-                "attributes": [
-                    { "key": "service.name", "value": { "stringValue": "opencode" } },
-                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
-                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } }
-                ]
-            },
-            "scopeLogs": [{
-                "logRecords": [{
-                    "timeUnixNano": "1781956802180000000",
-                    "eventName": "opencode.content",
-                    "body": { "stringValue": "content capture is opt-in and intentionally ignored by this rollup fixture" },
-                    "attributes": [
-                        { "key": "session.id", "value": { "stringValue": "opencode-session-1" } },
-                        { "key": "prompt.id", "value": { "stringValue": "opencode-turn-1" } },
-                        { "key": "content.opt_in", "value": { "boolValue": true } },
-                        { "key": "content.type", "value": { "stringValue": "assistant_message" } }
-                    ]
-                }]
             }]
         }]
     }"#
@@ -2973,7 +3041,6 @@ fn opencode_trace_protobuf_fixture() -> Vec<u8> {
                     string_attribute("repo.name", "kvasir"),
                     string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
                     string_attribute("session.id", "opencode-session-1"),
-                    string_attribute("prompt.id", "opencode-turn-1"),
                 ],
                 dropped_attributes_count: 0,
                 entity_refs: Vec::new(),
@@ -2991,7 +3058,10 @@ fn opencode_trace_protobuf_fixture() -> Vec<u8> {
                         kind: 0,
                         start_time_unix_nano: 1_781_956_800_000_000_000,
                         end_time_unix_nano: 1_781_956_802_170_000_000,
-                        attributes: vec![string_attribute("opencode.span.kind", "interaction")],
+                        attributes: vec![
+                            string_attribute("message.id", "opencode-turn-1"),
+                            string_attribute("opencode.span.kind", "interaction"),
+                        ],
                         dropped_attributes_count: 0,
                         events: Vec::new(),
                         dropped_events_count: 0,
@@ -3010,11 +3080,14 @@ fn opencode_trace_protobuf_fixture() -> Vec<u8> {
                         start_time_unix_nano: 1_781_956_800_120_000_000,
                         end_time_unix_nano: 1_781_956_801_920_000_000,
                         attributes: vec![
+                            string_attribute("message.id", "opencode-turn-1"),
                             string_attribute("ai.operationId", "ai.generateText"),
                             string_attribute("ai.model.id", "gpt-4.1"),
                             int_attribute("ai.usage.promptTokens", 1200),
                             int_attribute("ai.usage.completionTokens", 450),
                             int_attribute("ai.usage.cachedInputTokens", 80),
+                            string_attribute("ai.prompt.messages", "summarize README.md"),
+                            string_attribute("ai.response.text", "I need to read it first."),
                         ],
                         dropped_attributes_count: 0,
                         events: Vec::new(),
@@ -3034,8 +3107,14 @@ fn opencode_trace_protobuf_fixture() -> Vec<u8> {
                         start_time_unix_nano: 1_781_956_801_920_000_000,
                         end_time_unix_nano: 1_781_956_802_170_000_000,
                         attributes: vec![
+                            string_attribute("message.id", "opencode-turn-1"),
                             string_attribute("ai.operationId", "toolCall"),
                             string_attribute("ai.toolCall.name", "Read"),
+                            string_attribute("ai.toolCall.args", r#"{"path":"README.md"}"#),
+                            string_attribute(
+                                "ai.toolCall.result",
+                                "kvasir is a local telemetry daemon",
+                            ),
                         ],
                         dropped_attributes_count: 0,
                         events: Vec::new(),
@@ -3698,7 +3777,7 @@ fn persisted_opencode_content_rows(
     let mut statement = connection.prepare(
         "SELECT harness, content_kind, content
          FROM canonical_content_records
-         ORDER BY event_key",
+         ORDER BY occurred_at_ms, id",
     )?;
     let rows = statement
         .query_map([], |row| {
