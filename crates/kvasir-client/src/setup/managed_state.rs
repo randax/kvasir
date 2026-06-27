@@ -113,6 +113,25 @@ pub(super) fn ensure_installable_state(path: &Path) -> std::io::Result<()> {
     ))
 }
 
+pub(super) fn ensure_refreshable_state(path: &Path) -> std::io::Result<()> {
+    let state = ManagedFileState::load_io(path)?;
+    if !state.installed_exists
+        && !state.backup_exists
+        && !state.missing_exists
+        && !state.target_exists
+    {
+        return ensure_backup_state(path);
+    }
+    if state.has_complete_install_state() {
+        ensure_target_matches_state(path, &state)?;
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "setup state is incomplete",
+    ))
+}
+
 pub(super) fn write_installed_state(path: &Path, contents: &str) -> std::io::Result<()> {
     let state_path = installed_path(path);
     if let Some(parent) = state_path.parent() {

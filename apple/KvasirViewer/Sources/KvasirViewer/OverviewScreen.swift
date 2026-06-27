@@ -1,3 +1,4 @@
+import AppKit
 import Charts
 import SwiftUI
 import KvasirViewerCore
@@ -517,11 +518,13 @@ struct OverviewScreen: View {
     }
 
     private func errorBanner(_ message: String) -> some View {
-        Label(message, systemImage: "exclamationmark.triangle")
-            .foregroundStyle(.red)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        diagnosticBanner(
+            message,
+            systemImage: "exclamationmark.triangle",
+            tint: .red,
+            background: .red.opacity(0.08),
+            copyAccessibilityLabel: "Copy error"
+        )
     }
 
     private var approvalBanner: some View {
@@ -533,11 +536,49 @@ struct OverviewScreen: View {
     }
 
     private func warningBanner(_ message: String) -> some View {
-        Label(message, systemImage: "exclamationmark.triangle")
-            .foregroundStyle(.orange)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        diagnosticBanner(
+            message,
+            systemImage: "exclamationmark.triangle",
+            tint: .orange,
+            background: .orange.opacity(0.08),
+            copyAccessibilityLabel: "Copy warning"
+        )
+    }
+
+    private func diagnosticBanner(
+        _ message: String,
+        systemImage: String,
+        tint: Color,
+        background: Color,
+        copyAccessibilityLabel: String
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: systemImage)
+                .imageScale(.medium)
+                .accessibilityHidden(true)
+
+            Text(message)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                copyDiagnosticMessage(message)
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .help(copyAccessibilityLabel)
+            .accessibilityLabel(copyAccessibilityLabel)
+        }
+        .foregroundStyle(tint)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(background, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func copyDiagnosticMessage(_ message: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message, forType: .string)
     }
 
     private func usd(_ nanos: UInt64) -> String {

@@ -7,11 +7,11 @@ use kvasir_core::{
 
 use crate::error::KvasirClientError;
 
-use super::KvasirHarnessTelemetrySetup;
 use super::fs_atomic::{read_optional_string, replace_file};
 use super::managed_state::{
     ensure_installable_state, managed_file_is_current, write_installed_state,
 };
+use super::{KvasirHarnessTelemetrySetup, setup_error_to_client_error};
 
 pub(super) struct GeneratedHarnessFile {
     target_path: PathBuf,
@@ -35,27 +35,27 @@ pub(super) fn prepare_generated_harness_files(
         &read_optional_string(&claude_settings_path).map_err(|_| KvasirClientError::Filesystem)?,
         setup_config,
     )
-    .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+    .map_err(setup_error_to_client_error)?;
     let copilot_profile = CopilotShellProfile::generate(
         &read_optional_string(&copilot_profile_path).map_err(|_| KvasirClientError::Filesystem)?,
         setup_config,
     )
-    .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+    .map_err(setup_error_to_client_error)?;
     let opencode_setup = OpenCodeSetup::generate(
         &read_optional_string(&opencode_config_path).map_err(|_| KvasirClientError::Filesystem)?,
         setup_config,
     )
-    .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+    .map_err(setup_error_to_client_error)?;
     let zsh_profile = RepoInjectionShellProfile::generate(
         &read_optional_string(&zsh_profile_path).map_err(|_| KvasirClientError::Filesystem)?,
         &zsh_repo_hook_path,
     )
-    .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+    .map_err(setup_error_to_client_error)?;
     let bash_profile = RepoInjectionShellProfile::generate(
         &read_optional_string(&bash_profile_path).map_err(|_| KvasirClientError::Filesystem)?,
         &bash_repo_hook_path,
     )
-    .map_err(|_| KvasirClientError::HarnessTelemetrySetup)?;
+    .map_err(setup_error_to_client_error)?;
 
     Ok(vec![
         GeneratedHarnessFile {
