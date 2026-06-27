@@ -7,7 +7,12 @@ use kvasir_core::{
 #[cfg(test)]
 use kvasir_core::{SetupCredential, prepare_setup_config};
 
+use crate::client::KvasirClient;
 use crate::error::KvasirClientError;
+use crate::types::{
+    KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirContentReplayQuery,
+    KvasirSocketPath,
+};
 
 mod fs_atomic;
 mod generated_files;
@@ -122,6 +127,24 @@ pub fn configure_kvasir_harness_telemetry(
 }
 
 #[uniffi::export]
+pub fn load_kvasir_content_replay(
+    socket_path: KvasirSocketPath,
+    config: KvasirHarnessTelemetrySetup,
+    query: KvasirContentReplayQuery,
+) -> Result<KvasirContentReplay, KvasirClientError> {
+    load_kvasir_content_replay_from_source(
+        socket_path,
+        config,
+        query,
+        bearer_token_from_environment,
+        |socket_path, query| {
+            let client = KvasirClient::connect(socket_path)?;
+            client.content_replay(query)
+        },
+    )
+}
+
+#[uniffi::export]
 pub fn uninstall_kvasir_harness_telemetry(
     config: KvasirHarnessTelemetrySetup,
 ) -> Result<(), KvasirClientError> {
@@ -129,6 +152,58 @@ pub fn uninstall_kvasir_harness_telemetry(
         uninstall_managed_file(&path)?;
     }
     Ok(())
+}
+
+fn resolve_kvasir_bearer_token_from_source(
+    config: KvasirHarnessTelemetrySetup,
+    environment_token: impl FnOnce() -> Option<String>,
+) -> Result<KvasirBearerToken, KvasirClientError> {
+    if let Some(token) = environment_token() {
+        return KvasirBearerToken::try_from(token);
+    }
+
+    let setup_secret_source =
+        SetupSecretSource::claude_code_keychain(config.claude_settings_path.as_path());
+    let setup_config = setup_secret_source
+        .resolve(
+            config.otlp_endpoint.to_core(),
+            config.raw_body_directory.to_core(),
+        )
+        .map_err(setup_error_to_client_error)?;
+    KvasirBearerToken::try_from(setup_config.bearer_token().as_str().to_owned())
+}
+
+fn bearer_token_from_environment() -> Option<String> {
+    std::env::var("KVASIR_BEARER_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn load_kvasir_content_replay_from_source(
+    socket_path: KvasirSocketPath,
+    config: KvasirHarnessTelemetrySetup,
+    query: KvasirContentReplayQuery,
+    environment_token: impl FnOnce() -> Option<String>,
+    content_replay: impl FnOnce(
+        KvasirSocketPath,
+        KvasirContentQuery,
+    ) -> Result<KvasirContentReplay, KvasirClientError>,
+) -> Result<KvasirContentReplay, KvasirClientError> {
+    let bearer_token = resolve_kvasir_bearer_token_from_source(config, environment_token)?;
+    let query = content_replay_query_with_token(query, bearer_token);
+    content_replay(socket_path, query)
+}
+
+fn content_replay_query_with_token(
+    query: KvasirContentReplayQuery,
+    bearer_token: KvasirBearerToken,
+) -> KvasirContentQuery {
+    KvasirContentQuery {
+        harness: query.harness,
+        session_id: query.session_id,
+        prompt_id: query.prompt_id,
+        bearer_token,
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +267,28 @@ fn configure_kvasir_harness_telemetry_with_credential_and_install_hook(
     Ok(())
 }
 
+#[cfg(test)]
+fn resolve_kvasir_bearer_token_with_credential(
+    config: KvasirHarnessTelemetrySetup,
+    credential: &dyn SetupCredential,
+    environment_token: Option<String>,
+) -> Result<KvasirBearerToken, KvasirClientError> {
+    if let Some(token) = environment_token.filter(|token| !token.trim().is_empty()) {
+        return KvasirBearerToken::try_from(token);
+    }
+
+    let setup_config = prepare_setup_config(
+        credential,
+        config.otlp_endpoint.to_core(),
+        config.raw_body_directory.to_core(),
+    )
+    .map_err(setup_error_to_client_error)?
+    .commit(credential)
+    .map_err(setup_error_to_client_error)?
+    .into_config();
+    KvasirBearerToken::try_from(setup_config.bearer_token().as_str().to_owned())
+}
+
 fn handle_install_error(
     error: ConfigInstallError,
     rollback: impl FnOnce() -> Result<(), kvasir_core::SetupError>,
@@ -248,6 +345,7 @@ enum PreparedCodexTelemetryConfig {
     Unchanged {
         target_path: PathBuf,
         desired_contents: String,
+        setup_config: SetupConfig,
     },
     Replacement {
         target_path: PathBuf,
@@ -270,9 +368,8 @@ impl PreparedCodexTelemetryConfig {
             Self::Unchanged {
                 target_path,
                 desired_contents,
-            } => ensure_installable_state(&target_path)
-                .and_then(|_| write_installed_state(&target_path, &desired_contents))
-                .map_err(|_| ConfigInstallError::ConfigPreserved),
+                setup_config,
+            } => install_unchanged_codex_config(&target_path, &desired_contents, &setup_config),
             Self::Replacement {
                 target_path,
                 temp_path,
@@ -317,6 +414,7 @@ impl PreparedCodexTelemetryConfig {
             Self::Unchanged {
                 target_path,
                 desired_contents,
+                ..
             }
             | Self::Replacement {
                 target_path,
@@ -325,6 +423,34 @@ impl PreparedCodexTelemetryConfig {
             } => managed_file_is_current(target_path, desired_contents),
         }
     }
+}
+
+fn install_unchanged_codex_config(
+    target_path: &Path,
+    desired_contents: &str,
+    setup_config: &SetupConfig,
+) -> Result<(), ConfigInstallError> {
+    if ensure_installable_state(target_path).is_ok()
+        || installed_codex_config_regenerates_to(target_path, desired_contents, setup_config)
+            .unwrap_or(false)
+    {
+        return write_installed_state(target_path, desired_contents)
+            .map_err(|_| ConfigInstallError::ConfigPreserved);
+    }
+    Err(ConfigInstallError::ConfigPreserved)
+}
+
+fn installed_codex_config_regenerates_to(
+    target_path: &Path,
+    desired_contents: &str,
+    setup_config: &SetupConfig,
+) -> Result<bool, KvasirClientError> {
+    ensure_refreshable_state(target_path).map_err(|_| KvasirClientError::Filesystem)?;
+    let installed_contents = fs::read_to_string(managed_state::installed_path(target_path))
+        .map_err(|_| KvasirClientError::Filesystem)?;
+    let regenerated = CodexConfigToml::generate(&installed_contents, setup_config)
+        .map_err(codex_setup_error_to_client_error)?;
+    Ok(regenerated.as_str() == desired_contents)
 }
 
 enum ConfigInstallError {
@@ -350,6 +476,7 @@ fn prepare_codex_telemetry_config(
         return Ok(PreparedCodexTelemetryConfig::Unchanged {
             target_path: codex_config_path,
             desired_contents: generated.as_str().to_owned(),
+            setup_config: setup_config.clone(),
         });
     }
 
@@ -502,6 +629,7 @@ impl From<KvasirOtlpEndpoint> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{KvasirHarnessName, KvasirPromptId, KvasirSessionId};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -584,6 +712,181 @@ mod tests {
         assert_eq!(managed_setup_snapshot(&config)?, first_apply_snapshot);
         assert_eq!(*credential.write_count.borrow(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_repairs_stale_codex_installed_state_when_config_is_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(temp.path().join(".codex"))?;
+        fs::write(config.codex_config_path.as_path(), "model = \"gpt-5\"\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
+        let installed_path = managed_state::installed_path(config.codex_config_path.as_path());
+        fs::write(&installed_path, "model = \"gpt-5\"\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+
+        assert_eq!(
+            fs::read_to_string(config.codex_config_path.as_path())?,
+            generated
+        );
+        assert_eq!(fs::read_to_string(installed_path)?, generated);
+        assert!(managed_file_is_current(
+            config.codex_config_path.as_path(),
+            &generated
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_refuses_unrelated_stale_codex_installed_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(temp.path().join(".codex"))?;
+        fs::write(config.codex_config_path.as_path(), "model = \"gpt-5\"\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
+        let installed_path = managed_state::installed_path(config.codex_config_path.as_path());
+        fs::write(&installed_path, "unrelated stale installed marker\n")?;
+
+        let error = configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)
+            .unwrap_err();
+
+        assert!(matches!(error, KvasirClientError::Filesystem));
+        assert_eq!(
+            fs::read_to_string(config.codex_config_path.as_path())?,
+            generated
+        );
+        assert_eq!(
+            fs::read_to_string(installed_path)?,
+            "unrelated stale installed marker\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_repairs_stale_generated_installed_state_when_file_is_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.opencode_env_path.as_path())?;
+        let installed_path = managed_state::installed_path(config.opencode_env_path.as_path());
+        fs::write(&installed_path, "stale installed marker\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+
+        assert_eq!(
+            fs::read_to_string(config.opencode_env_path.as_path())?,
+            generated
+        );
+        assert_eq!(fs::read_to_string(installed_path)?, generated);
+        assert!(managed_file_is_current(
+            config.opencode_env_path.as_path(),
+            &generated
+        )?);
+        assert!(config.opencode_env_path.missing_backup_path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_bearer_token_uses_existing_setup_secret() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+
+        let first = resolve_kvasir_bearer_token_with_credential(config.clone(), &credential, None)?;
+        let second = resolve_kvasir_bearer_token_with_credential(config, &credential, None)?;
+
+        assert_eq!(String::from(first.clone()).len(), 64);
+        assert_eq!(first, second);
+        assert_eq!(*credential.write_count.borrow(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_bearer_token_prefers_environment_override() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+
+        let token = resolve_kvasir_bearer_token_with_credential(
+            config,
+            &credential,
+            Some("operator-token".to_owned()),
+        )?;
+
+        assert_eq!(String::from(token), "operator-token");
+        assert_eq!(*credential.write_count.borrow(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn load_content_replay_resolves_token_and_forwards_typed_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = full_harness_setup_config(temp.path());
+        let socket_path = KvasirSocketPath::try_from("/tmp/kvasird.sock".to_owned())?;
+        let token_reads = Rc::new(Cell::new(0));
+        let replay_calls = Rc::new(Cell::new(0));
+        let replay = KvasirContentReplay {
+            session_id: KvasirSessionId::try_from("opencode-session-1".to_owned())?,
+            prompt_id: KvasirPromptId::try_from("opencode-turn-1".to_owned())?,
+            items: Vec::new(),
+            availability: crate::types::KvasirContentAvailability::Unavailable {
+                reason: crate::types::KvasirContentUnavailableReason::NotCapturedForPrompt,
+            },
+        };
+
+        let loaded = load_kvasir_content_replay_from_source(
+            socket_path.clone(),
+            config,
+            KvasirContentReplayQuery {
+                harness: KvasirHarnessName::try_from("opencode".to_owned())?,
+                session_id: KvasirSessionId::try_from("opencode-session-1".to_owned())?,
+                prompt_id: KvasirPromptId::try_from("opencode-turn-1".to_owned())?,
+            },
+            {
+                let token_reads = Rc::clone(&token_reads);
+                move || {
+                    token_reads.set(token_reads.get() + 1);
+                    Some("operator-token".to_owned())
+                }
+            },
+            |received_socket_path, received_query| {
+                replay_calls.set(replay_calls.get() + 1);
+                assert_eq!(received_socket_path, socket_path);
+                assert_eq!(
+                    received_query.harness,
+                    KvasirHarnessName::try_from("opencode".to_owned())?
+                );
+                assert_eq!(
+                    received_query.session_id,
+                    KvasirSessionId::try_from("opencode-session-1".to_owned())?
+                );
+                assert_eq!(
+                    received_query.prompt_id,
+                    KvasirPromptId::try_from("opencode-turn-1".to_owned())?
+                );
+                assert_eq!(String::from(received_query.bearer_token), "operator-token");
+                Ok(replay.clone())
+            },
+        )?;
+
+        assert_eq!(loaded, replay);
+        assert_eq!(token_reads.get(), 1);
+        assert_eq!(replay_calls.get(), 1);
         Ok(())
     }
 

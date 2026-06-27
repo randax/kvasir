@@ -538,6 +538,300 @@ func drillDownProgressesFromRepoToModelToSessionToPrompt() async throws {
 
 @MainActor
 @Test
+func promptDrillDownLoadsTraceInspectorSnapshot() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let inspectorSnapshot = TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [
+            TraceInspectorTrace(
+                traceID: TraceInspectorTraceID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                spans: [
+                    TraceInspectorSpan(
+                        spanID: TraceInspectorSpanID("1111111111111111"),
+                        parentSpanID: nil,
+                        kind: .interaction,
+                        name: TraceInspectorSpanName("opencode.interaction"),
+                        startedAt: Date(timeIntervalSince1970: 1_781_956_800),
+                        endedAt: Date(timeIntervalSince1970: 1_781_956_802),
+                        durationMilliseconds: 2_000,
+                        toolName: nil
+                    )
+                ],
+                durations: TraceInspectorDurations(
+                    timeToFirstTokenMilliseconds: 250,
+                    requestMilliseconds: 1_500,
+                    toolMilliseconds: nil
+                )
+            )
+        ],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("summarize README.md")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [
+                .captured(.userPrompt)
+            ]
+        )
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt))
+        ]
+    )
+    let traceInspectorClient = RecordingTraceInspectorClient(
+        snapshot: inspectorSnapshot
+    )
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+
+    #expect(traceInspectorClient.queries == [
+        TraceInspectorQuery(prompt: prompt)
+    ])
+    #expect(viewer.traceInspectorSnapshot == inspectorSnapshot)
+    #expect(viewer.traceInspectorErrorMessage == nil)
+}
+
+@MainActor
+@Test
+func traceInspectorFailureDoesNotOverwriteOverviewRefreshSuccess() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt)),
+            .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: prompt)),
+        ]
+    )
+    let traceInspectorClient = FailingTraceInspectorClient(error: TraceInspectorTestError.replayUnavailable)
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+    try await viewer.refreshOverview()
+
+    #expect(viewer.overviewSnapshot?.totals.totalTokens == 8)
+    #expect(viewer.errorMessage == nil)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.traceInspectorErrorMessage == TraceInspectorTestError.replayUnavailable.localizedDescription)
+    #expect(traceInspectorClient.queries == [
+        TraceInspectorQuery(prompt: prompt),
+        TraceInspectorQuery(prompt: prompt),
+    ])
+}
+
+@MainActor
+@Test
+func traceInspectorRefreshFailureKeepsPreviousSnapshot() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let inspectorSnapshot = TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [],
+        content: [],
+        contentAvailability: .unavailable(reason: .notCapturedForPrompt)
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt)),
+            .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: prompt)),
+        ]
+    )
+    let traceInspectorClient = SequenceTraceInspectorClient(results: [
+        .success(inspectorSnapshot),
+        .failure(TraceInspectorTestError.replayUnavailable),
+    ])
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+    try await viewer.refreshOverview()
+
+    #expect(viewer.overviewSnapshot?.totals.totalTokens == 8)
+    #expect(viewer.traceInspectorSnapshot == inspectorSnapshot)
+    #expect(viewer.traceInspectorErrorMessage == TraceInspectorTestError.replayUnavailable.localizedDescription)
+}
+
+@MainActor
+@Test
+func switchingPromptsClearsPreviousTraceInspectorWhileNewTraceLoads() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let firstPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let secondPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-2")
+    )
+    let firstInspectorSnapshot = TraceInspectorSnapshot(
+        prompt: firstPrompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("first prompt")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.userPrompt)]
+        )
+    )
+    let secondInspectorSnapshot = TraceInspectorSnapshot(
+        prompt: secondPrompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_901),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("second prompt")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.userPrompt)]
+        )
+    )
+    let overviewClient = OrderedOverviewResultClient(results: [
+        .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: firstPrompt)),
+        .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: secondPrompt)),
+    ])
+    let traceInspectorClient = OrderedTraceInspectorClient(responses: [
+        firstInspectorSnapshot,
+        secondInspectorSnapshot,
+    ])
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    let firstDrillDown = Task {
+        try await viewer.drillDown(to: .prompt(firstPrompt))
+    }
+    await overviewClient.waitForPendingLoads(count: 1)
+    overviewClient.completeLoad(at: 0)
+    await traceInspectorClient.waitForPendingLoads(count: 1)
+    traceInspectorClient.completeLoad(at: 0)
+    try await firstDrillDown.value
+    #expect(viewer.traceInspectorSnapshot == firstInspectorSnapshot)
+
+    let secondDrillDown = Task {
+        try await viewer.drillDown(to: .prompt(secondPrompt))
+    }
+    await overviewClient.waitForPendingLoads(count: 2)
+    overviewClient.completeLoad(at: 1)
+    await traceInspectorClient.waitForPendingLoads(count: 2)
+
+    #expect(viewer.selectedPrompt == secondPrompt)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.traceInspectorErrorMessage == nil)
+
+    traceInspectorClient.completeLoad(at: 1)
+    try await secondDrillDown.value
+
+    #expect(viewer.traceInspectorSnapshot == secondInspectorSnapshot)
+}
+
+@MainActor
+@Test
+func switchingPromptsDoesNotRestorePreviousTraceInspectorWhenNewTraceFails() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let firstPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let secondPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-2")
+    )
+    let firstInspectorSnapshot = TraceInspectorSnapshot(
+        prompt: firstPrompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("first prompt")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.userPrompt)]
+        )
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: firstPrompt)),
+            .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: secondPrompt)),
+        ]
+    )
+    let traceInspectorClient = SequenceTraceInspectorClient(results: [
+        .success(firstInspectorSnapshot),
+        .failure(TraceInspectorTestError.replayUnavailable),
+    ])
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(firstPrompt))
+    try await viewer.drillDown(to: .prompt(secondPrompt))
+
+    #expect(viewer.selectedPrompt == secondPrompt)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.traceInspectorErrorMessage == TraceInspectorTestError.replayUnavailable.localizedDescription)
+}
+
+@MainActor
+@Test
 func failedSessionDrillDownKeepsPreviousPromptAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let session = OverviewSessionRoute(
@@ -832,6 +1126,89 @@ private final class RecordingResultOverviewClient: OverviewClient, @unchecked Se
         for waiter in readyWaiters {
             waiter.1.resume()
         }
+    }
+}
+
+private final class RecordingTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private let snapshot: TraceInspectorSnapshot
+    private(set) var queries: [TraceInspectorQuery] = []
+
+    init(snapshot: TraceInspectorSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        queries.append(query)
+        return snapshot
+    }
+}
+
+private enum TraceInspectorTestError: LocalizedError {
+    case replayUnavailable
+
+    var errorDescription: String? {
+        "replay unavailable"
+    }
+}
+
+private final class FailingTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private let error: any Error
+    private(set) var queries: [TraceInspectorQuery] = []
+
+    init(error: any Error) {
+        self.error = error
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        queries.append(query)
+        throw error
+    }
+}
+
+private final class SequenceTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private var results: [Result<TraceInspectorSnapshot, any Error>]
+
+    init(results: [Result<TraceInspectorSnapshot, any Error>]) {
+        self.results = results
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        try results.removeFirst().get()
+    }
+}
+
+private final class OrderedTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private let responses: [TraceInspectorSnapshot]
+    private var pendingContinuations: [CheckedContinuation<Void, Never>?] = []
+
+    init(responses: [TraceInspectorSnapshot]) {
+        self.responses = responses
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        let index = lock.withLock {
+            let index = pendingContinuations.count
+            pendingContinuations.append(nil)
+            return index
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.withLock {
+                pendingContinuations[index] = continuation
+            }
+        }
+        return responses[index]
+    }
+
+    func waitForPendingLoads(count: Int) async {
+        while !lock.withLock({ pendingContinuations.count >= count && pendingContinuations.prefix(count).allSatisfy { $0 != nil } }) {
+            await Task.yield()
+        }
+    }
+
+    func completeLoad(at index: Int) {
+        let continuation = lock.withLock { pendingContinuations[index] }
+        continuation?.resume()
     }
 }
 

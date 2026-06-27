@@ -52,6 +52,42 @@ func overviewSocketClientDefersSourceConnectionUntilLoad() async throws {
     #expect(source.loadCount == 1)
 }
 
+@MainActor
+@Test
+func traceInspectorSocketClientLoadsSnapshotForTheSameQuery() async throws {
+    let prompt = OverviewPromptRoute(
+        session: OverviewSessionRoute(
+            harness: OverviewHarnessName("opencode"),
+            sessionID: OverviewSessionID("opencode-session-1")
+        ),
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let query = TraceInspectorQuery(prompt: prompt)
+    let snapshot = TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .assistantMessage,
+                content: TraceInspectorContentText("I need to read it first.")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.assistantMessage)]
+        )
+    )
+    let source = RecordingTraceInspectorSnapshotSource(snapshot: snapshot)
+    let client = TraceInspectorSocketClient(source: source)
+
+    let loaded = try await client.loadTraceInspector(query: query)
+
+    #expect(source.queries == [query])
+    #expect(loaded == snapshot)
+}
+
 private final class RecordingOverviewSnapshotSource: OverviewRollupSource, @unchecked Sendable {
     let snapshot: OverviewSnapshot
     private let lock = NSLock()
@@ -69,6 +105,27 @@ private final class RecordingOverviewSnapshotSource: OverviewRollupSource, @unch
     }
 
     var queries: [OverviewQuery] {
+        lock.withLock { recordedQueries }
+    }
+}
+
+private final class RecordingTraceInspectorSnapshotSource: TraceInspectorSource, @unchecked Sendable {
+    let snapshot: TraceInspectorSnapshot
+    private let lock = NSLock()
+    private var recordedQueries: [TraceInspectorQuery] = []
+
+    init(snapshot: TraceInspectorSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func traceInspectorSnapshot(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        lock.withLock {
+            recordedQueries.append(query)
+        }
+        return snapshot
+    }
+
+    var queries: [TraceInspectorQuery] {
         lock.withLock { recordedQueries }
     }
 }

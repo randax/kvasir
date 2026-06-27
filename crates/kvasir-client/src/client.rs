@@ -52,9 +52,9 @@ const OVERVIEW_REFRESH_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 impl KvasirClient {
     #[uniffi::constructor]
     pub fn connect(socket_path: KvasirSocketPath) -> Result<Self, KvasirClientError> {
-        let socket_path = PathBuf::from(socket_path.into_string());
-        connect_with_retries(&socket_path)?;
-        Ok(Self { socket_path })
+        Ok(Self {
+            socket_path: PathBuf::from(socket_path.into_string()),
+        })
     }
 
     pub fn token_rollups(
@@ -182,25 +182,6 @@ impl KvasirClient {
         }
     }
 
-    pub fn content_replay(
-        &self,
-        query: KvasirContentQuery,
-    ) -> Result<KvasirContentReplay, KvasirClientError> {
-        let (query, bearer_token) = query.into();
-        let response = send_rpc_request(
-            &self.socket_path,
-            RpcRequest::Content {
-                query,
-                bearer_token,
-            },
-        )?;
-        match response {
-            RpcResponse::Content { replay } => replay.try_into(),
-            RpcResponse::Error { error } => Err(error.into()),
-            _ => Err(KvasirClientError::WrongResponseType),
-        }
-    }
-
     pub fn subscribe_token_rollups(
         &self,
         query: KvasirRollupQuery,
@@ -230,6 +211,27 @@ impl KvasirClient {
         Ok(KvasirOverviewRefreshSubscription::new(
             self.socket_path.clone(),
         ))
+    }
+}
+
+impl KvasirClient {
+    pub(crate) fn content_replay(
+        &self,
+        query: KvasirContentQuery,
+    ) -> Result<KvasirContentReplay, KvasirClientError> {
+        let (query, bearer_token) = query.into();
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::Content {
+                query,
+                bearer_token,
+            },
+        )?;
+        match response {
+            RpcResponse::Content { replay } => replay.try_into(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
     }
 }
 

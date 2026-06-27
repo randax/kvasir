@@ -9,13 +9,15 @@ use crate::error::KvasirClientError;
 
 use super::fs_atomic::{read_optional_string, replace_file};
 use super::managed_state::{
-    ensure_installable_state, managed_file_is_current, write_installed_state,
+    ensure_installable_state, ensure_refreshable_state, managed_file_is_current,
+    write_installed_state,
 };
 use super::{KvasirHarnessTelemetrySetup, setup_error_to_client_error};
 
 pub(super) struct GeneratedHarnessFile {
     target_path: PathBuf,
     contents: String,
+    repair_stale_installed_state: bool,
 }
 
 pub(super) fn prepare_generated_harness_files(
@@ -61,38 +63,46 @@ pub(super) fn prepare_generated_harness_files(
         GeneratedHarnessFile {
             target_path: claude_settings_path,
             contents: claude_settings.as_str().to_owned(),
+            repair_stale_installed_state: false,
         },
         GeneratedHarnessFile {
             target_path: copilot_profile_path,
             contents: copilot_profile.as_str().to_owned(),
+            repair_stale_installed_state: false,
         },
         GeneratedHarnessFile {
             target_path: opencode_config_path,
             contents: opencode_setup.opencode_json().to_owned(),
+            repair_stale_installed_state: false,
         },
         GeneratedHarnessFile {
             target_path: opencode_env_path,
             contents: opencode_env_file(&opencode_setup),
+            repair_stale_installed_state: true,
         },
         GeneratedHarnessFile {
             target_path: zsh_profile_path,
             contents: zsh_profile.as_str().to_owned(),
+            repair_stale_installed_state: false,
         },
         GeneratedHarnessFile {
             target_path: bash_profile_path,
             contents: bash_profile.as_str().to_owned(),
+            repair_stale_installed_state: false,
         },
         GeneratedHarnessFile {
             target_path: zsh_repo_hook_path,
             contents: RepoInjectionShellHook::generate(RepoInjectionShell::Zsh)
                 .as_str()
                 .to_owned(),
+            repair_stale_installed_state: true,
         },
         GeneratedHarnessFile {
             target_path: bash_repo_hook_path,
             contents: RepoInjectionShellHook::generate(RepoInjectionShell::Bash)
                 .as_str()
                 .to_owned(),
+            repair_stale_installed_state: true,
         },
     ])
 }
@@ -119,7 +129,11 @@ pub(super) fn generated_harness_files_are_current(
 
 fn install_generated_harness_file(file: GeneratedHarnessFile) -> std::io::Result<()> {
     if read_optional_string(&file.target_path)? == file.contents {
-        ensure_installable_state(&file.target_path)?;
+        if file.repair_stale_installed_state {
+            ensure_refreshable_state(&file.target_path)?;
+        } else {
+            ensure_installable_state(&file.target_path)?;
+        }
         write_installed_state(&file.target_path, &file.contents)?;
         return Ok(());
     }

@@ -37,8 +37,10 @@ public enum OverviewRangePreset: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var overviewSnapshot: OverviewSnapshot?
+    @Published public private(set) var traceInspectorSnapshot: TraceInspectorSnapshot?
     @Published public private(set) var launchAgentOutcome: LaunchAgentRegistrationOutcome?
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var traceInspectorErrorMessage: String?
     @Published public private(set) var setupWarningMessage: String?
     @Published public private(set) var selectedRepo: OverviewRepoBucket?
     @Published public private(set) var selectedModel: OverviewModelName?
@@ -47,7 +49,12 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var selectedPrompt: OverviewPromptRoute?
     @Published public var selectedRangePreset: OverviewRangePreset
 
+    public var isTraceInspectorEnabled: Bool {
+        traceInspector != nil
+    }
+
     private let dashboard: OverviewDashboard
+    private let traceInspector: TraceInspector?
     private let telemetrySetup: any HarnessTelemetrySetup
     private let launchAgent: DaemonLaunchAgent
     private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
@@ -55,10 +62,12 @@ public final class KvasirViewerModel: ObservableObject {
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
+    private var traceInspectorLoadID: UInt64 = 0
     private var liveOverviewUpdates: Task<Void, Never>?
 
     public init(
         dashboard: OverviewDashboard,
+        traceInspector: TraceInspector? = nil,
         telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
         launchAgent: DaemonLaunchAgent,
         shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
@@ -68,6 +77,7 @@ public final class KvasirViewerModel: ObservableObject {
         calendar: Calendar = .kvasirRollupUTC
     ) {
         self.dashboard = dashboard
+        self.traceInspector = traceInspector
         self.telemetrySetup = telemetrySetup
         self.launchAgent = launchAgent
         self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
@@ -104,6 +114,7 @@ public final class KvasirViewerModel: ObservableObject {
         try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
             selectedSession = nil
             selectedPrompt = nil
+            clearTraceInspector()
         }
     }
 
@@ -112,6 +123,7 @@ public final class KvasirViewerModel: ObservableObject {
             selectedRepo = repo
             selectedSession = nil
             selectedPrompt = nil
+            clearTraceInspector()
         }
     }
 
@@ -120,6 +132,7 @@ public final class KvasirViewerModel: ObservableObject {
             selectedModel = model
             selectedSession = nil
             selectedPrompt = nil
+            clearTraceInspector()
         }
     }
 
@@ -128,6 +141,7 @@ public final class KvasirViewerModel: ObservableObject {
             selectedHarness = harness
             selectedSession = nil
             selectedPrompt = nil
+            clearTraceInspector()
         }
     }
 
@@ -144,13 +158,16 @@ public final class KvasirViewerModel: ObservableObject {
                 selectedHarness = session.harness
                 selectedSession = session
                 selectedPrompt = nil
+                clearTraceInspector()
             }
         case .prompt(let prompt):
             try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: prompt.session.harness, session: prompt.session, prompt: prompt) {
                 selectedHarness = prompt.session.harness
                 selectedSession = prompt.session
                 selectedPrompt = prompt
+                clearTraceInspector()
             }
+            await refreshTraceInspector(for: prompt)
         }
     }
 
@@ -158,12 +175,14 @@ public final class KvasirViewerModel: ObservableObject {
         try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
             selectedSession = nil
             selectedPrompt = nil
+            clearTraceInspector()
         }
     }
 
     public func clearPrompt() async throws {
         try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: selectedSession, prompt: nil) {
             selectedPrompt = nil
+            clearTraceInspector()
         }
     }
 
@@ -175,6 +194,13 @@ public final class KvasirViewerModel: ObservableObject {
             session: selectedSession,
             prompt: selectedPrompt
         )
+        if let selectedPrompt {
+            await refreshTraceInspector(for: selectedPrompt)
+        }
+    }
+
+    public func refreshTraceInspector() async {
+        await refreshTraceInspector(for: selectedPrompt)
     }
 
     private func refreshOverview(
@@ -213,6 +239,45 @@ public final class KvasirViewerModel: ObservableObject {
 
     public func record(error: any Error) {
         errorMessage = error.localizedDescription
+    }
+
+    private func refreshTraceInspector(for prompt: OverviewPromptRoute?) async {
+        do {
+            try await loadTraceInspector(for: prompt)
+        } catch {
+            // loadTraceInspector records failures on the scoped inspector error surface.
+        }
+    }
+
+    private func loadTraceInspector(for prompt: OverviewPromptRoute?) async throws {
+        traceInspectorLoadID += 1
+        let loadID = traceInspectorLoadID
+        guard let prompt, let traceInspector else {
+            traceInspectorSnapshot = nil
+            traceInspectorErrorMessage = nil
+            return
+        }
+
+        do {
+            let snapshot = try await traceInspector.load(prompt: prompt)
+            guard loadID == traceInspectorLoadID else {
+                return
+            }
+            traceInspectorSnapshot = snapshot
+            traceInspectorErrorMessage = nil
+        } catch {
+            guard loadID == traceInspectorLoadID else {
+                return
+            }
+            traceInspectorErrorMessage = error.localizedDescription
+            throw error
+        }
+    }
+
+    private func clearTraceInspector() {
+        traceInspectorLoadID += 1
+        traceInspectorSnapshot = nil
+        traceInspectorErrorMessage = nil
     }
 
     private func startLiveOverviewUpdatesIfNeeded() {

@@ -3,14 +3,32 @@ import Foundation
 import kvasir_client
 import KvasirViewerCore
 
-struct KvasirClientRollupSource: OverviewRollupSource {
+struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource {
     let socketPath: String
+    let setupConfig: HarnessTelemetrySetupConfig
 
     func overviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         try await Task.detached(priority: .userInitiated) { [self] in
             let client = try KvasirClient.connect(socketPath: socketPath)
             return try overviewSnapshotFromKvasir(
                 client.overviewSnapshot(query: kvasirRollupQuery(from: query))
+            )
+        }.value
+    }
+
+    func traceInspectorSnapshot(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        try await Task.detached(priority: .userInitiated) { [self] in
+            let client = try KvasirClient.connect(socketPath: socketPath)
+            let traces = try client.trace(query: kvasirTraceQuery(from: query))
+            let replay = try loadKvasirContentReplay(
+                socketPath: socketPath,
+                config: kvasirHarnessTelemetrySetup(from: setupConfig),
+                query: kvasirContentReplayQuery(from: query)
+            )
+            return traceInspectorSnapshotFromKvasir(
+                prompt: query.prompt,
+                traces: traces,
+                replay: replay
             )
         }.value
     }
@@ -83,6 +101,51 @@ func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
 
 func overviewSnapshotFromKvasir(_ snapshot: KvasirOverviewSnapshot) -> OverviewSnapshot {
     snapshot.overviewSnapshot
+}
+
+func traceInspectorSnapshotFromKvasir(
+    prompt: OverviewPromptRoute,
+    traces: [KvasirTrace],
+    replay: KvasirContentReplay
+) -> TraceInspectorSnapshot {
+    TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: traces.map(\.traceInspectorTrace),
+        content: replay.items.map(\.traceInspectorContentItem),
+        contentAvailability: replay.availability.traceInspectorContentAvailability
+    )
+}
+
+func kvasirTraceQuery(from query: TraceInspectorQuery) -> KvasirTraceQuery {
+    KvasirTraceQuery(
+        harness: query.prompt.session.harness.displayName(),
+        sessionId: query.prompt.session.sessionID.displayName(),
+        promptId: query.prompt.promptID.displayName()
+    )
+}
+
+func kvasirContentReplayQuery(from query: TraceInspectorQuery) -> KvasirContentReplayQuery {
+    KvasirContentReplayQuery(
+        harness: query.prompt.session.harness.displayName(),
+        sessionId: query.prompt.session.sessionID.displayName(),
+        promptId: query.prompt.promptID.displayName()
+    )
+}
+
+func kvasirHarnessTelemetrySetup(from config: HarnessTelemetrySetupConfig) -> KvasirHarnessTelemetrySetup {
+    KvasirHarnessTelemetrySetup(
+        codexConfigPath: config.codexConfigPath,
+        claudeSettingsPath: config.claudeSettingsPath,
+        copilotProfilePath: config.copilotProfilePath,
+        opencodeConfigPath: config.opencodeConfigPath,
+        opencodeEnvPath: config.opencodeEnvPath,
+        zshProfilePath: config.zshProfilePath,
+        bashProfilePath: config.bashProfilePath,
+        zshRepoHookPath: config.zshRepoHookPath,
+        bashRepoHookPath: config.bashRepoHookPath,
+        rawBodyDirectory: config.rawBodyDirectory,
+        otlpEndpoint: config.otlpEndpoint
+    )
 }
 
 private extension OverviewRepoBucket {
@@ -315,6 +378,125 @@ private extension KvasirCostSource {
             return .estimated
         case .mixed:
             return .mixed
+        }
+    }
+}
+
+private extension KvasirTrace {
+    var traceInspectorTrace: TraceInspectorTrace {
+        TraceInspectorTrace(
+            traceID: TraceInspectorTraceID(traceId),
+            spans: spans.map(\.traceInspectorSpan),
+            durations: durations.traceInspectorDurations
+        )
+    }
+}
+
+private extension KvasirTraceSpan {
+    var traceInspectorSpan: TraceInspectorSpan {
+        TraceInspectorSpan(
+            spanID: TraceInspectorSpanID(spanId),
+            parentSpanID: parentSpanId.map(TraceInspectorSpanID.init),
+            kind: kind.traceInspectorSpanKind,
+            name: TraceInspectorSpanName(name),
+            startedAt: startedAt.overviewDate,
+            endedAt: endedAt.overviewDate,
+            durationMilliseconds: durationMs,
+            toolName: toolName.map(TraceInspectorToolName.init)
+        )
+    }
+}
+
+private extension KvasirTraceSpanKind {
+    var traceInspectorSpanKind: TraceInspectorSpanKind {
+        switch self {
+        case .interaction:
+            return .interaction
+        case .llmRequest:
+            return .llmRequest
+        case .toolCall:
+            return .toolCall
+        }
+    }
+}
+
+private extension KvasirTraceDurationMeasures {
+    var traceInspectorDurations: TraceInspectorDurations {
+        TraceInspectorDurations(
+            timeToFirstTokenMilliseconds: ttftMs,
+            requestMilliseconds: requestMs,
+            toolMilliseconds: toolMs
+        )
+    }
+}
+
+private extension KvasirContentReplayItem {
+    var traceInspectorContentItem: TraceInspectorContentItem {
+        TraceInspectorContentItem(
+            occurredAt: occurredAt.overviewDate,
+            harness: OverviewHarnessName(harness),
+            kind: kind.traceInspectorContentKind,
+            content: TraceInspectorContentText(content)
+        )
+    }
+}
+
+private extension KvasirContentKind {
+    var traceInspectorContentKind: TraceInspectorContentKind {
+        switch self {
+        case .userPrompt:
+            return .userPrompt
+        case .assistantMessage:
+            return .assistantMessage
+        case .toolInput:
+            return .toolInput
+        case .toolOutput:
+            return .toolOutput
+        case .rawApiRequest:
+            return .rawApiRequest
+        case .rawApiResponse:
+            return .rawApiResponse
+        }
+    }
+}
+
+private extension KvasirContentAvailability {
+    var traceInspectorContentAvailability: TraceInspectorContentAvailability {
+        switch self {
+        case .captured(let harness, let kinds):
+            return .captured(
+                harness: OverviewHarnessName(harness),
+                kinds: kinds.map(\.traceInspectorContentKindAvailability)
+            )
+        case .unavailable(let reason):
+            return .unavailable(reason: reason.traceInspectorContentUnavailableReason)
+        }
+    }
+}
+
+private extension KvasirContentKindAvailability {
+    var traceInspectorContentKindAvailability: TraceInspectorContentKindAvailability {
+        switch self {
+        case .captured(let kind):
+            return .captured(kind.traceInspectorContentKind)
+        case .unavailable(let kind, let reason):
+            return .unavailable(
+                kind: kind.traceInspectorContentKind,
+                reason: reason.traceInspectorContentUnavailableReason
+            )
+        }
+    }
+}
+
+private extension KvasirContentUnavailableReason {
+    var traceInspectorContentUnavailableReason: TraceInspectorContentUnavailableReason {
+        switch self {
+        case .notProvidedByHarness:
+            return .notProvidedByHarness
+        case .notCapturedForPrompt:
+            return .notCapturedForPrompt
+        case .promptNotFound:
+            return .promptNotFound
         }
     }
 }
