@@ -162,7 +162,7 @@ public final class KvasirViewerModel: ObservableObject {
                 selectedSession = prompt.session
                 selectedPrompt = prompt
             }
-            try await loadTraceInspector(for: prompt)
+            await refreshTraceInspector(for: prompt)
         }
     }
 
@@ -190,12 +190,12 @@ public final class KvasirViewerModel: ObservableObject {
             prompt: selectedPrompt
         )
         if let selectedPrompt {
-            try await loadTraceInspector(for: selectedPrompt)
+            await refreshTraceInspector(for: selectedPrompt)
         }
     }
 
-    public func refreshTraceInspector() async throws {
-        try await loadTraceInspector(for: selectedPrompt)
+    public func refreshTraceInspector() async {
+        await refreshTraceInspector(for: selectedPrompt)
     }
 
     private func refreshOverview(
@@ -234,6 +234,14 @@ public final class KvasirViewerModel: ObservableObject {
 
     public func record(error: any Error) {
         errorMessage = error.localizedDescription
+    }
+
+    private func refreshTraceInspector(for prompt: OverviewPromptRoute?) async {
+        do {
+            try await loadTraceInspector(for: prompt)
+        } catch {
+            // loadTraceInspector records failures on the scoped inspector error surface.
+        }
     }
 
     private func loadTraceInspector(for prompt: OverviewPromptRoute?) async throws {

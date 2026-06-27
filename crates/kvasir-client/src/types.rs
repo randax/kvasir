@@ -111,6 +111,13 @@ pub struct KvasirContentQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirContentReplayQuery {
+    pub harness: KvasirHarnessName,
+    pub session_id: KvasirSessionId,
+    pub prompt_id: KvasirPromptId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirTokenRollup {
     pub day: KvasirRollupDay,
     pub repo: KvasirRepoBucket,

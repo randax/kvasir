@@ -283,6 +283,17 @@ public enum TraceInspectorContentUnavailableReason: Equatable, Sendable {
     case notProvidedByHarness
     case notCapturedForPrompt
     case promptNotFound
+
+    public var displayName: String {
+        switch self {
+        case .notProvidedByHarness:
+            return "Replay is not provided by this harness"
+        case .notCapturedForPrompt:
+            return "No replay content was captured for this prompt"
+        case .promptNotFound:
+            return "Prompt content was not found"
+        }
+    }
 }
 
 public protocol TraceInspectorClient: Sendable {

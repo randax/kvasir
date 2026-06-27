@@ -7,8 +7,12 @@ use kvasir_core::{
 #[cfg(test)]
 use kvasir_core::{SetupCredential, prepare_setup_config};
 
+use crate::client::KvasirClient;
 use crate::error::KvasirClientError;
-use crate::types::KvasirBearerToken;
+use crate::types::{
+    KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirContentReplayQuery,
+    KvasirSocketPath,
+};
 
 mod fs_atomic;
 mod generated_files;
@@ -123,10 +127,20 @@ pub fn configure_kvasir_harness_telemetry(
 }
 
 #[uniffi::export]
-pub fn resolve_kvasir_bearer_token(
+pub fn load_kvasir_content_replay(
+    socket_path: KvasirSocketPath,
     config: KvasirHarnessTelemetrySetup,
-) -> Result<KvasirBearerToken, KvasirClientError> {
-    resolve_kvasir_bearer_token_from_source(config, bearer_token_from_environment)
+    query: KvasirContentReplayQuery,
+) -> Result<KvasirContentReplay, KvasirClientError> {
+    let bearer_token =
+        resolve_kvasir_bearer_token_from_source(config, bearer_token_from_environment)?;
+    let client = KvasirClient::connect(socket_path)?;
+    client.content_replay(KvasirContentQuery {
+        harness: query.harness,
+        session_id: query.session_id,
+        prompt_id: query.prompt_id,
+        bearer_token,
+    })
 }
 
 #[uniffi::export]

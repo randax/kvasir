@@ -19,12 +19,11 @@ struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource {
     func traceInspectorSnapshot(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
         try await Task.detached(priority: .userInitiated) { [self] in
             let client = try KvasirClient.connect(socketPath: socketPath)
-            let bearerToken = try resolveKvasirBearerToken(
-                config: kvasirHarnessTelemetrySetup(from: setupConfig)
-            )
             let traces = try client.trace(query: kvasirTraceQuery(from: query))
-            let replay = try client.contentReplay(
-                query: kvasirContentQuery(from: query, bearerToken: bearerToken)
+            let replay = try loadKvasirContentReplay(
+                socketPath: socketPath,
+                config: kvasirHarnessTelemetrySetup(from: setupConfig),
+                query: kvasirContentReplayQuery(from: query)
             )
             return traceInspectorSnapshotFromKvasir(
                 prompt: query.prompt,
@@ -125,15 +124,11 @@ func kvasirTraceQuery(from query: TraceInspectorQuery) -> KvasirTraceQuery {
     )
 }
 
-func kvasirContentQuery(
-    from query: TraceInspectorQuery,
-    bearerToken: KvasirBearerToken
-) -> KvasirContentQuery {
-    KvasirContentQuery(
+func kvasirContentReplayQuery(from query: TraceInspectorQuery) -> KvasirContentReplayQuery {
+    KvasirContentReplayQuery(
         harness: query.prompt.session.harness.displayName(),
         sessionId: query.prompt.session.sessionID.displayName(),
-        promptId: query.prompt.promptID.displayName(),
-        bearerToken: bearerToken
+        promptId: query.prompt.promptID.displayName()
     )
 }
 

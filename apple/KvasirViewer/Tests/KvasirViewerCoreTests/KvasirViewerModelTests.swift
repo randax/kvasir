@@ -611,6 +611,43 @@ func promptDrillDownLoadsTraceInspectorSnapshot() async throws {
 
 @MainActor
 @Test
+func traceInspectorFailureDoesNotOverwriteOverviewRefreshSuccess() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt)),
+            .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: prompt)),
+        ]
+    )
+    let traceInspectorClient = FailingTraceInspectorClient(error: TraceInspectorTestError.replayUnavailable)
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+    try await viewer.refreshOverview()
+
+    #expect(viewer.overviewSnapshot?.totals.totalTokens == 8)
+    #expect(viewer.errorMessage == nil)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.traceInspectorErrorMessage == TraceInspectorTestError.replayUnavailable.localizedDescription)
+    #expect(traceInspectorClient.queries == [
+        TraceInspectorQuery(prompt: prompt),
+        TraceInspectorQuery(prompt: prompt),
+    ])
+}
+
+@MainActor
+@Test
 func failedSessionDrillDownKeepsPreviousPromptAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let session = OverviewSessionRoute(
@@ -919,6 +956,28 @@ private final class RecordingTraceInspectorClient: TraceInspectorClient, @unchec
     func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
         queries.append(query)
         return snapshot
+    }
+}
+
+private enum TraceInspectorTestError: LocalizedError {
+    case replayUnavailable
+
+    var errorDescription: String? {
+        "replay unavailable"
+    }
+}
+
+private final class FailingTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private let error: any Error
+    private(set) var queries: [TraceInspectorQuery] = []
+
+    init(error: any Error) {
+        self.error = error
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        queries.append(query)
+        throw error
     }
 }
 

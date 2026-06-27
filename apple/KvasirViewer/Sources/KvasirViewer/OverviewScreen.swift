@@ -458,11 +458,7 @@ struct OverviewScreen: View {
                 Spacer()
                 Button {
                     Task {
-                        do {
-                            try await model.refreshTraceInspector()
-                        } catch {
-                            model.record(error: error)
-                        }
+                        await model.refreshTraceInspector()
                     }
                 } label: {
                     Label("Reload trace", systemImage: "arrow.clockwise")
@@ -481,7 +477,10 @@ struct OverviewScreen: View {
                         }
                     }
 
-                    TraceContentReplayView(items: snapshot.content)
+                    TraceContentReplayView(
+                        items: snapshot.content,
+                        availability: snapshot.contentAvailability
+                    )
                 }
                 .padding(12)
                 .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
@@ -755,6 +754,7 @@ private struct TraceDurationBadge: View {
 
 private struct TraceContentReplayView: View {
     let items: [TraceInspectorContentItem]
+    let availability: TraceInspectorContentAvailability
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -762,7 +762,7 @@ private struct TraceContentReplayView: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
             if items.isEmpty {
-                TraceInspectorEmptyState(title: "No captured content")
+                TraceContentAvailabilityState(availability: availability, showsGenericEmptyState: true)
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(items.enumerated()), id: \.offset) { _, item in
@@ -771,7 +771,41 @@ private struct TraceContentReplayView: View {
                     }
                 }
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+
+                TraceContentAvailabilityState(availability: availability, showsGenericEmptyState: false)
             }
+        }
+    }
+}
+
+private struct TraceContentAvailabilityState: View {
+    let availability: TraceInspectorContentAvailability
+    let showsGenericEmptyState: Bool
+
+    var body: some View {
+        switch availability {
+        case .captured(_, let kinds):
+            let unavailableKinds = kinds.compactMap(\.unavailablePresentation)
+            if unavailableKinds.isEmpty {
+                if showsGenericEmptyState {
+                    TraceInspectorEmptyState(title: "No captured content")
+                } else {
+                    EmptyView()
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(unavailableKinds.enumerated()), id: \.offset) { _, item in
+                        Label(
+                            "\(item.kind.displayName): \(item.reason.displayName)",
+                            systemImage: item.kind.systemImage
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        case .unavailable(let reason):
+            TraceInspectorEmptyState(title: reason.displayName)
         }
     }
 }
@@ -804,6 +838,11 @@ private struct TraceInspectorEmptyState: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
     }
+}
+
+private struct TraceContentUnavailablePresentation {
+    let kind: TraceInspectorContentKind
+    let reason: TraceInspectorContentUnavailableReason
 }
 
 private struct RepoEmptyRow: View {
@@ -1424,6 +1463,17 @@ private extension TraceInspectorContentKind {
             return .orange
         case .rawApiRequest, .rawApiResponse:
             return .secondary
+        }
+    }
+}
+
+private extension TraceInspectorContentKindAvailability {
+    var unavailablePresentation: TraceContentUnavailablePresentation? {
+        switch self {
+        case .captured:
+            return nil
+        case .unavailable(let kind, let reason):
+            return TraceContentUnavailablePresentation(kind: kind, reason: reason)
         }
     }
 }

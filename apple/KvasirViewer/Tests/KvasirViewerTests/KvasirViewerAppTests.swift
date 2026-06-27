@@ -24,6 +24,40 @@ func productionViewerTargetBuildsOverviewScreenAndFactoryModel() async throws {
     #endif
 }
 
+@MainActor
+@Test
+func productionFactoryUsesInjectedTraceInspectorClientForPromptDrillDown() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let inspectorSnapshot = TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [],
+        content: [],
+        contentAvailability: .unavailable(reason: .notCapturedForPrompt)
+    )
+    let overviewClient = SequenceOverviewClient(results: [
+        .success(overviewSnapshot(totalTokens: 9, selectedSession: session, selectedPrompt: prompt))
+    ])
+    let traceClient = RecordingTraceInspectorClient(snapshot: inspectorSnapshot)
+    let model = ProductionModelFactory.make(
+        overviewClient: overviewClient,
+        traceInspectorClient: traceClient
+    )
+
+    try await model.drillDown(to: .prompt(prompt))
+
+    #expect(await traceClient.queries == [TraceInspectorQuery(prompt: prompt)])
+    #expect(model.traceInspectorSnapshot == inspectorSnapshot)
+    #expect(model.traceInspectorErrorMessage == nil)
+    #expect(model.errorMessage == nil)
+}
+
 @Test
 func overviewScreenCostPresentationCarriesVisibleEstimateMarkers() {
     let snapshot = OverviewSnapshot(
@@ -68,6 +102,162 @@ func overviewScreenCostPresentationCarriesVisibleEstimateMarkers() {
 }
 
 #if canImport(kvasir_client)
+@Test
+func kvasirTraceInspectorMappingPreservesTraceAndCapturedReplay() {
+    let prompt = OverviewPromptRoute(
+        session: OverviewSessionRoute(
+            harness: OverviewHarnessName("opencode"),
+            sessionID: OverviewSessionID("opencode-session-1")
+        ),
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let mapped = traceInspectorSnapshotFromKvasir(
+        prompt: prompt,
+        traces: [
+            KvasirTrace(
+                sessionId: "opencode-session-1",
+                promptId: "opencode-turn-1",
+                traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                spans: [
+                    KvasirTraceSpan(
+                        spanId: "span-root",
+                        parentSpanId: nil,
+                        kind: .interaction,
+                        name: "opencode.interaction",
+                        startedAt: KvasirTimestampMillis(value: 1_781_956_800_000),
+                        endedAt: KvasirTimestampMillis(value: 1_781_956_803_000),
+                        durationMs: 3_000,
+                        toolName: nil
+                    ),
+                    KvasirTraceSpan(
+                        spanId: "span-request",
+                        parentSpanId: "span-root",
+                        kind: .llmRequest,
+                        name: "opencode.generate_text",
+                        startedAt: KvasirTimestampMillis(value: 1_781_956_801_000),
+                        endedAt: KvasirTimestampMillis(value: 1_781_956_802_000),
+                        durationMs: 1_000,
+                        toolName: nil
+                    ),
+                ],
+                durations: KvasirTraceDurationMeasures(
+                    ttftMs: 250,
+                    requestMs: 1_000,
+                    toolMs: nil
+                )
+            )
+        ],
+        replay: KvasirContentReplay(
+            sessionId: "opencode-session-1",
+            promptId: "opencode-turn-1",
+            items: [
+                KvasirContentReplayItem(
+                    occurredAt: KvasirTimestampMillis(value: 1_781_956_801_000),
+                    harness: "opencode",
+                    kind: .rawApiRequest,
+                    content: "{\"messages\":[]}"
+                ),
+                KvasirContentReplayItem(
+                    occurredAt: KvasirTimestampMillis(value: 1_781_956_802_000),
+                    harness: "opencode",
+                    kind: .rawApiResponse,
+                    content: "{\"text\":\"done\"}"
+                ),
+            ],
+            availability: .captured(
+                harness: "opencode",
+                kinds: [
+                    .captured(kind: .rawApiRequest),
+                    .captured(kind: .rawApiResponse),
+                    .unavailable(kind: .toolOutput, reason: .notCapturedForPrompt),
+                ]
+            )
+        )
+    )
+
+    #expect(mapped == TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [
+            TraceInspectorTrace(
+                traceID: TraceInspectorTraceID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                spans: [
+                    TraceInspectorSpan(
+                        spanID: TraceInspectorSpanID("span-root"),
+                        parentSpanID: nil,
+                        kind: .interaction,
+                        name: TraceInspectorSpanName("opencode.interaction"),
+                        startedAt: Date(timeIntervalSince1970: 1_781_956_800),
+                        endedAt: Date(timeIntervalSince1970: 1_781_956_803),
+                        durationMilliseconds: 3_000,
+                        toolName: nil
+                    ),
+                    TraceInspectorSpan(
+                        spanID: TraceInspectorSpanID("span-request"),
+                        parentSpanID: TraceInspectorSpanID("span-root"),
+                        kind: .llmRequest,
+                        name: TraceInspectorSpanName("opencode.generate_text"),
+                        startedAt: Date(timeIntervalSince1970: 1_781_956_801),
+                        endedAt: Date(timeIntervalSince1970: 1_781_956_802),
+                        durationMilliseconds: 1_000,
+                        toolName: nil
+                    ),
+                ],
+                durations: TraceInspectorDurations(
+                    timeToFirstTokenMilliseconds: 250,
+                    requestMilliseconds: 1_000,
+                    toolMilliseconds: nil
+                )
+            )
+        ],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .rawApiRequest,
+                content: TraceInspectorContentText("{\"messages\":[]}")
+            ),
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_802),
+                harness: OverviewHarnessName("opencode"),
+                kind: .rawApiResponse,
+                content: TraceInspectorContentText("{\"text\":\"done\"}")
+            ),
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [
+                .captured(.rawApiRequest),
+                .captured(.rawApiResponse),
+                .unavailable(kind: .toolOutput, reason: .notCapturedForPrompt),
+            ]
+        )
+    ))
+}
+
+@Test
+func kvasirTraceInspectorMappingPreservesUnavailableReplayReason() {
+    let prompt = OverviewPromptRoute(
+        session: OverviewSessionRoute(
+            harness: OverviewHarnessName("opencode"),
+            sessionID: OverviewSessionID("opencode-session-404")
+        ),
+        promptID: OverviewPromptID("missing-turn")
+    )
+    let mapped = traceInspectorSnapshotFromKvasir(
+        prompt: prompt,
+        traces: [],
+        replay: KvasirContentReplay(
+            sessionId: "opencode-session-404",
+            promptId: "missing-turn",
+            items: [],
+            availability: .unavailable(reason: .promptNotFound)
+        )
+    )
+
+    #expect(mapped.contentAvailability == .unavailable(reason: .promptNotFound))
+    #expect(mapped.content.isEmpty)
+}
+
 @Test
 func kvasirOverviewSnapshotMappingPreservesAggregatedSnapshot() {
     let repo = KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir")
@@ -315,6 +505,16 @@ func harnessTelemetrySetupConfigUsesProductionDefaultsWhenDaemonOverridesAreEmpt
     #expect(
         config.claudeSettingsPath == home.appendingPathComponent(".claude", isDirectory: true)
             .appendingPathComponent("settings.json").path
+    )
+    #expect(
+        config.opencodeConfigPath == home.appendingPathComponent(".config", isDirectory: true)
+            .appendingPathComponent("opencode", isDirectory: true)
+            .appendingPathComponent("opencode.json").path
+    )
+    #expect(
+        config.opencodeEnvPath == home.appendingPathComponent(".config", isDirectory: true)
+            .appendingPathComponent("opencode", isDirectory: true)
+            .appendingPathComponent("kvasir.env").path
     )
     #expect(
         config.rawBodyDirectory == applicationSupport
@@ -730,6 +930,20 @@ private actor SequenceOverviewClient: OverviewClient {
     }
 }
 
+private actor RecordingTraceInspectorClient: TraceInspectorClient {
+    private let snapshot: TraceInspectorSnapshot
+    private(set) var queries: [TraceInspectorQuery] = []
+
+    init(snapshot: TraceInspectorSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        queries.append(query)
+        return snapshot
+    }
+}
+
 private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
     private let continuation: AsyncStream<Void>.Continuation
     private let stream: AsyncStream<Void>
@@ -755,12 +969,18 @@ private struct RawHarnessTelemetrySetupError: LocalizedError {
     }
 }
 
-private func overviewSnapshot(totalTokens: UInt64 = 0) -> OverviewSnapshot {
+private func overviewSnapshot(
+    totalTokens: UInt64 = 0,
+    selectedSession: OverviewSessionRoute? = nil,
+    selectedPrompt: OverviewPromptRoute? = nil
+) -> OverviewSnapshot {
     OverviewSnapshot(
         totals: OverviewTotals(totalTokens: totalTokens, costUsdNanos: 0, toolCalls: 0),
         series: [],
         repoBreakdown: [],
-        selectedRepo: nil
+        selectedRepo: nil,
+        selectedSession: selectedSession,
+        selectedPrompt: selectedPrompt
     )
 }
 
