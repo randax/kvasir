@@ -9,6 +9,7 @@ enum ProductionModelFactory {
     @MainActor
     static func make(
         overviewClient: (any OverviewClient)? = nil,
+        traceInspectorClient: (any TraceInspectorClient)? = nil,
         overviewUpdateSource: (any OverviewUpdateSource)? = nil,
         daemonStarter: any DaemonProcessStarter = BundledDaemonProcess.shared,
         daemonFallbackGate: DaemonFallbackGate = DaemonFallbackGate(),
@@ -27,6 +28,7 @@ enum ProductionModelFactory {
                 ),
                 updateSource: overviewUpdateSource ?? makeOverviewUpdateSource(primary: overviewClient)
             ),
+            traceInspector: makeTraceInspector(client: traceInspectorClient),
             telemetrySetup: makeHarnessTelemetrySetup(),
             launchAgent: launchAgent,
             shouldRefreshLaunchAgentAfterStartupOverviewError: shouldRefreshLaunchAgentAfterStartupOverviewError,
@@ -52,7 +54,8 @@ enum ProductionModelFactory {
         #if canImport(kvasir_client)
         let socketClient = OverviewSocketClient(
             source: KvasirClientRollupSource(
-                socketPath: rpcSocketPath
+                socketPath: rpcSocketPath,
+                setupConfig: harnessTelemetrySetupConfig
             )
         )
         return DaemonFallbackOverviewClient(
@@ -62,6 +65,26 @@ enum ProductionModelFactory {
         )
         #else
         return MissingKvasirClient()
+        #endif
+    }
+
+    @MainActor
+    private static func makeTraceInspector(
+        client primary: (any TraceInspectorClient)?
+    ) -> TraceInspector? {
+        if let primary {
+            return TraceInspector(client: primary)
+        }
+        #if canImport(kvasir_client)
+        let socketClient = TraceInspectorSocketClient(
+            source: KvasirClientRollupSource(
+                socketPath: rpcSocketPath,
+                setupConfig: harnessTelemetrySetupConfig
+            )
+        )
+        return TraceInspector(client: socketClient)
+        #else
+        return nil
         #endif
     }
 
@@ -305,21 +328,7 @@ struct KvasirClientHarnessTelemetrySetup: HarnessTelemetrySetup {
         setup = ConfiguringHarnessTelemetrySetup(
             config: config,
             configure: { config in
-                try configureKvasirHarnessTelemetry(
-                    config: KvasirHarnessTelemetrySetup(
-                        codexConfigPath: config.codexConfigPath,
-                        claudeSettingsPath: config.claudeSettingsPath,
-                        copilotProfilePath: config.copilotProfilePath,
-                        opencodeConfigPath: config.opencodeConfigPath,
-                        opencodeEnvPath: config.opencodeEnvPath,
-                        zshProfilePath: config.zshProfilePath,
-                        bashProfilePath: config.bashProfilePath,
-                        zshRepoHookPath: config.zshRepoHookPath,
-                        bashRepoHookPath: config.bashRepoHookPath,
-                        rawBodyDirectory: config.rawBodyDirectory,
-                        otlpEndpoint: config.otlpEndpoint
-                    )
-                )
+                try configureKvasirHarnessTelemetry(config: kvasirHarnessTelemetrySetup(from: config))
             },
             warningForError: { error in
                 guard let error = error as? KvasirClientError else {

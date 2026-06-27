@@ -8,6 +8,7 @@ use kvasir_core::{
 use kvasir_core::{SetupCredential, prepare_setup_config};
 
 use crate::error::KvasirClientError;
+use crate::types::KvasirBearerToken;
 
 mod fs_atomic;
 mod generated_files;
@@ -122,6 +123,13 @@ pub fn configure_kvasir_harness_telemetry(
 }
 
 #[uniffi::export]
+pub fn resolve_kvasir_bearer_token(
+    config: KvasirHarnessTelemetrySetup,
+) -> Result<KvasirBearerToken, KvasirClientError> {
+    resolve_kvasir_bearer_token_from_source(config, bearer_token_from_environment)
+}
+
+#[uniffi::export]
 pub fn uninstall_kvasir_harness_telemetry(
     config: KvasirHarnessTelemetrySetup,
 ) -> Result<(), KvasirClientError> {
@@ -129,6 +137,31 @@ pub fn uninstall_kvasir_harness_telemetry(
         uninstall_managed_file(&path)?;
     }
     Ok(())
+}
+
+fn resolve_kvasir_bearer_token_from_source(
+    config: KvasirHarnessTelemetrySetup,
+    environment_token: impl FnOnce() -> Option<String>,
+) -> Result<KvasirBearerToken, KvasirClientError> {
+    if let Some(token) = environment_token() {
+        return KvasirBearerToken::try_from(token);
+    }
+
+    let setup_secret_source =
+        SetupSecretSource::claude_code_keychain(config.claude_settings_path.as_path());
+    let setup_config = setup_secret_source
+        .resolve(
+            config.otlp_endpoint.to_core(),
+            config.raw_body_directory.to_core(),
+        )
+        .map_err(setup_error_to_client_error)?;
+    KvasirBearerToken::try_from(setup_config.bearer_token().as_str().to_owned())
+}
+
+fn bearer_token_from_environment() -> Option<String> {
+    std::env::var("KVASIR_BEARER_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -190,6 +223,28 @@ fn configure_kvasir_harness_telemetry_with_credential_and_install_hook(
         };
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn resolve_kvasir_bearer_token_with_credential(
+    config: KvasirHarnessTelemetrySetup,
+    credential: &dyn SetupCredential,
+    environment_token: Option<String>,
+) -> Result<KvasirBearerToken, KvasirClientError> {
+    if let Some(token) = environment_token.filter(|token| !token.trim().is_empty()) {
+        return KvasirBearerToken::try_from(token);
+    }
+
+    let setup_config = prepare_setup_config(
+        credential,
+        config.otlp_endpoint.to_core(),
+        config.raw_body_directory.to_core(),
+    )
+    .map_err(setup_error_to_client_error)?
+    .commit(credential)
+    .map_err(setup_error_to_client_error)?
+    .into_config();
+    KvasirBearerToken::try_from(setup_config.bearer_token().as_str().to_owned())
 }
 
 fn handle_install_error(
@@ -584,6 +639,39 @@ mod tests {
         assert_eq!(managed_setup_snapshot(&config)?, first_apply_snapshot);
         assert_eq!(*credential.write_count.borrow(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_bearer_token_uses_existing_setup_secret() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+
+        let first = resolve_kvasir_bearer_token_with_credential(config.clone(), &credential, None)?;
+        let second = resolve_kvasir_bearer_token_with_credential(config, &credential, None)?;
+
+        assert_eq!(String::from(first.clone()).len(), 64);
+        assert_eq!(first, second);
+        assert_eq!(*credential.write_count.borrow(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_bearer_token_prefers_environment_override() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+
+        let token = resolve_kvasir_bearer_token_with_credential(
+            config,
+            &credential,
+            Some("operator-token".to_owned()),
+        )?;
+
+        assert_eq!(String::from(token), "operator-token");
+        assert_eq!(*credential.write_count.borrow(), 0);
         Ok(())
     }
 

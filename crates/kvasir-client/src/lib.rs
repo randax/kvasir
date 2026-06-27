@@ -14,7 +14,7 @@ pub use setup::{
     KvasirClaudeSettingsPath, KvasirCodexConfigPath, KvasirHarnessTelemetrySetup,
     KvasirOpenCodeConfigPath, KvasirOpenCodeEnvPath, KvasirOtlpEndpoint, KvasirRawBodyDirectory,
     KvasirRepoHookPath, KvasirShellProfilePath, configure_kvasir_harness_telemetry,
-    uninstall_kvasir_harness_telemetry,
+    resolve_kvasir_bearer_token, uninstall_kvasir_harness_telemetry,
 };
 pub use types::{
     KvasirAttributionStatus, KvasirBearerToken, KvasirContentAvailability, KvasirContentKind,

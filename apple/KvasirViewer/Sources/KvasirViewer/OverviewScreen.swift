@@ -103,6 +103,12 @@ struct OverviewScreen: View {
                         moreAvailable: snapshot.promptBreakdownMoreAvailable,
                         showsToolCalls: snapshot.selectedModel == nil
                     )
+                    if model.selectedPrompt != nil {
+                        traceInspectorDashboard(
+                            model.traceInspectorSnapshot,
+                            errorMessage: model.traceInspectorErrorMessage
+                        )
+                    }
                     charts(
                         snapshot.series,
                         costPresentation: costPresentation,
@@ -432,6 +438,68 @@ struct OverviewScreen: View {
         }
     }
 
+    @ViewBuilder
+    private func traceInspectorDashboard(
+        _ snapshot: TraceInspectorSnapshot?,
+        errorMessage: String?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Trace inspector")
+                    .font(.headline)
+                if let prompt = snapshot?.prompt ?? model.selectedPrompt {
+                    Text(prompt.promptID.displayName())
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(prompt.promptID.displayName())
+                }
+                Spacer()
+                Button {
+                    Task {
+                        do {
+                            try await model.refreshTraceInspector()
+                        } catch {
+                            model.record(error: error)
+                        }
+                    }
+                } label: {
+                    Label("Reload trace", systemImage: "arrow.clockwise")
+                }
+            }
+
+            if let errorMessage {
+                warningBanner(errorMessage)
+            } else if let snapshot {
+                VStack(alignment: .leading, spacing: 16) {
+                    if snapshot.traces.isEmpty {
+                        TraceInspectorEmptyState(title: "No spans captured")
+                    } else {
+                        ForEach(snapshot.traces, id: \.traceID) { trace in
+                            TraceWaterfallView(trace: trace)
+                        }
+                    }
+
+                    TraceContentReplayView(items: snapshot.content)
+                }
+                .padding(12)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+                )
+            } else {
+                TraceInspectorEmptyState(title: "No trace loaded")
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+                    )
+            }
+        }
+    }
+
     private func charts(
         _ series: [OverviewSeriesPoint],
         costPresentation: OverviewCostDashboardPresentation,
@@ -594,6 +662,147 @@ struct OverviewScreen: View {
                 model.record(error: error)
             }
         }
+    }
+}
+
+private struct TraceWaterfallView: View {
+    let trace: TraceInspectorTrace
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Label(trace.traceID.displayName(), systemImage: "chart.bar.xaxis")
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(trace.traceID.displayName())
+                Spacer()
+                TraceDurationBadge(title: "TTFT", milliseconds: trace.durations.timeToFirstTokenMilliseconds)
+                TraceDurationBadge(title: "Requests", milliseconds: trace.durations.requestMilliseconds)
+                TraceDurationBadge(title: "Tools", milliseconds: trace.durations.toolMilliseconds)
+            }
+
+            VStack(spacing: 8) {
+                ForEach(trace.waterfallRows, id: \.span.spanID) { row in
+                    TraceWaterfallRowView(row: row)
+                }
+            }
+        }
+    }
+}
+
+private struct TraceWaterfallRowView: View {
+    let row: TraceInspectorWaterfallRow
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: row.span.kind.systemImage)
+                    .foregroundStyle(row.span.kind.tint)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.span.toolName?.displayName() ?? row.span.kind.displayName)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(row.span.name.displayName())
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(row.span.name.displayName())
+                }
+            }
+            .padding(.leading, CGFloat(row.depth) * 14)
+            .frame(width: 240, alignment: .leading)
+
+            GeometryReader { proxy in
+                let width = max(proxy.size.width, 1)
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(row.span.kind.tint.opacity(0.75))
+                    .frame(
+                        width: max(clamped(row.widthFraction) * width, 2),
+                        height: 10
+                    )
+                    .offset(x: clamped(row.startFraction) * width)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            }
+            .frame(height: 20)
+
+            Text(durationLabel(row.span.durationMilliseconds))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .trailing)
+        }
+    }
+}
+
+private struct TraceDurationBadge: View {
+    let title: String
+    let milliseconds: UInt64?
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text(milliseconds.map(durationLabel) ?? "n/a")
+                .font(.caption.monospacedDigit())
+        }
+        .frame(width: 76, alignment: .trailing)
+    }
+}
+
+private struct TraceContentReplayView: View {
+    let items: [TraceInspectorContentItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Captured content")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            if items.isEmpty {
+                TraceInspectorEmptyState(title: "No captured content")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                        TraceContentReplayRow(item: item)
+                        Divider()
+                    }
+                }
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+}
+
+private struct TraceContentReplayRow: View {
+    let item: TraceInspectorContentItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Label(item.kind.displayName, systemImage: item.kind.systemImage)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(item.kind.tint)
+                .frame(width: 112, alignment: .leading)
+            Text(item.content.displayText())
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .lineLimit(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+    }
+}
+
+private struct TraceInspectorEmptyState: View {
+    let title: String
+
+    var body: some View {
+        Label(title, systemImage: "tray")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
     }
 }
 
@@ -1161,4 +1370,72 @@ private extension OverviewRepoBucket {
             return identity.path?.rawValue
         }
     }
+}
+
+private extension TraceInspectorSpanKind {
+    var systemImage: String {
+        switch self {
+        case .interaction:
+            return "rectangle.stack"
+        case .llmRequest:
+            return "sparkles"
+        case .toolCall:
+            return "hammer"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .interaction:
+            return .teal
+        case .llmRequest:
+            return .indigo
+        case .toolCall:
+            return .orange
+        }
+    }
+}
+
+private extension TraceInspectorContentKind {
+    var systemImage: String {
+        switch self {
+        case .userPrompt:
+            return "person.crop.circle"
+        case .assistantMessage:
+            return "sparkles"
+        case .toolInput:
+            return "arrow.down.doc"
+        case .toolOutput:
+            return "arrow.up.doc"
+        case .rawApiRequest:
+            return "arrow.up.forward.app"
+        case .rawApiResponse:
+            return "arrow.down.forward.app"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .userPrompt:
+            return .teal
+        case .assistantMessage:
+            return .indigo
+        case .toolInput, .toolOutput:
+            return .orange
+        case .rawApiRequest, .rawApiResponse:
+            return .secondary
+        }
+    }
+}
+
+private func durationLabel(_ milliseconds: UInt64) -> String {
+    if milliseconds < 1_000 {
+        return "\(milliseconds)ms"
+    }
+    let seconds = Double(milliseconds) / 1_000
+    return seconds.formatted(.number.precision(.fractionLength(0...2))) + "s"
+}
+
+private func clamped(_ value: Double) -> Double {
+    min(max(value, 0), 1)
 }

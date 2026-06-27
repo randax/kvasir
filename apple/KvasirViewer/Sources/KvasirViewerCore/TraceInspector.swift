@@ -41,6 +41,60 @@ public struct TraceInspectorTrace: Equatable, Sendable {
         self.spans = spans
         self.durations = durations
     }
+
+    public var waterfallRows: [TraceInspectorWaterfallRow] {
+        guard let traceStart = spans.map(\.startedAt).min(),
+              let traceEnd = spans.map(\.endedAt).max()
+        else {
+            return []
+        }
+        let totalSeconds = max(traceEnd.timeIntervalSince(traceStart), .leastNonzeroMagnitude)
+        let spansByID = Dictionary(spans.map { ($0.spanID, $0) }, uniquingKeysWith: { first, _ in first })
+
+        return spans.map { span in
+            TraceInspectorWaterfallRow(
+                span: span,
+                depth: waterfallDepth(for: span, spansByID: spansByID),
+                startFraction: span.startedAt.timeIntervalSince(traceStart) / totalSeconds,
+                widthFraction: max(span.endedAt.timeIntervalSince(span.startedAt), 0) / totalSeconds
+            )
+        }
+    }
+
+    private func waterfallDepth(
+        for span: TraceInspectorSpan,
+        spansByID: [TraceInspectorSpanID: TraceInspectorSpan]
+    ) -> Int {
+        var depth = 0
+        var parentSpanID = span.parentSpanID
+        var seen = Set<TraceInspectorSpanID>()
+        while let currentParentID = parentSpanID,
+              seen.insert(currentParentID).inserted,
+              let parentSpan = spansByID[currentParentID] {
+            depth += 1
+            parentSpanID = parentSpan.parentSpanID
+        }
+        return depth
+    }
+}
+
+public struct TraceInspectorWaterfallRow: Equatable, Sendable {
+    public var span: TraceInspectorSpan
+    public var depth: Int
+    public var startFraction: Double
+    public var widthFraction: Double
+
+    public init(
+        span: TraceInspectorSpan,
+        depth: Int,
+        startFraction: Double,
+        widthFraction: Double
+    ) {
+        self.span = span
+        self.depth = depth
+        self.startFraction = startFraction
+        self.widthFraction = widthFraction
+    }
 }
 
 public struct TraceInspectorTraceID: Hashable, Sendable {
