@@ -340,6 +340,7 @@ enum PreparedCodexTelemetryConfig {
     Unchanged {
         target_path: PathBuf,
         desired_contents: String,
+        setup_config: SetupConfig,
     },
     Replacement {
         target_path: PathBuf,
@@ -362,9 +363,8 @@ impl PreparedCodexTelemetryConfig {
             Self::Unchanged {
                 target_path,
                 desired_contents,
-            } => ensure_installable_state(&target_path)
-                .and_then(|_| write_installed_state(&target_path, &desired_contents))
-                .map_err(|_| ConfigInstallError::ConfigPreserved),
+                setup_config,
+            } => install_unchanged_codex_config(&target_path, &desired_contents, &setup_config),
             Self::Replacement {
                 target_path,
                 temp_path,
@@ -409,6 +409,7 @@ impl PreparedCodexTelemetryConfig {
             Self::Unchanged {
                 target_path,
                 desired_contents,
+                ..
             }
             | Self::Replacement {
                 target_path,
@@ -417,6 +418,34 @@ impl PreparedCodexTelemetryConfig {
             } => managed_file_is_current(target_path, desired_contents),
         }
     }
+}
+
+fn install_unchanged_codex_config(
+    target_path: &Path,
+    desired_contents: &str,
+    setup_config: &SetupConfig,
+) -> Result<(), ConfigInstallError> {
+    if ensure_installable_state(target_path).is_ok()
+        || installed_codex_config_regenerates_to(target_path, desired_contents, setup_config)
+            .unwrap_or(false)
+    {
+        return write_installed_state(target_path, desired_contents)
+            .map_err(|_| ConfigInstallError::ConfigPreserved);
+    }
+    Err(ConfigInstallError::ConfigPreserved)
+}
+
+fn installed_codex_config_regenerates_to(
+    target_path: &Path,
+    desired_contents: &str,
+    setup_config: &SetupConfig,
+) -> Result<bool, KvasirClientError> {
+    ensure_refreshable_state(target_path).map_err(|_| KvasirClientError::Filesystem)?;
+    let installed_contents = fs::read_to_string(managed_state::installed_path(target_path))
+        .map_err(|_| KvasirClientError::Filesystem)?;
+    let regenerated = CodexConfigToml::generate(&installed_contents, setup_config)
+        .map_err(codex_setup_error_to_client_error)?;
+    Ok(regenerated.as_str() == desired_contents)
 }
 
 enum ConfigInstallError {
@@ -442,6 +471,7 @@ fn prepare_codex_telemetry_config(
         return Ok(PreparedCodexTelemetryConfig::Unchanged {
             target_path: codex_config_path,
             desired_contents: generated.as_str().to_owned(),
+            setup_config: setup_config.clone(),
         });
     }
 
@@ -677,6 +707,90 @@ mod tests {
         assert_eq!(managed_setup_snapshot(&config)?, first_apply_snapshot);
         assert_eq!(*credential.write_count.borrow(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_repairs_stale_codex_installed_state_when_config_is_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(temp.path().join(".codex"))?;
+        fs::write(config.codex_config_path.as_path(), "model = \"gpt-5\"\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
+        let installed_path = managed_state::installed_path(config.codex_config_path.as_path());
+        fs::write(&installed_path, "model = \"gpt-5\"\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+
+        assert_eq!(
+            fs::read_to_string(config.codex_config_path.as_path())?,
+            generated
+        );
+        assert_eq!(fs::read_to_string(installed_path)?, generated);
+        assert!(managed_file_is_current(
+            config.codex_config_path.as_path(),
+            &generated
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_refuses_unrelated_stale_codex_installed_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+        fs::create_dir_all(temp.path().join(".codex"))?;
+        fs::write(config.codex_config_path.as_path(), "model = \"gpt-5\"\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.codex_config_path.as_path())?;
+        let installed_path = managed_state::installed_path(config.codex_config_path.as_path());
+        fs::write(&installed_path, "unrelated stale installed marker\n")?;
+
+        let error = configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)
+            .unwrap_err();
+
+        assert!(matches!(error, KvasirClientError::Filesystem));
+        assert_eq!(
+            fs::read_to_string(config.codex_config_path.as_path())?,
+            generated
+        );
+        assert_eq!(
+            fs::read_to_string(installed_path)?,
+            "unrelated stale installed marker\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configure_harness_telemetry_repairs_stale_generated_installed_state_when_file_is_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let credential = MemorySetupCredential::default();
+        let config = full_harness_setup_config(temp.path());
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+        let generated = fs::read_to_string(config.opencode_env_path.as_path())?;
+        let installed_path = managed_state::installed_path(config.opencode_env_path.as_path());
+        fs::write(&installed_path, "stale installed marker\n")?;
+
+        configure_kvasir_harness_telemetry_with_credential(config.clone(), &credential)?;
+
+        assert_eq!(
+            fs::read_to_string(config.opencode_env_path.as_path())?,
+            generated
+        );
+        assert_eq!(fs::read_to_string(installed_path)?, generated);
+        assert!(managed_file_is_current(
+            config.opencode_env_path.as_path(),
+            &generated
+        )?);
+        assert!(config.opencode_env_path.missing_backup_path().exists());
         Ok(())
     }
 
