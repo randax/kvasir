@@ -777,6 +777,61 @@ func switchingPromptsClearsPreviousTraceInspectorWhileNewTraceLoads() async thro
 
 @MainActor
 @Test
+func switchingPromptsDoesNotRestorePreviousTraceInspectorWhenNewTraceFails() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let firstPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let secondPrompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-2")
+    )
+    let firstInspectorSnapshot = TraceInspectorSnapshot(
+        prompt: firstPrompt,
+        traces: [],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("first prompt")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [.captured(.userPrompt)]
+        )
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: firstPrompt)),
+            .success(overviewSnapshot(totalTokens: 8, selectedSession: session, selectedPrompt: secondPrompt)),
+        ]
+    )
+    let traceInspectorClient = SequenceTraceInspectorClient(results: [
+        .success(firstInspectorSnapshot),
+        .failure(TraceInspectorTestError.replayUnavailable),
+    ])
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(firstPrompt))
+    try await viewer.drillDown(to: .prompt(secondPrompt))
+
+    #expect(viewer.selectedPrompt == secondPrompt)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.traceInspectorErrorMessage == TraceInspectorTestError.replayUnavailable.localizedDescription)
+}
+
+@MainActor
+@Test
 func failedSessionDrillDownKeepsPreviousPromptAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let session = OverviewSessionRoute(
