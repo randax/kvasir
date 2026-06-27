@@ -5,7 +5,10 @@ mod setup;
 mod transport;
 mod types;
 
-pub use client::{KvasirClient, KvasirTokenRollupSubscription};
+pub use client::{
+    KvasirClient, KvasirOverviewRefreshSubscription, KvasirTokenRollupSubscription,
+    KvasirUsageUpdateSubscription,
+};
 pub use error::KvasirClientError;
 pub use setup::{
     KvasirClaudeSettingsPath, KvasirCodexConfigPath, KvasirHarnessTelemetrySetup,
@@ -27,7 +30,7 @@ pub use types::{
     KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
     KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTrace,
     KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind,
+    KvasirTraceSpanKind, KvasirUsageUpdateKind,
 };
 
 uniffi::setup_scaffolding!();

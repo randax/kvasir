@@ -481,6 +481,30 @@ func productionFactoryOpensDaemonFallbackAfterSuccessfulStartupForLaterRefreshFa
 
 @MainActor
 @Test
+func productionFactoryWiresLiveOverviewUpdateSourceIntoModel() async throws {
+    let primary = SequenceOverviewClient(results: [
+        .success(overviewSnapshot(totalTokens: 3)),
+        .success(overviewSnapshot(totalTokens: 68)),
+    ])
+    let updateSource = ManualOverviewUpdateSource()
+    let model = ProductionModelFactory.make(
+        overviewClient: primary,
+        overviewUpdateSource: updateSource,
+        launchAgent: DaemonLaunchAgent(registry: RecordingLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await model.start()
+    #expect(model.overviewSnapshot?.totals.totalTokens == 3)
+
+    updateSource.send()
+    await waitForLoadCount(primary, 2)
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 68)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 68)
+}
+
+@MainActor
+@Test
 func productionFactoryDoesNotStartBundledDaemonBeforeStartupGateOpens() async throws {
     let primary = SequenceOverviewClient(results: [
         .failure(DaemonFallbackTestError.recoverable),
@@ -635,6 +659,25 @@ private actor SequenceOverviewClient: OverviewClient {
     }
 }
 
+private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
+    private let continuation: AsyncStream<Void>.Continuation
+    private let stream: AsyncStream<Void>
+
+    init() {
+        var continuation: AsyncStream<Void>.Continuation!
+        stream = AsyncStream { continuation = $0 }
+        self.continuation = continuation
+    }
+
+    func overviewRefreshEvents() -> AsyncStream<Void> {
+        stream
+    }
+
+    func send() {
+        continuation.yield(())
+    }
+}
+
 private func overviewSnapshot(totalTokens: UInt64 = 0) -> OverviewSnapshot {
     OverviewSnapshot(
         totals: OverviewTotals(totalTokens: totalTokens, costUsdNanos: 0, toolCalls: 0),
@@ -682,5 +725,33 @@ private actor RecordingRetryDelay {
 
     func sleep(attempt: Int) async {
         attempts.append(attempt)
+    }
+}
+
+@MainActor
+private func waitForLoadCount(
+    _ client: SequenceOverviewClient,
+    _ count: Int,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async {
+    for _ in 0..<1_000 {
+        if await client.loadCount >= count {
+            return
+        }
+        await Task.yield()
+    }
+    Issue.record("load count was not reached", sourceLocation: sourceLocation)
+}
+
+@MainActor
+private func waitUntil(
+    _ condition: @autoclosure () -> Bool,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async {
+    for _ in 0..<1_000 where !condition() {
+        await Task.yield()
+    }
+    if !condition() {
+        Issue.record("condition was not met", sourceLocation: sourceLocation)
     }
 }

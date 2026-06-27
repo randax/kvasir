@@ -36,6 +36,129 @@ func viewerStartupRegistersDaemonAndLoadsOverviewForDefaultRange() async throws 
 
 @MainActor
 @Test
+func liveOverviewUpdateReloadsDashboardForCurrentSelection() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let updateSource = ManualOverviewUpdateSource()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.start()
+    #expect(model.overviewSnapshot?.totals.totalTokens == 35)
+
+    updateSource.send()
+    await client.waitForQueries(count: 2)
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query,
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query
+    ])
+}
+
+@MainActor
+@Test
+func failedLiveOverviewUpdateKeepsSnapshotAndListenerRecovers() async throws {
+    let updateSource = ManualOverviewUpdateSource()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .failure(StartupTestError.transient),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await model.start()
+    let previousSnapshot = model.overviewSnapshot
+
+    updateSource.send()
+    await client.waitForQueries(count: 2)
+    await waitUntil(model.errorMessage == "transient")
+
+    #expect(model.overviewSnapshot == previousSnapshot)
+    #expect(model.errorMessage == "transient")
+
+    updateSource.send()
+    await client.waitForQueries(count: 3)
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+    #expect(model.errorMessage == nil)
+}
+
+@MainActor
+@Test
+func liveOverviewListenerDoesNotRetainModel() async throws {
+    let updateSource = ManualOverviewUpdateSource()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35))
+        ]
+    )
+    var model: KvasirViewerModel? = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+    let releasedModel = WeakKvasirViewerModelReference(model)
+
+    try await model?.start()
+    #expect(releasedModel.model?.overviewSnapshot?.totals.totalTokens == 35)
+
+    model = nil
+    await waitUntil(releasedModel.model == nil)
+
+    #expect(releasedModel.model == nil)
+}
+
+@MainActor
+@Test
+func successfulRefreshAfterStartupFailureStartsLiveOverviewUpdates() async throws {
+    let updateSource = ManualOverviewUpdateSource()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .failure(StartupTestError.transient),
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    do {
+        try await model.start()
+        Issue.record("expected startup overview failure")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+    #expect(model.overviewSnapshot == nil)
+
+    try await model.refreshOverview()
+    #expect(model.overviewSnapshot?.totals.totalTokens == 35)
+
+    updateSource.send()
+    await client.waitForQueries(count: 3)
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+}
+
+@MainActor
+@Test
 func viewerStartupWarnsAndContinuesWhenTelemetrySetupFails() async throws {
     let client = RecordingStartupOverviewClient(
         snapshot: overviewSnapshot()
@@ -682,6 +805,7 @@ private final class RecordingStartupOverviewClient: OverviewClient, @unchecked S
 private final class RecordingResultOverviewClient: OverviewClient, @unchecked Sendable {
     private let results: [Result<OverviewSnapshot, any Error>]
     private(set) var queries: [OverviewQuery] = []
+    private var queryWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     init(results: [Result<OverviewSnapshot, any Error>]) {
         self.results = results
@@ -689,7 +813,25 @@ private final class RecordingResultOverviewClient: OverviewClient, @unchecked Se
 
     func loadOverviewSnapshot(query: OverviewQuery) async throws -> OverviewSnapshot {
         queries.append(query)
+        resumeQueryWaiters()
         return try results[queries.count - 1].get()
+    }
+
+    func waitForQueries(count: Int) async {
+        guard queries.count < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            queryWaiters.append((count, continuation))
+        }
+    }
+
+    private func resumeQueryWaiters() {
+        let readyWaiters = queryWaiters.filter { queries.count >= $0.0 }
+        queryWaiters.removeAll { queries.count >= $0.0 }
+        for waiter in readyWaiters {
+            waiter.1.resume()
+        }
     }
 }
 
@@ -856,6 +998,33 @@ private final class RecordingOverviewRecoveryGate: @unchecked Sendable {
     }
 }
 
+private final class WeakKvasirViewerModelReference {
+    weak var model: KvasirViewerModel?
+
+    init(_ model: KvasirViewerModel?) {
+        self.model = model
+    }
+}
+
+private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
+    private let continuation: AsyncStream<Void>.Continuation
+    private let stream: AsyncStream<Void>
+
+    init() {
+        var continuation: AsyncStream<Void>.Continuation!
+        stream = AsyncStream { continuation = $0 }
+        self.continuation = continuation
+    }
+
+    func overviewRefreshEvents() -> AsyncStream<Void> {
+        stream
+    }
+
+    func send() {
+        continuation.yield(())
+    }
+}
+
 private enum StartupEvent: Equatable {
     case configuredTelemetry
     case registeredLaunchAgent
@@ -946,5 +1115,18 @@ private enum StartupTestError: LocalizedError {
 
     var errorDescription: String? {
         "transient"
+    }
+}
+
+@MainActor
+private func waitUntil(
+    _ condition: @autoclosure () -> Bool,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async {
+    for _ in 0..<1_000 where !condition() {
+        await Task.yield()
+    }
+    if !condition() {
+        Issue.record("condition was not met", sourceLocation: sourceLocation)
     }
 }

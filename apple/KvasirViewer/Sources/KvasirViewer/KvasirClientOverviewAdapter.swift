@@ -16,6 +16,59 @@ struct KvasirClientRollupSource: OverviewRollupSource {
     }
 }
 
+struct KvasirClientUsageUpdateSource: OverviewUpdateSource {
+    let socketPath: String
+
+    func overviewRefreshEvents() -> AsyncStream<Void> {
+        AsyncStream { continuation in
+            let subscriptionBox = KvasirOverviewRefreshSubscriptionBox()
+            let task = Task.detached(priority: .background) {
+                do {
+                    let subscription = try KvasirOverviewRefreshSubscription.connect(socketPath: socketPath)
+                    subscriptionBox.replace(with: subscription)
+                    while !Task.isCancelled {
+                        try subscription.next()
+                        continuation.yield(())
+                    }
+                } catch {
+                    subscriptionBox.clear()
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+                subscriptionBox.close()
+            }
+        }
+    }
+}
+
+private final class KvasirOverviewRefreshSubscriptionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var subscription: KvasirOverviewRefreshSubscription?
+
+    func replace(with subscription: KvasirOverviewRefreshSubscription) {
+        lock.withLock {
+            self.subscription = subscription
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            subscription = nil
+        }
+    }
+
+    func close() {
+        let subscription = lock.withLock {
+            let subscription = self.subscription
+            self.subscription = nil
+            return subscription
+        }
+        try? subscription?.close()
+    }
+}
+
 func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
     KvasirRollupQuery(
         start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),

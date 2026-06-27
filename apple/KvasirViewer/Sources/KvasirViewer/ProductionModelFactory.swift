@@ -9,6 +9,7 @@ enum ProductionModelFactory {
     @MainActor
     static func make(
         overviewClient: (any OverviewClient)? = nil,
+        overviewUpdateSource: (any OverviewUpdateSource)? = nil,
         daemonStarter: any DaemonProcessStarter = BundledDaemonProcess.shared,
         daemonFallbackGate: DaemonFallbackGate = DaemonFallbackGate(),
         launchAgent: DaemonLaunchAgent = DaemonLaunchAgent(),
@@ -23,7 +24,8 @@ enum ProductionModelFactory {
                     shouldStartDaemonAfterError: { error in
                         daemonFallbackGate.isEnabled && shouldStartBundledDaemonAfterOverviewError(error)
                     }
-                )
+                ),
+                updateSource: overviewUpdateSource ?? makeOverviewUpdateSource(primary: overviewClient)
             ),
             telemetrySetup: makeHarnessTelemetrySetup(),
             launchAgent: launchAgent,
@@ -60,6 +62,18 @@ enum ProductionModelFactory {
         )
         #else
         return MissingKvasirClient()
+        #endif
+    }
+
+    @MainActor
+    private static func makeOverviewUpdateSource(primary: (any OverviewClient)?) -> (any OverviewUpdateSource)? {
+        guard primary == nil else {
+            return nil
+        }
+        #if canImport(kvasir_client)
+        return KvasirClientUsageUpdateSource(socketPath: rpcSocketPath)
+        #else
+        return nil
         #endif
     }
 
