@@ -538,6 +538,79 @@ func drillDownProgressesFromRepoToModelToSessionToPrompt() async throws {
 
 @MainActor
 @Test
+func promptDrillDownLoadsTraceInspectorSnapshot() async throws {
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let inspectorSnapshot = TraceInspectorSnapshot(
+        prompt: prompt,
+        traces: [
+            TraceInspectorTrace(
+                traceID: TraceInspectorTraceID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                spans: [
+                    TraceInspectorSpan(
+                        spanID: TraceInspectorSpanID("1111111111111111"),
+                        parentSpanID: nil,
+                        kind: .interaction,
+                        name: TraceInspectorSpanName("opencode.interaction"),
+                        startedAt: Date(timeIntervalSince1970: 1_781_956_800),
+                        endedAt: Date(timeIntervalSince1970: 1_781_956_802),
+                        durationMilliseconds: 2_000,
+                        toolName: nil
+                    )
+                ],
+                durations: TraceInspectorDurations(
+                    timeToFirstTokenMilliseconds: 250,
+                    requestMilliseconds: 1_500,
+                    toolMilliseconds: nil
+                )
+            )
+        ],
+        content: [
+            TraceInspectorContentItem(
+                occurredAt: Date(timeIntervalSince1970: 1_781_956_801),
+                harness: OverviewHarnessName("opencode"),
+                kind: .userPrompt,
+                content: TraceInspectorContentText("summarize README.md")
+            )
+        ],
+        contentAvailability: .captured(
+            harness: OverviewHarnessName("opencode"),
+            kinds: [
+                .captured(.userPrompt)
+            ]
+        )
+    )
+    let overviewClient = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt))
+        ]
+    )
+    let traceInspectorClient = RecordingTraceInspectorClient(
+        snapshot: inspectorSnapshot
+    )
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: overviewClient),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+
+    #expect(traceInspectorClient.queries == [
+        TraceInspectorQuery(prompt: prompt)
+    ])
+    #expect(viewer.traceInspectorSnapshot == inspectorSnapshot)
+    #expect(viewer.traceInspectorErrorMessage == nil)
+}
+
+@MainActor
+@Test
 func failedSessionDrillDownKeepsPreviousPromptAndSnapshot() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let session = OverviewSessionRoute(
@@ -832,6 +905,20 @@ private final class RecordingResultOverviewClient: OverviewClient, @unchecked Se
         for waiter in readyWaiters {
             waiter.1.resume()
         }
+    }
+}
+
+private final class RecordingTraceInspectorClient: TraceInspectorClient, @unchecked Sendable {
+    private let snapshot: TraceInspectorSnapshot
+    private(set) var queries: [TraceInspectorQuery] = []
+
+    init(snapshot: TraceInspectorSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
+        queries.append(query)
+        return snapshot
     }
 }
 
