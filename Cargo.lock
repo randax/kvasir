@@ -1275,6 +1275,7 @@ dependencies = [
  "http",
  "keyring",
  "kvasir-core",
+ "libc",
  "opentelemetry-proto",
  "prost",
  "reqwest",

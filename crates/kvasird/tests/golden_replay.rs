@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex as StdMutex};
 use std::time::Duration;
 
 use base64::Engine;
 use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
+use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence};
 use kvasir_core::rpc::{
     BearerToken, ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay,
     ContentReplayItem, ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource,
@@ -19,7 +23,7 @@ use kvasir_core::{
 };
 use kvasird::{
     DaemonConfig, RunningDaemon, StoreKeySource, query_content, query_cost_rollup,
-    query_token_rollup, query_tool_call_rollup, query_trace, start_with_store_key_source,
+    query_token_rollup, query_tool_call_rollup, query_trace, start, start_with_store_key_source,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -32,6 +36,10 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use zeroize::Zeroizing;
+
+const TEST_STORE_KEY_BYTES: [u8; 32] = [11; 32];
+static TEST_KEYRING_DEFAULT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::Result<()> {
@@ -1513,7 +1521,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
                 bearer_token: bearer_token.clone(),
                 price_table: PriceTable::bundled_defaults(),
             },
-            StoreKeySource::static_key_for_test([11; 32]),
+            StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
         )
         .await?;
 
@@ -1535,7 +1543,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
             bearer_token,
             price_table: PriceTable::bundled_defaults(),
         },
-        StoreKeySource::static_key_for_test([11; 32]),
+        StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
     )
     .await?;
 
@@ -1575,6 +1583,506 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
             },
         ]
     );
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_generates_reuses_and_requires_keychain_key() -> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let config = DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path,
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    };
+
+    {
+        let daemon = start(config.clone()).await?;
+
+        reqwest::Client::new()
+            .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+            .header(AUTHORIZATION, "Bearer test-token")
+            .header(CONTENT_TYPE, "application/json")
+            .body(repo_and_no_repo_metrics_fixture())
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    assert_eq!(test_keyring.set_count(), 1);
+
+    let daemon = start(config.clone()).await?;
+
+    assert_eq!(test_keyring.set_count(), 1);
+    assert_eq!(test_keyring.get_count(), 2);
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), repo_and_no_repo_rollup_query()).await?,
+        repo_and_no_repo_expected_rollups()?
+    );
+
+    drop(daemon);
+    let saved_passwords = test_keyring.take_passwords();
+
+    let error = match start(config.clone()).await {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("missing key must fail startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(
+            &error,
+            "store key is missing for existing encrypted database"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 1);
+
+    test_keyring.replace_passwords(saved_passwords);
+    let daemon = start(config.clone()).await?;
+
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), repo_and_no_repo_rollup_query()).await?,
+        repo_and_no_repo_expected_rollups()?
+    );
+
+    drop(daemon);
+
+    let saved_passwords = test_keyring.take_passwords();
+    let mut wrong_key_passwords = saved_passwords.clone();
+    let wrong_key = StoreKey::from_bytes([12; 32]).to_hex_secret();
+    for password in wrong_key_passwords.values_mut() {
+        *password = wrong_key.as_bytes().to_vec();
+    }
+    test_keyring.replace_passwords(wrong_key_passwords);
+
+    let get_count_before_wrong_key = test_keyring.get_count();
+    let error = match start(config.clone()).await {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("wrong key must fail startup");
+        }
+        Err(error) => error,
+    };
+
+    assert_eq!(test_keyring.get_count(), get_count_before_wrong_key + 1);
+    assert!(
+        !error_chain_contains(
+            &error,
+            "store key is missing for existing encrypted database"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 1);
+
+    test_keyring.replace_passwords(saved_passwords);
+    let daemon = start(config).await?;
+
+    assert_eq!(
+        query_token_rollup(rpc_socket_path, repo_and_no_repo_rollup_query()).await?,
+        repo_and_no_repo_expected_rollups()?
+    );
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_generates_key_for_empty_placeholder_database() -> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    std::fs::File::create(&database_path)?;
+
+    let daemon = start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path,
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    assert_eq!(test_keyring.set_count(), 1);
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_requires_key_for_empty_database_with_sidecar() -> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let wal_path = sqlite_sidecar_test_path(&database_path, "-wal");
+    std::fs::File::create(&database_path)?;
+    std::fs::write(&wal_path, "preserved wal")?;
+
+    let error = match start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await
+    {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("sidecar state without a key must fail startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(
+            &error,
+            "store key is missing for existing encrypted database"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 0);
+    assert_eq!(std::fs::metadata(&database_path)?.len(), 0);
+    assert_eq!(std::fs::read_to_string(&wal_path)?, "preserved wal");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn daemon_default_start_requires_key_for_symlinked_empty_database_with_sidecar()
+-> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let real_database_path = temp.path().join("real.sqlite3");
+    let symlink_database_path = temp.path().join("alias.sqlite3");
+    let wal_path = sqlite_sidecar_test_path(&real_database_path, "-wal");
+    std::fs::File::create(&real_database_path)?;
+    std::os::unix::fs::symlink(&real_database_path, &symlink_database_path)?;
+    std::fs::write(&wal_path, "preserved canonical wal")?;
+
+    let error = match start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: symlink_database_path,
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await
+    {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("canonical sidecar state without a key must fail startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(
+            &error,
+            "store key is missing for existing encrypted database"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 0);
+    assert_eq!(std::fs::metadata(&real_database_path)?.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&wal_path)?,
+        "preserved canonical wal"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn daemon_default_start_rejects_dangling_database_symlink_before_key_persistence()
+-> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    std::os::unix::fs::symlink(temp.path().join("missing.sqlite3"), &database_path)?;
+
+    let error = match start(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path,
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await
+    {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("dangling database symlink must fail startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(&error, "database path is not a regular file"),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn daemon_default_start_opens_stable_database_path_after_alias_retarget() -> anyhow::Result<()>
+{
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let keyring_set_pause = test_keyring.pause_next_set();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let first_database_path = temp.path().join("first.sqlite3");
+    let second_database_path = temp.path().join("second.sqlite3");
+    let symlink_database_path = temp.path().join("alias.sqlite3");
+    std::fs::File::create(&first_database_path)?;
+    std::os::unix::fs::symlink(&first_database_path, &symlink_database_path)?;
+    let config = DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: symlink_database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    };
+
+    let start_task = tokio::spawn(start(config));
+    keyring_set_pause.wait_until_set_paused();
+    std::fs::remove_file(&symlink_database_path)?;
+    std::os::unix::fs::symlink(&second_database_path, &symlink_database_path)?;
+    keyring_set_pause.release_set();
+
+    let daemon = start_task.await??;
+
+    assert_eq!(test_keyring.set_count(), 1);
+    assert!(std::fs::metadata(&first_database_path)?.len() > 0);
+    assert!(!second_database_path.try_exists()?);
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_cleans_bootstrap_database_when_keychain_write_fails()
+-> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let config = DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    };
+
+    test_keyring.fail_next_set();
+    let error = match start(config.clone()).await {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("keychain write failure must fail first startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(&error, "configured keyring write failure"),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 1);
+    assert!(!database_path.try_exists()?);
+
+    let daemon = start(config).await?;
+
+    assert_eq!(test_keyring.set_count(), 2);
+    assert!(database_path.try_exists()?);
+    assert!(std::fs::metadata(&database_path)?.len() > 0);
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_restores_empty_placeholder_when_keychain_write_fails()
+-> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    std::fs::File::create(&database_path)?;
+    let config = DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    };
+
+    test_keyring.fail_next_set();
+    let error = match start(config.clone()).await {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("keychain write failure must fail placeholder startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(&error, "configured keyring write failure"),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 1);
+    assert!(database_path.try_exists()?);
+    assert_eq!(std::fs::metadata(&database_path)?.len(), 0);
+
+    let daemon = start(config).await?;
+
+    assert_eq!(test_keyring.set_count(), 2);
+    assert!(std::fs::metadata(&database_path)?.len() > 0);
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_preserves_key_when_store_open_bootstrap_fails() -> anyhow::Result<()>
+{
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let mut lock_path = database_path.as_os_str().to_os_string();
+    lock_path.push(".startup-lock");
+    let lock_path = PathBuf::from(lock_path);
+    std::fs::File::create(&database_path)?;
+    std::fs::File::create(&lock_path)?;
+    std::fs::set_permissions(&database_path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+    let directory_permissions_restore =
+        DirectoryPermissionsRestore::make_read_only(temp.path().to_path_buf())?;
+    let config = DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    };
+
+    let error = match start(config.clone()).await {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("store-open bootstrap failure must fail first startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        !error_chain_contains(
+            &error,
+            "store key is missing for existing encrypted database"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 1);
+    assert_eq!(test_keyring.stored_password_count(), 1);
+    assert_eq!(std::fs::metadata(&database_path)?.len(), 0);
+
+    drop(directory_permissions_restore);
+    let daemon = start(config).await?;
+
+    assert_eq!(test_keyring.set_count(), 1);
+    assert!(std::fs::metadata(&database_path)?.len() > 0);
+
+    drop(daemon);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_default_start_preserves_key_when_bootstrap_database_prepare_fails()
+-> anyhow::Result<()> {
+    let _keyring_default_guard = TEST_KEYRING_DEFAULT_LOCK.lock().await;
+    let test_keyring = PersistentTestKeyring::default();
+    let _keyring_default_override = test_keyring.install_as_default_keyring();
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let mut lock_path = database_path.as_os_str().to_os_string();
+    lock_path.push(".startup-lock");
+    let lock_path = PathBuf::from(lock_path);
+    std::fs::File::create(&lock_path)?;
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+    let directory_permissions_restore =
+        DirectoryPermissionsRestore::make_read_only(temp.path().to_path_buf())?;
+    let config = DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    };
+
+    let error = match start(config.clone()).await {
+        Ok(daemon) => {
+            drop(daemon);
+            anyhow::bail!("database prepare failure must fail first startup");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error_chain_contains(&error, "Permission denied"),
+        "{error:?}"
+    );
+    assert_eq!(test_keyring.set_count(), 1);
+    assert!(!database_path.try_exists()?);
+    assert_eq!(test_keyring.stored_password_count(), 1);
+
+    drop(directory_permissions_restore);
+    let daemon = start(config).await?;
+
+    assert_eq!(test_keyring.set_count(), 1);
+    assert!(database_path.try_exists()?);
 
     drop(daemon);
 
@@ -2486,7 +2994,11 @@ fn claude_token_usage_protobuf_fixture() -> anyhow::Result<Vec<u8>> {
 }
 
 async fn start_test_daemon(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
-    start_with_store_key_source(config, StoreKeySource::static_key_for_test([11; 32])).await
+    start_with_store_key_source(
+        config,
+        StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
+    )
+    .await
 }
 
 fn kvasir_repo() -> RepoBucket {
@@ -3771,9 +4283,7 @@ fn custom_price_token_usage_fixture() -> &'static str {
 fn persisted_opencode_content_rows(
     database_path: &Path,
 ) -> anyhow::Result<Vec<(String, String, String)>> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let connection = open_test_store_connection(database_path)?;
     let mut statement = connection.prepare(
         "SELECT harness, content_kind, content
          FROM canonical_content_records
@@ -3799,9 +4309,7 @@ struct PersistedRawBodyRow {
 }
 
 fn persisted_raw_body_rows(database_path: &Path) -> anyhow::Result<Vec<PersistedRawBodyRow>> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let connection = open_test_store_connection(database_path)?;
     let mut statement = connection.prepare(
         "SELECT harness, content_kind, compression, compressed_body
          FROM canonical_raw_body_records
@@ -3821,11 +4329,286 @@ fn persisted_raw_body_rows(database_path: &Path) -> anyhow::Result<Vec<Persisted
 }
 
 fn initialize_test_store(database_path: &Path) -> anyhow::Result<()> {
-    let key = StoreKey::from_bytes([11; 32]);
+    let key = test_store_key();
     let store =
         UsageStore::open_with_price_table(database_path, &key, PriceTable::bundled_defaults())?;
     drop(store);
     Ok(())
+}
+
+fn open_test_store_connection(database_path: &Path) -> anyhow::Result<rusqlite::Connection> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    let raw_key = test_store_key().to_hex_secret();
+    let sql = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", raw_key.as_str()));
+    connection.execute_batch(sql.as_str())?;
+    Ok(connection)
+}
+
+fn test_store_key() -> StoreKey {
+    StoreKey::from_bytes(TEST_STORE_KEY_BYTES)
+}
+
+fn sqlite_sidecar_test_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn repo_and_no_repo_rollup_query() -> RollupQuery {
+    RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    )
+}
+
+fn repo_and_no_repo_expected_rollups() -> anyhow::Result<Vec<TokenRollup>> {
+    Ok(vec![
+        TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: RepoBucket::no_repo(),
+            model: ModelName::new("claude-opus-4-20250514"),
+            input_tokens: 25,
+            output_tokens: 0,
+            cache_tokens: 0,
+        },
+        TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("claude-opus-4-20250514"),
+            input_tokens: 100,
+            output_tokens: 0,
+            cache_tokens: 0,
+        },
+        TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: other_kvasir_repo(),
+            model: ModelName::new("claude-opus-4-20250514"),
+            input_tokens: 40,
+            output_tokens: 0,
+            cache_tokens: 0,
+        },
+    ])
+}
+
+fn error_chain_contains(error: &anyhow::Error, expected: &str) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(expected))
+}
+
+#[derive(Clone, Default)]
+struct PersistentTestKeyring {
+    passwords: Arc<StdMutex<HashMap<TestCredentialKey, Vec<u8>>>>,
+    get_count: Arc<AtomicUsize>,
+    set_count: Arc<AtomicUsize>,
+    set_failures_remaining: Arc<AtomicUsize>,
+    set_pause: Arc<StdMutex<Option<Arc<KeyringSetPause>>>>,
+}
+
+impl PersistentTestKeyring {
+    fn install_as_default_keyring(&self) -> KeyringDefaultOverride {
+        keyring::set_default_credential_builder(Box::new(PersistentTestCredentialBuilder {
+            keyring: self.clone(),
+        }));
+        KeyringDefaultOverride
+    }
+
+    fn get_count(&self) -> usize {
+        self.get_count.load(Ordering::SeqCst)
+    }
+
+    fn set_count(&self) -> usize {
+        self.set_count.load(Ordering::SeqCst)
+    }
+
+    fn fail_next_set(&self) {
+        self.set_failures_remaining.store(1, Ordering::SeqCst);
+    }
+
+    fn pause_next_set(&self) -> Arc<KeyringSetPause> {
+        let pause = Arc::new(KeyringSetPause::new());
+        *self.set_pause.lock().expect("test keyring mutex poisoned") = Some(pause.clone());
+        pause
+    }
+
+    fn stored_password_count(&self) -> usize {
+        self.passwords
+            .lock()
+            .expect("test keyring mutex poisoned")
+            .len()
+    }
+
+    fn take_passwords(&self) -> HashMap<TestCredentialKey, Vec<u8>> {
+        std::mem::take(&mut *self.passwords.lock().expect("test keyring mutex poisoned"))
+    }
+
+    fn replace_passwords(&self, passwords: HashMap<TestCredentialKey, Vec<u8>>) {
+        self.passwords
+            .lock()
+            .expect("test keyring mutex poisoned")
+            .extend(passwords);
+    }
+}
+
+struct KeyringSetPause {
+    set_paused: Barrier,
+    set_released: Barrier,
+}
+
+impl KeyringSetPause {
+    fn new() -> Self {
+        Self {
+            set_paused: Barrier::new(2),
+            set_released: Barrier::new(2),
+        }
+    }
+
+    fn wait_until_set_paused(&self) {
+        self.set_paused.wait();
+    }
+
+    fn release_set(&self) {
+        self.set_released.wait();
+    }
+
+    fn pause_set(&self) {
+        self.set_paused.wait();
+        self.set_released.wait();
+    }
+}
+
+struct KeyringDefaultOverride;
+
+impl Drop for KeyringDefaultOverride {
+    fn drop(&mut self) {
+        keyring::set_default_credential_builder(keyring::default::default_credential_builder());
+    }
+}
+
+struct PersistentTestCredentialBuilder {
+    keyring: PersistentTestKeyring,
+}
+
+impl CredentialBuilderApi for PersistentTestCredentialBuilder {
+    fn build(
+        &self,
+        target: Option<&str>,
+        service: &str,
+        user: &str,
+    ) -> keyring::Result<Box<Credential>> {
+        Ok(Box::new(PersistentTestCredential {
+            key: TestCredentialKey {
+                target: target.map(str::to_owned),
+                service: service.to_owned(),
+                user: user.to_owned(),
+            },
+            keyring: self.keyring.clone(),
+        }))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn persistence(&self) -> CredentialPersistence {
+        CredentialPersistence::UntilDelete
+    }
+}
+
+struct PersistentTestCredential {
+    key: TestCredentialKey,
+    keyring: PersistentTestKeyring,
+}
+
+impl CredentialApi for PersistentTestCredential {
+    fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
+        self.keyring.set_count.fetch_add(1, Ordering::SeqCst);
+        if self
+            .keyring
+            .set_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("configured keyring write failure"),
+            )));
+        }
+        self.keyring
+            .passwords
+            .lock()
+            .expect("test keyring mutex poisoned")
+            .insert(self.key.clone(), secret.to_vec());
+        if let Some(pause) = self
+            .keyring
+            .set_pause
+            .lock()
+            .expect("test keyring mutex poisoned")
+            .take()
+        {
+            pause.pause_set();
+        }
+        Ok(())
+    }
+
+    fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+        self.keyring.get_count.fetch_add(1, Ordering::SeqCst);
+        self.keyring
+            .passwords
+            .lock()
+            .expect("test keyring mutex poisoned")
+            .get(&self.key)
+            .cloned()
+            .ok_or(keyring::Error::NoEntry)
+    }
+
+    fn delete_credential(&self) -> keyring::Result<()> {
+        let removed = self
+            .keyring
+            .passwords
+            .lock()
+            .expect("test keyring mutex poisoned")
+            .remove(&self.key);
+        match removed {
+            Some(_) => Ok(()),
+            None => Err(keyring::Error::NoEntry),
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn debug_fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PersistentTestCredential(<redacted>)")
+    }
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct TestCredentialKey {
+    target: Option<String>,
+    service: String,
+    user: String,
+}
+
+struct DirectoryPermissionsRestore {
+    path: PathBuf,
+    mode: u32,
+}
+
+impl DirectoryPermissionsRestore {
+    fn make_read_only(path: PathBuf) -> anyhow::Result<Self> {
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))?;
+        Ok(Self { path, mode })
+    }
+}
+
+impl Drop for DirectoryPermissionsRestore {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+    }
 }
 
 fn insert_raw_body_import_queue_row(
@@ -3833,9 +4616,7 @@ fn insert_raw_body_import_queue_row(
     body_ref: &str,
     occurred_at_ms: i64,
 ) -> anyhow::Result<String> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let connection = open_test_store_connection(database_path)?;
     let occurred_at_nanos = occurred_at_ms * 1_000_000;
     let event_key = format!(
         "otel-raw-body-file\nrepo_bucket=repo\nrepo_name=kvasir\nrepo_path=/Users/oyr/projects/kvasir\nharness=claude_code\nsession_id=claude-session-1\nprompt_id=claude-turn-1\nkind=raw_api_request\noccurred_at_nanos={occurred_at_nanos}\nbody_ref={body_ref}\n"
@@ -3876,9 +4657,7 @@ fn insert_persisted_raw_body_row_for_event(
     event_key: &str,
     compression: &str,
 ) -> anyhow::Result<()> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let connection = open_test_store_connection(database_path)?;
     connection.execute(
         "INSERT INTO canonical_raw_body_records (
             event_key,
@@ -3915,9 +4694,7 @@ fn insert_persisted_raw_body_row_for_event(
 }
 
 fn raw_body_import_queue_body_refs(database_path: &Path) -> anyhow::Result<Vec<String>> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let connection = open_test_store_connection(database_path)?;
     let mut statement =
         connection.prepare("SELECT body_ref FROM raw_body_import_queue ORDER BY body_ref")?;
     let rows = statement
@@ -3927,9 +4704,7 @@ fn raw_body_import_queue_body_refs(database_path: &Path) -> anyhow::Result<Vec<S
 }
 
 fn delete_raw_body_import_queue_event(database_path: &Path, event_key: &str) -> anyhow::Result<()> {
-    let connection = rusqlite::Connection::open(database_path)?;
-    let raw_key = "0b".repeat(32);
-    connection.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))?;
+    let connection = open_test_store_connection(database_path)?;
     connection.execute(
         "DELETE FROM raw_body_import_queue WHERE event_key = ?1",
         [event_key],

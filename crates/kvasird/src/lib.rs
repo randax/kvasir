@@ -3,7 +3,7 @@ use std::fs::File;
 use std::net::SocketAddr;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -104,10 +104,60 @@ impl StoreKeySource {
         Self::Static(StoreKey::from_bytes(bytes))
     }
 
-    fn resolve(&self) -> anyhow::Result<StoreKey> {
+    fn resolve(
+        &self,
+        missing_key_policy: MissingStoreKeyPolicy,
+    ) -> anyhow::Result<ResolvedStoreKey> {
         match self {
-            Self::Keychain(source) => source.resolve(),
-            Self::Static(key) => Ok(key.clone()),
+            Self::Keychain(source) => source.resolve(missing_key_policy),
+            Self::Static(key) => Ok(ResolvedStoreKey::existing(key.clone())),
+        }
+    }
+
+    fn persist_generated_key(&self, resolved_key: &ResolvedStoreKey) -> anyhow::Result<()> {
+        if !resolved_key.was_generated {
+            return Ok(());
+        }
+        match self {
+            Self::Keychain(source) => source.persist(&resolved_key.key),
+            Self::Static(_key) => Ok(()),
+        }
+    }
+}
+
+struct ResolvedStoreKey {
+    key: StoreKey,
+    was_generated: bool,
+}
+
+impl ResolvedStoreKey {
+    fn existing(key: StoreKey) -> Self {
+        Self {
+            key,
+            was_generated: false,
+        }
+    }
+
+    fn generated(key: StoreKey) -> Self {
+        Self {
+            key,
+            was_generated: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MissingStoreKeyPolicy {
+    Create,
+    RequireExisting,
+}
+
+impl MissingStoreKeyPolicy {
+    fn for_database_requires_key(database_requires_key: bool) -> Self {
+        if database_requires_key {
+            Self::RequireExisting
+        } else {
+            Self::Create
         }
     }
 }
@@ -126,9 +176,18 @@ impl KeychainStoreKeySource {
         }
     }
 
-    fn resolve(&self) -> anyhow::Result<StoreKey> {
+    fn resolve(
+        &self,
+        missing_key_policy: MissingStoreKeyPolicy,
+    ) -> anyhow::Result<ResolvedStoreKey> {
         let entry = keyring::Entry::new(self.service, &self.user)?;
-        resolve_store_key(&KeyringStoreKeyCredential { entry })
+        resolve_store_key(&KeyringStoreKeyCredential { entry }, missing_key_policy)
+    }
+
+    fn persist(&self, key: &StoreKey) -> anyhow::Result<()> {
+        let entry = keyring::Entry::new(self.service, &self.user)?;
+        let encoded_key = key.to_hex_secret();
+        KeyringStoreKeyCredential { entry }.set_password(&encoded_key)
     }
 }
 
@@ -160,17 +219,24 @@ impl StoreKeyCredential for KeyringStoreKeyCredential {
     }
 }
 
-fn resolve_store_key(credential: &impl StoreKeyCredential) -> anyhow::Result<StoreKey> {
+fn resolve_store_key(
+    credential: &impl StoreKeyCredential,
+    missing_key_policy: MissingStoreKeyPolicy,
+) -> anyhow::Result<ResolvedStoreKey> {
     match credential.get_password() {
         Ok(encoded_key) => {
             let encoded_key = Zeroizing::new(encoded_key);
-            Ok(StoreKey::from_hex(&encoded_key)?)
+            Ok(ResolvedStoreKey::existing(StoreKey::from_hex(
+                &encoded_key,
+            )?))
+        }
+        Err(StoreKeyCredentialReadError::NoEntry)
+            if matches!(missing_key_policy, MissingStoreKeyPolicy::Create) =>
+        {
+            Ok(ResolvedStoreKey::generated(StoreKey::generate()?))
         }
         Err(StoreKeyCredentialReadError::NoEntry) => {
-            let key = StoreKey::generate()?;
-            let encoded_key = key.to_hex_secret();
-            credential.set_password(&encoded_key)?;
-            Ok(key)
+            Err(DaemonError::StoreKeyMissingForExistingDatabase.into())
         }
         Err(StoreKeyCredentialReadError::Read(err)) => Err(err),
     }
@@ -295,21 +361,55 @@ struct DaemonState {
 }
 
 pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
-    let store_key_source = StoreKeySource::keychain_for_database(&config.database_path);
-    start_with_store_key_source(config, store_key_source).await
+    let stable_database_path = canonical_database_path(&config.database_path);
+    let store_key_source = StoreKeySource::keychain_for_database(&stable_database_path);
+    start_with_store_key_source_at_stable_path(config, store_key_source, stable_database_path).await
 }
 
 pub async fn start_with_store_key_source(
     config: DaemonConfig,
     store_key_source: StoreKeySource,
 ) -> anyhow::Result<RunningDaemon> {
-    let _startup_lock = StoreStartupLock::acquire(&config.database_path).await?;
-    let store_key = store_key_source.resolve()?;
-    let store = UsageStore::open_with_price_table(
-        &config.database_path,
-        &store_key,
-        config.price_table.clone(),
+    let stable_database_path = canonical_database_path(&config.database_path);
+    start_with_store_key_source_at_stable_path(config, store_key_source, stable_database_path).await
+}
+
+async fn start_with_store_key_source_at_stable_path(
+    config: DaemonConfig,
+    store_key_source: StoreKeySource,
+    stable_database_path: PathBuf,
+) -> anyhow::Result<RunningDaemon> {
+    let _startup_lock = StoreStartupLock::acquire(&stable_database_path).await?;
+    let database_requires_key =
+        database_requires_existing_store_key_at_stable_path(&stable_database_path)?;
+    let bootstrap_cleanup =
+        BootstrapDatabaseCleanup::capture(&stable_database_path, database_requires_key)?;
+    let resolved_store_key = store_key_source.resolve(
+        MissingStoreKeyPolicy::for_database_requires_key(database_requires_key),
     )?;
+    store_key_source.persist_generated_key(&resolved_store_key)?;
+    let bootstrap_cleanup = match bootstrap_cleanup.prepare_for_database_open(&stable_database_path)
+    {
+        Ok(bootstrap_cleanup) => bootstrap_cleanup,
+        Err(err) => return Err(err.into()),
+    };
+    let store = match UsageStore::open_with_price_table(
+        &stable_database_path,
+        &resolved_store_key.key,
+        config.price_table.clone(),
+    ) {
+        Ok(store) => store,
+        Err(err) => {
+            if resolved_store_key.was_generated {
+                rollback_failed_generated_key_bootstrap(
+                    &stable_database_path,
+                    &bootstrap_cleanup,
+                    &err,
+                )?;
+            }
+            return Err(err.into());
+        }
+    };
     let raw_body_directory = prepare_raw_body_directory(&config.database_path)?;
     let (overview_updates, _overview_update_receiver) = broadcast::channel(32);
     let (usage_updates, _usage_update_receiver) = broadcast::channel(32);
@@ -432,8 +532,8 @@ struct StoreStartupLock {
 }
 
 impl StoreStartupLock {
-    async fn acquire(database_path: &Path) -> anyhow::Result<Self> {
-        let lock_path = store_startup_lock_path(database_path);
+    async fn acquire(stable_database_path: &Path) -> anyhow::Result<Self> {
+        let lock_path = store_startup_lock_path_for_stable_database_path(stable_database_path);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -466,11 +566,217 @@ impl Drop for StoreStartupLock {
     }
 }
 
+#[cfg(test)]
 fn store_startup_lock_path(database_path: &Path) -> PathBuf {
     let stable_path = canonical_database_path(database_path);
+    store_startup_lock_path_for_stable_database_path(&stable_path)
+}
+
+fn store_startup_lock_path_for_stable_database_path(stable_path: &Path) -> PathBuf {
     let mut lock_path = stable_path.as_os_str().to_os_string();
     lock_path.push(".startup-lock");
     PathBuf::from(lock_path)
+}
+
+#[cfg(test)]
+fn database_requires_existing_store_key(database_path: &Path) -> std::io::Result<bool> {
+    let stable_database_path = canonical_database_path(database_path);
+    database_requires_existing_store_key_at_stable_path(&stable_database_path)
+}
+
+fn database_requires_existing_store_key_at_stable_path(
+    stable_database_path: &Path,
+) -> std::io::Result<bool> {
+    reject_stable_database_symlink(stable_database_path)?;
+    let main_database_requires_key = match std::fs::metadata(stable_database_path) {
+        Ok(metadata) if metadata.is_file() => metadata.len() > 0,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "database path is not a regular file: {}",
+                    stable_database_path.display()
+                ),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err),
+    };
+    if main_database_requires_key {
+        return Ok(true);
+    }
+
+    sqlite_sidecar_exists(stable_database_path)
+}
+
+fn reject_stable_database_symlink(stable_database_path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(stable_database_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "database path is not a regular file: {}",
+                stable_database_path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn sqlite_sidecar_exists(database_path: &Path) -> std::io::Result<bool> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar_path = sqlite_sidecar_path(database_path, suffix);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "sqlite sidecar path is not a regular file: {}",
+                        sidecar_path.display()
+                    ),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
+}
+
+enum BootstrapDatabaseCleanup {
+    None,
+    RemoveCreatedDatabase,
+    RemoveCreatedDatabaseFile { dev: u64, ino: u64 },
+    RestoreEmptyDatabaseFile { dev: u64, ino: u64 },
+}
+
+impl BootstrapDatabaseCleanup {
+    fn capture(database_path: &Path, database_requires_key: bool) -> std::io::Result<Self> {
+        if database_requires_key {
+            return Ok(Self::None);
+        }
+
+        match std::fs::metadata(database_path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+                Ok(Self::RestoreEmptyDatabaseFile {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                })
+            }
+            Ok(_) => Ok(Self::None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::RemoveCreatedDatabase)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn prepare_for_database_open(self, database_path: &Path) -> std::io::Result<Self> {
+        match self {
+            Self::RemoveCreatedDatabase => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(database_path)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "created database placeholder is not a regular file",
+                    ));
+                }
+                Ok(Self::RemoveCreatedDatabaseFile {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn clean_after_failed_bootstrap(&self, database_path: &Path) -> std::io::Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::RemoveCreatedDatabase => Ok(()),
+            Self::RemoveCreatedDatabaseFile { dev, ino }
+            | Self::RestoreEmptyDatabaseFile { dev, ino } => {
+                let file = open_verified_database_path(database_path, *dev, *ino)?;
+                ensure_no_sqlite_sidecar_files(database_path)?;
+                file.set_len(0)
+            }
+        }
+    }
+}
+
+fn rollback_failed_generated_key_bootstrap(
+    database_path: &Path,
+    bootstrap_cleanup: &BootstrapDatabaseCleanup,
+    original_error: &StoreError,
+) -> anyhow::Result<()> {
+    rollback_failed_generated_key_bootstrap_with(database_path, original_error, || {
+        bootstrap_cleanup.clean_after_failed_bootstrap(database_path)
+    })
+}
+
+fn rollback_failed_generated_key_bootstrap_with(
+    database_path: &Path,
+    original_error: &StoreError,
+    cleanup: impl FnOnce() -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    if let Err(cleanup_error) = cleanup() {
+        return Err(anyhow::anyhow!(
+            "store bootstrap failed and database cleanup failed for {}; generated key was preserved: {cleanup_error}; original error: {original_error}",
+            database_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn open_verified_database_path(
+    database_path: &Path,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> std::io::Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(database_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.dev() != expected_dev || metadata.ino() != expected_ino {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "database placeholder changed before rollback",
+        ));
+    }
+    Ok(file)
+}
+
+fn ensure_no_sqlite_sidecar_files(database_path: &Path) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar_path = sqlite_sidecar_path(database_path, suffix);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("sqlite sidecar exists during bootstrap rollback: {sidecar_path:?}"),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn try_lock_file(file: &File) -> std::io::Result<bool> {
@@ -1256,11 +1562,15 @@ enum DaemonError {
     RpcSocketPathIsNotSocket { path: PathBuf },
     #[error("timed out waiting for store startup lock {path}")]
     StoreStartupLockTimedOut { path: PathBuf },
+    #[error("store key is missing for existing encrypted database")]
+    StoreKeyMissingForExistingDatabase,
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
 
     use super::*;
     use tempfile::tempdir;
@@ -1269,12 +1579,38 @@ mod tests {
     fn store_key_resolver_generates_once_and_reuses_stored_key() -> anyhow::Result<()> {
         let credential = MemoryStoreKeyCredential::default();
 
-        let first_key = resolve_store_key(&credential)?;
-        let second_key = resolve_store_key(&credential)?;
+        let first_key = resolve_store_key(&credential, MissingStoreKeyPolicy::Create)?;
+        assert!(first_key.was_generated);
+        assert_eq!(credential.set_count.get(), 0);
 
-        assert_eq!(first_key, second_key);
+        let encoded_key = first_key.key.to_hex_secret();
+        credential.set_password(&encoded_key)?;
+        let second_key = resolve_store_key(&credential, MissingStoreKeyPolicy::RequireExisting)?;
+
+        assert!(!second_key.was_generated);
+        assert_eq!(first_key.key, second_key.key);
         assert_eq!(credential.set_count.get(), 1);
         assert_eq!(credential.password.borrow().as_ref().unwrap().len(), 64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn store_key_resolver_does_not_generate_for_existing_database_without_key() -> anyhow::Result<()>
+    {
+        let credential = MemoryStoreKeyCredential::default();
+
+        let result = resolve_store_key(&credential, MissingStoreKeyPolicy::RequireExisting);
+        let error = match result {
+            Ok(_) => anyhow::bail!("missing key should fail for existing database"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<DaemonError>(),
+            Some(DaemonError::StoreKeyMissingForExistingDatabase)
+        ));
+        assert_eq!(credential.set_count.get(), 0);
 
         Ok(())
     }
@@ -1367,6 +1703,353 @@ mod tests {
         std::fs::write(store_startup_lock_path(&database_path), "stale")?;
 
         let _lock = StoreStartupLock::acquire(&database_path).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn startup_uses_stable_database_path_after_lock_wait_alias_retarget() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let rpc_socket_path = temp.path().join("kvasird.sock");
+        let first_database_path = temp.path().join("first.sqlite3");
+        let second_database_path = temp.path().join("second.sqlite3");
+        let symlink_database_path = temp.path().join("alias.sqlite3");
+        File::create(&first_database_path)?;
+        std::os::unix::fs::symlink(&first_database_path, &symlink_database_path)?;
+
+        let stable_database_path = canonical_database_path(&symlink_database_path);
+        assert_eq!(stable_database_path, first_database_path.canonicalize()?);
+        let lock_path = store_startup_lock_path_for_stable_database_path(&stable_database_path);
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        assert!(try_lock_file(&lock_file)?);
+
+        let config = DaemonConfig {
+            otlp_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            rpc_socket_path,
+            database_path: symlink_database_path.clone(),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        };
+        let start_future =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([17; 32]));
+        tokio::pin!(start_future);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(start_future.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        std::fs::remove_file(&symlink_database_path)?;
+        std::os::unix::fs::symlink(&second_database_path, &symlink_database_path)?;
+        drop(lock_file);
+
+        let daemon = start_future.await?;
+
+        assert!(std::fs::metadata(&first_database_path)?.len() > 0);
+        assert!(!second_database_path.try_exists()?);
+
+        drop(daemon);
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_placeholder_database_does_not_require_existing_store_key() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        File::create(&database_path)?;
+
+        assert!(!database_requires_existing_store_key(&database_path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn initialized_database_requires_existing_store_key() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        std::fs::write(&database_path, "not empty")?;
+
+        assert!(database_requires_existing_store_key(&database_path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn database_sidecar_requires_existing_store_key() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let missing_database_path = temp.path().join("missing.sqlite3");
+        std::fs::write(
+            sqlite_sidecar_path(&missing_database_path, "-wal"),
+            "sidecar",
+        )?;
+
+        assert!(database_requires_existing_store_key(
+            &missing_database_path
+        )?);
+
+        let empty_database_path = temp.path().join("empty.sqlite3");
+        File::create(&empty_database_path)?;
+        std::fs::write(
+            sqlite_sidecar_path(&empty_database_path, "-journal"),
+            "sidecar",
+        )?;
+
+        assert!(database_requires_existing_store_key(&empty_database_path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn database_sidecar_requires_existing_store_key_through_database_symlink() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let real_database_path = temp.path().join("real.sqlite3");
+        let symlink_database_path = temp.path().join("alias.sqlite3");
+        File::create(&real_database_path)?;
+        std::os::unix::fs::symlink(&real_database_path, &symlink_database_path)?;
+        std::fs::write(
+            sqlite_sidecar_path(&real_database_path, "-wal"),
+            "canonical sidecar",
+        )?;
+
+        assert!(database_requires_existing_store_key(
+            &symlink_database_path
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn non_regular_database_nodes_are_invalid_store_paths() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        std::fs::create_dir(&database_path)?;
+
+        let error = match database_requires_existing_store_key(&database_path) {
+            Ok(_) => anyhow::bail!("database directory should be invalid"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_database_symlink_is_an_invalid_store_path() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        std::os::unix::fs::symlink(temp.path().join("missing.sqlite3"), &database_path)?;
+
+        let error = match database_requires_existing_store_key(&database_path) {
+            Ok(_) => anyhow::bail!("dangling database symlink should be invalid"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        Ok(())
+    }
+
+    #[test]
+    fn non_regular_sidecar_nodes_are_invalid_store_paths() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        File::create(&database_path)?;
+        std::fs::create_dir(sqlite_sidecar_path(&database_path, "-wal"))?;
+
+        let error = match database_requires_existing_store_key(&database_path) {
+            Ok(_) => anyhow::bail!("sidecar directory should be invalid"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_placeholder_restore_rejects_path_swap() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        File::create(&database_path)?;
+        let BootstrapDatabaseCleanup::RestoreEmptyDatabaseFile { dev, ino } =
+            BootstrapDatabaseCleanup::capture(&database_path, false)?
+        else {
+            anyhow::bail!("empty placeholder should require restore cleanup");
+        };
+
+        std::fs::remove_file(&database_path)?;
+        File::create(&database_path)?;
+
+        let error = match open_verified_database_path(&database_path, dev, ino) {
+            Ok(_file) => anyhow::bail!("placeholder swap must fail rollback restore"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_placeholder_cleanup_rejects_path_swap_before_sidecar_deletion() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        File::create(&database_path)?;
+        let cleanup = BootstrapDatabaseCleanup::capture(&database_path, false)?;
+        std::fs::remove_file(&database_path)?;
+        File::create(&database_path)?;
+        let wal_path = sqlite_sidecar_path(&database_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&database_path, "-shm");
+        let journal_path = sqlite_sidecar_path(&database_path, "-journal");
+        std::fs::write(&wal_path, "keep wal")?;
+        std::fs::write(&shm_path, "keep shm")?;
+        std::fs::write(&journal_path, "keep journal")?;
+
+        let error = match cleanup.clean_after_failed_bootstrap(&database_path) {
+            Ok(()) => anyhow::bail!("placeholder swap must fail cleanup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_to_string(wal_path)?, "keep wal");
+        assert_eq!(std::fs::read_to_string(shm_path)?, "keep shm");
+        assert_eq!(std::fs::read_to_string(journal_path)?, "keep journal");
+
+        Ok(())
+    }
+
+    #[test]
+    fn created_database_cleanup_truncates_verified_path_without_sidecars() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let cleanup = BootstrapDatabaseCleanup::capture(&database_path, false)?
+            .prepare_for_database_open(&database_path)?;
+        std::fs::write(&database_path, "partial bootstrap database")?;
+
+        cleanup.clean_after_failed_bootstrap(&database_path)?;
+
+        assert!(database_path.try_exists()?);
+        assert_eq!(std::fs::metadata(database_path)?.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn created_database_cleanup_preserves_verified_path_when_sidecar_exists() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let cleanup = BootstrapDatabaseCleanup::capture(&database_path, false)?
+            .prepare_for_database_open(&database_path)?;
+        std::fs::write(&database_path, "partial bootstrap database")?;
+        std::fs::write(sqlite_sidecar_path(&database_path, "-wal"), "sidecar")?;
+
+        let error = match cleanup.clean_after_failed_bootstrap(&database_path) {
+            Ok(()) => anyhow::bail!("sidecar must fail bootstrap cleanup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&database_path)?,
+            "partial bootstrap database"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn created_database_cleanup_rejects_path_swap_before_sidecar_deletion() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let cleanup = BootstrapDatabaseCleanup::capture(&database_path, false)?
+            .prepare_for_database_open(&database_path)?;
+        std::fs::remove_file(&database_path)?;
+        File::create(&database_path)?;
+        let wal_path = sqlite_sidecar_path(&database_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&database_path, "-shm");
+        let journal_path = sqlite_sidecar_path(&database_path, "-journal");
+        std::fs::write(&wal_path, "keep wal")?;
+        std::fs::write(&shm_path, "keep shm")?;
+        std::fs::write(&journal_path, "keep journal")?;
+
+        let error = match cleanup.clean_after_failed_bootstrap(&database_path) {
+            Ok(()) => anyhow::bail!("created database path swap must fail cleanup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_to_string(wal_path)?, "keep wal");
+        assert_eq!(std::fs::read_to_string(shm_path)?, "keep shm");
+        assert_eq!(std::fs::read_to_string(journal_path)?, "keep journal");
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn empty_placeholder_restore_rejects_symlink_swap() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let target_path = temp.path().join("target.txt");
+        File::create(&database_path)?;
+        std::fs::write(&target_path, "do not truncate")?;
+        let BootstrapDatabaseCleanup::RestoreEmptyDatabaseFile { dev, ino } =
+            BootstrapDatabaseCleanup::capture(&database_path, false)?
+        else {
+            anyhow::bail!("empty placeholder should require restore cleanup");
+        };
+
+        std::fs::remove_file(&database_path)?;
+        std::os::unix::fs::symlink(&target_path, &database_path)?;
+
+        let error = match open_verified_database_path(&database_path, dev, ino) {
+            Ok(_file) => anyhow::bail!("symlink swap must fail rollback restore"),
+            Err(error) => error,
+        };
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_to_string(&target_path)?, "do not truncate");
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_bootstrap_rollback_preserves_key_when_database_cleanup_fails() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let original_error = StoreError::Sqlite(rusqlite::Error::ExecuteReturnedResults);
+
+        let error = match rollback_failed_generated_key_bootstrap_with(
+            &database_path,
+            &original_error,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cleanup failed",
+                ))
+            },
+        ) {
+            Ok(()) => anyhow::bail!("cleanup failure must be surfaced"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("generated key was preserved"),
+            "{error:?}"
+        );
 
         Ok(())
     }
