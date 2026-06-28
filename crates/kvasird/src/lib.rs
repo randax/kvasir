@@ -361,17 +361,27 @@ struct DaemonState {
 }
 
 pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
-    let store_key_source = StoreKeySource::keychain_for_database(&config.database_path);
-    start_with_store_key_source(config, store_key_source).await
+    let stable_database_path = canonical_database_path(&config.database_path);
+    let store_key_source = StoreKeySource::keychain_for_database(&stable_database_path);
+    start_with_store_key_source_at_stable_path(config, store_key_source, stable_database_path).await
 }
 
 pub async fn start_with_store_key_source(
     config: DaemonConfig,
     store_key_source: StoreKeySource,
 ) -> anyhow::Result<RunningDaemon> {
-    let _startup_lock = StoreStartupLock::acquire(&config.database_path).await?;
     let stable_database_path = canonical_database_path(&config.database_path);
-    let database_requires_key = database_requires_existing_store_key(&stable_database_path)?;
+    start_with_store_key_source_at_stable_path(config, store_key_source, stable_database_path).await
+}
+
+async fn start_with_store_key_source_at_stable_path(
+    config: DaemonConfig,
+    store_key_source: StoreKeySource,
+    stable_database_path: PathBuf,
+) -> anyhow::Result<RunningDaemon> {
+    let _startup_lock = StoreStartupLock::acquire(&stable_database_path).await?;
+    let database_requires_key =
+        database_requires_existing_store_key_at_stable_path(&stable_database_path)?;
     let bootstrap_cleanup =
         BootstrapDatabaseCleanup::capture(&stable_database_path, database_requires_key)?;
     let resolved_store_key = store_key_source.resolve(
@@ -522,8 +532,8 @@ struct StoreStartupLock {
 }
 
 impl StoreStartupLock {
-    async fn acquire(database_path: &Path) -> anyhow::Result<Self> {
-        let lock_path = store_startup_lock_path(database_path);
+    async fn acquire(stable_database_path: &Path) -> anyhow::Result<Self> {
+        let lock_path = store_startup_lock_path_for_stable_database_path(stable_database_path);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -556,49 +566,59 @@ impl Drop for StoreStartupLock {
     }
 }
 
+#[cfg(test)]
 fn store_startup_lock_path(database_path: &Path) -> PathBuf {
     let stable_path = canonical_database_path(database_path);
+    store_startup_lock_path_for_stable_database_path(&stable_path)
+}
+
+fn store_startup_lock_path_for_stable_database_path(stable_path: &Path) -> PathBuf {
     let mut lock_path = stable_path.as_os_str().to_os_string();
     lock_path.push(".startup-lock");
     PathBuf::from(lock_path)
 }
 
+#[cfg(test)]
 fn database_requires_existing_store_key(database_path: &Path) -> std::io::Result<bool> {
     let stable_database_path = canonical_database_path(database_path);
-    let database_path = stable_database_path.as_path();
-    let main_database_requires_key = match std::fs::metadata(database_path) {
+    database_requires_existing_store_key_at_stable_path(&stable_database_path)
+}
+
+fn database_requires_existing_store_key_at_stable_path(
+    stable_database_path: &Path,
+) -> std::io::Result<bool> {
+    reject_stable_database_symlink(stable_database_path)?;
+    let main_database_requires_key = match std::fs::metadata(stable_database_path) {
         Ok(metadata) if metadata.is_file() => metadata.len() > 0,
         Ok(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "database path is not a regular file: {}",
-                    database_path.display()
+                    stable_database_path.display()
                 ),
             ));
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            reject_existing_non_regular_database_node(database_path)?;
-            false
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(err) => return Err(err),
     };
     if main_database_requires_key {
         return Ok(true);
     }
 
-    sqlite_sidecar_exists(database_path)
+    sqlite_sidecar_exists(stable_database_path)
 }
 
-fn reject_existing_non_regular_database_node(database_path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(database_path) {
-        Ok(_) => Err(std::io::Error::new(
+fn reject_stable_database_symlink(stable_database_path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(stable_database_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "database path is not a regular file: {}",
-                database_path.display()
+                stable_database_path.display()
             ),
         )),
+        Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
@@ -1549,6 +1569,8 @@ enum DaemonError {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
 
     use super::*;
     use tempfile::tempdir;
@@ -1681,6 +1703,59 @@ mod tests {
         std::fs::write(store_startup_lock_path(&database_path), "stale")?;
 
         let _lock = StoreStartupLock::acquire(&database_path).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn startup_uses_stable_database_path_after_lock_wait_alias_retarget() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let rpc_socket_path = temp.path().join("kvasird.sock");
+        let first_database_path = temp.path().join("first.sqlite3");
+        let second_database_path = temp.path().join("second.sqlite3");
+        let symlink_database_path = temp.path().join("alias.sqlite3");
+        File::create(&first_database_path)?;
+        std::os::unix::fs::symlink(&first_database_path, &symlink_database_path)?;
+
+        let stable_database_path = canonical_database_path(&symlink_database_path);
+        assert_eq!(stable_database_path, first_database_path.canonicalize()?);
+        let lock_path = store_startup_lock_path_for_stable_database_path(&stable_database_path);
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        assert!(try_lock_file(&lock_file)?);
+
+        let config = DaemonConfig {
+            otlp_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            rpc_socket_path,
+            database_path: symlink_database_path.clone(),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        };
+        let start_future =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([17; 32]));
+        tokio::pin!(start_future);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(start_future.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        std::fs::remove_file(&symlink_database_path)?;
+        std::os::unix::fs::symlink(&second_database_path, &symlink_database_path)?;
+        drop(lock_file);
+
+        let daemon = start_future.await?;
+
+        assert!(std::fs::metadata(&first_database_path)?.len() > 0);
+        assert!(!second_database_path.try_exists()?);
+
+        drop(daemon);
 
         Ok(())
     }
