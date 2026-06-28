@@ -1945,10 +1945,13 @@ fn proto_trace_span_record(
     let is_opencode_span = is_opencode_span(resource_harness, &span.name, |key| {
         proto_attribute(&span.attributes, key)
     });
+    let is_claude_code_span =
+        is_claude_code_span(&span.name, |key| proto_attribute(&span.attributes, key));
     let Some(kind) = proto_trace_span_kind(&span.attributes)
+        .or_else(|| claude_code_inferred_proto_span_kind(&span))
         .or_else(|| opencode_inferred_proto_span_kind(resource_harness, &span))
     else {
-        if is_opencode_context(resource_harness) {
+        if is_opencode_context(resource_harness) || is_claude_code_span {
             return Ok(None);
         }
         return Err(OtlpError::InvalidTraceSpanKind);
@@ -2576,10 +2579,12 @@ fn json_trace_span_record(
     let is_opencode_span = is_opencode_span(resource_harness, name, |key| {
         json_attribute(attributes, key)
     });
+    let is_claude_code_span = is_claude_code_span(name, |key| json_attribute(attributes, key));
     let Some(kind) = json_trace_span_kind(attributes)
+        .or_else(|| claude_code_inferred_json_span_kind(span))
         .or_else(|| opencode_inferred_json_span_kind(resource_harness, span))
     else {
-        if is_opencode_context(resource_harness) {
+        if is_opencode_context(resource_harness) || is_claude_code_span {
             return Ok(None);
         }
         return Err(OtlpError::InvalidTraceSpanKind);
@@ -2699,6 +2704,51 @@ fn is_opencode_span(
 
 fn is_opencode_context(resource_harness: Option<&str>) -> bool {
     resource_harness.is_some_and(|value| value.eq_ignore_ascii_case("opencode"))
+}
+
+fn is_claude_code_span(span_name: &str, attribute: impl Fn(&str) -> Option<String>) -> bool {
+    is_claude_code_span_type(span_name)
+        || first_meaningful_attribute_from(&attribute, &["span.type"])
+            .is_some_and(|value| is_claude_code_span_type(&value))
+}
+
+fn is_claude_code_span_type(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase().replace('-', "_");
+    value.starts_with("claude_code.") || value.starts_with("claude.")
+}
+
+fn claude_code_inferred_proto_span_kind(span: &OtlpSpan) -> Option<TraceSpanKind> {
+    if !is_claude_code_span(&span.name, |key| proto_attribute(&span.attributes, key)) {
+        return None;
+    }
+    inferred_claude_code_span_kind(&span.name, |key| proto_attribute(&span.attributes, key))
+}
+
+fn claude_code_inferred_json_span_kind(span: &Value) -> Option<TraceSpanKind> {
+    let attributes = span.get("attributes").and_then(Value::as_array);
+    let name = span.get("name").and_then(Value::as_str).unwrap_or_default();
+    if !is_claude_code_span(name, |key| json_attribute(attributes, key)) {
+        return None;
+    }
+    inferred_claude_code_span_kind(name, |key| json_attribute(attributes, key))
+}
+
+fn inferred_claude_code_span_kind(
+    span_name: &str,
+    attribute: impl Fn(&str) -> Option<String>,
+) -> Option<TraceSpanKind> {
+    first_meaningful_attribute_from(&attribute, &["span.type"])
+        .and_then(|span_type| canonical_claude_code_span_kind(&span_type))
+        .or_else(|| canonical_claude_code_span_kind(span_name))
+}
+
+fn canonical_claude_code_span_kind(value: &str) -> Option<TraceSpanKind> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "claude.interaction" | "claude_code.interaction" => Some(TraceSpanKind::Interaction),
+        "claude.llm_request" | "claude_code.llm_request" => Some(TraceSpanKind::LlmRequest),
+        "claude.tool" | "claude_code.tool" => Some(TraceSpanKind::ToolCall),
+        _ => None,
+    }
 }
 
 fn opencode_inferred_proto_span_kind(
@@ -4007,6 +4057,82 @@ mod tests {
             records.trace_spans[0].trace_id.as_str(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn json_claude_resource_rejects_unrelated_span_without_trace_kind() {
+        let payload = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        { "key": "service.name", "value": { "stringValue": "claude_code" } },
+                        { "key": "session.id", "value": { "stringValue": "session-12" } },
+                        { "key": "prompt.id", "value": { "stringValue": "prompt-7" } }
+                    ]
+                },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "spanId": "1111111111111111",
+                        "name": "runtime.flush",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956800010000000",
+                        "attributes": []
+                    }]
+                }]
+            }]
+        }"#;
+
+        assert!(matches!(
+            parse_otlp_json_traces(payload.as_bytes()),
+            Err(OtlpError::InvalidTraceSpanKind)
+        ));
+    }
+
+    #[test]
+    fn protobuf_claude_resource_rejects_unrelated_span_without_trace_kind() {
+        let payload = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute("service.name", "claude_code"),
+                        string_attribute("session.id", "session-12"),
+                        string_attribute("prompt.id", "prompt-7"),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0xaa; 16],
+                        span_id: vec![0x11; 8],
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "runtime.flush".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_800_010_000_000,
+                        attributes: Vec::new(),
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec();
+
+        assert!(matches!(
+            parse_otlp_protobuf_traces(&payload),
+            Err(OtlpError::InvalidTraceSpanKind)
+        ));
     }
 
     #[test]
