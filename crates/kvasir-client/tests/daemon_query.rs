@@ -27,7 +27,9 @@ use kvasir_core::rpc::{
     RpcRequest, RpcResponse, RpcStreamEvent, SessionId as CoreSessionId, UsageUpdateKind,
 };
 use kvasir_core::{ContentRetentionPolicy, PriceTable};
-use kvasird::{DaemonConfig, StoreKeySource, start_with_store_key_source};
+use kvasird::{
+    ContentRetentionSchedule, DaemonConfig, StoreKeySource, start_with_store_key_source,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::resource::v1::Resource;
@@ -47,6 +49,7 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -135,6 +138,7 @@ async fn client_queries_claude_trace_by_session_and_prompt() -> anyhow::Result<(
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -265,6 +269,7 @@ async fn client_retrieves_trace_response_above_previous_rpc_response_cap() -> an
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -313,6 +318,7 @@ async fn client_keeps_distinct_trace_ids_for_the_same_session_prompt() -> anyhow
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -366,6 +372,7 @@ async fn client_scopes_trace_replay_by_harness() -> anyhow::Result<()> {
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -436,6 +443,7 @@ async fn client_queries_protobuf_claude_trace_by_session_and_prompt() -> anyhow:
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -483,6 +491,7 @@ async fn client_queries_content_replay_by_session_and_prompt() -> anyhow::Result
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -589,6 +598,7 @@ async fn client_queries_protobuf_content_replay_by_session_and_prompt() -> anyho
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -695,6 +705,7 @@ async fn client_queries_opencode_content_replay_from_opted_in_logs() -> anyhow::
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -778,6 +789,7 @@ async fn raw_rpc_queries_canonicalize_hyphenated_mixed_case_harnesses() -> anyho
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -894,6 +906,7 @@ async fn client_queries_claude_content_replay_from_opted_in_logs() -> anyhow::Re
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -986,6 +999,7 @@ async fn client_queries_codex_content_replay_from_opted_in_logs() -> anyhow::Res
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1069,6 +1083,7 @@ async fn client_ignores_content_logs_from_unknown_harnesses() -> anyhow::Result<
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1120,6 +1135,7 @@ async fn client_reports_prompt_not_found_for_empty_content_replay() -> anyhow::R
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1163,6 +1179,7 @@ async fn client_reports_known_harness_content_kinds_when_prompt_has_no_content()
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1241,6 +1258,7 @@ async fn client_reports_not_provided_for_existing_unsupported_harness_prompt() -
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1293,6 +1311,7 @@ async fn client_does_not_report_content_capability_for_another_harness_prompt() 
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1344,6 +1363,7 @@ async fn client_queries_overview_rollups_through_one_daemon_socket_request() -> 
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1655,6 +1675,7 @@ async fn client_scopes_overview_snapshot_by_selected_model() -> anyhow::Result<(
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1809,6 +1830,7 @@ async fn client_scopes_overview_snapshot_by_selected_harness() -> anyhow::Result
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -1966,6 +1988,7 @@ async fn client_deep_scoped_overview_snapshot_does_not_leak_aggregate_rollups() 
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2043,6 +2066,7 @@ async fn client_subscription_delivers_live_token_rollup_updates() -> anyhow::Res
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2171,6 +2195,7 @@ async fn client_subscription_delivers_live_usage_update_notifications() -> anyho
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2246,6 +2271,7 @@ async fn usage_update_subscription_close_unblocks_waiting_reader() -> anyhow::Re
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2310,6 +2336,7 @@ async fn overview_refresh_subscription_reconnects_and_delivers_later_initial() -
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2336,6 +2363,7 @@ async fn overview_refresh_subscription_reconnects_and_delivers_later_initial() -
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2370,6 +2398,7 @@ async fn overview_refresh_subscription_waits_for_initial_daemon_connection() -> 
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2467,6 +2496,7 @@ async fn client_queries_cost_rollups_through_daemon_socket() -> anyhow::Result<(
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2552,6 +2582,7 @@ async fn client_queries_tool_call_rollups_through_daemon_socket() -> anyhow::Res
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2645,6 +2676,7 @@ async fn client_rpc_retries_until_daemon_socket_is_available() -> anyhow::Result
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )
@@ -2668,6 +2700,7 @@ async fn client_reports_response_too_large_for_oversized_daemon_query() -> anyho
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test([11; 32]),
     )

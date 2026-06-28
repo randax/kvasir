@@ -45,10 +45,11 @@ const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const RAW_BODY_IMPORT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const RAW_BODY_IMPORT_BATCH_SIZE: usize = 64;
-const CONTENT_RETENTION_COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_CONTENT_RETENTION_COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 pub use setup::{KeychainSetupSecretSource, SetupSecretSource};
 
@@ -64,6 +65,7 @@ pub struct DaemonConfig {
     pub bearer_token: BearerToken,
     pub price_table: PriceTable,
     pub content_retention_policy: ContentRetentionPolicy,
+    pub content_retention_schedule: ContentRetentionSchedule,
 }
 
 impl DaemonConfig {
@@ -80,8 +82,55 @@ impl DaemonConfig {
             bearer_token,
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRetentionSchedule {
+    interval: Duration,
+    window_start_utc: Duration,
+}
+
+impl ContentRetentionSchedule {
+    pub fn new(interval: Duration, window_start_utc: Duration) -> Result<Self, ScheduleError> {
+        if interval.is_zero() {
+            return Err(ScheduleError::ZeroInterval);
+        }
+        if window_start_utc >= Duration::from_secs(SECONDS_PER_DAY) {
+            return Err(ScheduleError::WindowStartOutsideDay);
+        }
+        Ok(Self {
+            interval,
+            window_start_utc,
+        })
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub fn window_start_utc(&self) -> Duration {
+        self.window_start_utc
+    }
+}
+
+impl Default for ContentRetentionSchedule {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_CONTENT_RETENTION_COMPACTION_INTERVAL,
+            window_start_utc: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScheduleError {
+    #[error("content retention compaction interval must be greater than zero")]
+    ZeroInterval,
+    #[error("content retention compaction window start must be within one UTC day")]
+    WindowStartOutsideDay,
 }
 
 #[derive(Clone)]
@@ -349,7 +398,7 @@ impl RunningDaemon {
         policy: &ContentRetentionPolicy,
         compacted_at: kvasir_core::rpc::TimestampMillis,
     ) -> anyhow::Result<ContentRetentionReport> {
-        compact_content_retention(&self.state, policy, compacted_at)
+        compact_content_retention(&self.state, policy, compacted_at, true)
             .await
             .map_err(anyhow::Error::from)
     }
@@ -471,11 +520,13 @@ async fn start_with_store_key_source_at_stable_path(
     let content_retention_state = state.clone();
     let content_retention_shutdown = shutdown.clone();
     let content_retention_policy = config.content_retention_policy.clone();
+    let content_retention_schedule = config.content_retention_schedule;
     let content_retention_task = tokio::spawn(async move {
         run_content_retention_compactor(
             content_retention_state,
             content_retention_shutdown,
             content_retention_policy,
+            content_retention_schedule,
         )
         .await;
     });
@@ -515,18 +566,21 @@ async fn run_content_retention_compactor(
     state: DaemonState,
     shutdown: broadcast::Sender<()>,
     policy: ContentRetentionPolicy,
+    schedule: ContentRetentionSchedule,
 ) {
     if policy.keeps_forever() {
         return;
     }
     let mut shutdown = shutdown.subscribe();
-    if let Err(error) = compact_content_retention(&state, &policy, current_timestamp_millis()).await
+    if let Err(error) =
+        compact_content_retention(&state, &policy, current_timestamp_millis(), false).await
     {
         eprintln!("content retention compaction failed: {error:?}");
     }
     let mut interval = tokio::time::interval_at(
-        tokio::time::Instant::now() + duration_until_next_utc_midnight(SystemTime::now()),
-        CONTENT_RETENTION_COMPACTION_INTERVAL,
+        tokio::time::Instant::now()
+            + duration_until_next_retention_window(SystemTime::now(), schedule),
+        schedule.interval(),
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -534,7 +588,7 @@ async fn run_content_retention_compactor(
         tokio::select! {
             _ = shutdown.recv() => break,
             _ = interval.tick() => {
-                if let Err(error) = compact_content_retention(&state, &policy, current_timestamp_millis()).await {
+                if let Err(error) = compact_content_retention(&state, &policy, current_timestamp_millis(), true).await {
                     eprintln!("content retention compaction failed: {error:?}");
                 }
             }
@@ -546,12 +600,14 @@ async fn compact_content_retention(
     state: &DaemonState,
     policy: &ContentRetentionPolicy,
     compacted_at: kvasir_core::rpc::TimestampMillis,
+    run_maintenance: bool,
 ) -> Result<ContentRetentionReport, StoreError> {
-    state
-        .store
-        .lock()
-        .await
-        .compact_content_retention(policy, compacted_at)
+    let mut store = state.store.lock().await;
+    let report = store.compact_content_retention(policy, compacted_at)?;
+    if run_maintenance {
+        store.run_pending_maintenance();
+    }
+    Ok(report)
 }
 
 fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
@@ -563,15 +619,22 @@ fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
     kvasir_core::rpc::TimestampMillis::from_millis(millis)
 }
 
-fn duration_until_next_utc_midnight(now: SystemTime) -> Duration {
+fn duration_until_next_retention_window(
+    now: SystemTime,
+    schedule: ContentRetentionSchedule,
+) -> Duration {
     let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let day = Duration::from_secs(24 * 60 * 60);
-    let elapsed_since_midnight = Duration::new(now.as_secs() % (24 * 60 * 60), now.subsec_nanos());
-    if elapsed_since_midnight.is_zero() {
-        day
+    let now_ms = i128::try_from(now.as_millis()).unwrap_or(i128::MAX);
+    let interval_ms = i128::try_from(schedule.interval().as_millis()).unwrap_or(i128::MAX);
+    let window_start_ms =
+        i128::try_from(schedule.window_start_utc().as_millis()).unwrap_or(i128::MAX);
+    let elapsed_since_window = (now_ms - window_start_ms).rem_euclid(interval_ms);
+    let wait_ms = if elapsed_since_window == 0 {
+        interval_ms
     } else {
-        day - elapsed_since_midnight
-    }
+        interval_ms - elapsed_since_window
+    };
+    Duration::from_millis(u64::try_from(wait_ms).unwrap_or(u64::MAX))
 }
 
 fn bind_private_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
@@ -1822,24 +1885,54 @@ mod tests {
     }
 
     #[test]
-    fn content_retention_scheduler_targets_next_utc_midnight() {
+    fn content_retention_scheduler_targets_configured_utc_window() {
+        let default_schedule = ContentRetentionSchedule::default();
         assert_eq!(
-            duration_until_next_utc_midnight(
-                UNIX_EPOCH + Duration::from_secs(23 * 60 * 60 + 59 * 60 + 59)
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(23 * 60 * 60 + 59 * 60 + 59),
+                default_schedule,
             ),
             Duration::from_secs(1)
         );
         assert_eq!(
-            duration_until_next_utc_midnight(
+            duration_until_next_retention_window(
                 UNIX_EPOCH
                     + Duration::from_secs(23 * 60 * 60 + 59 * 60 + 59)
-                    + Duration::from_millis(750)
+                    + Duration::from_millis(750),
+                default_schedule,
             ),
             Duration::from_millis(250)
         );
         assert_eq!(
-            duration_until_next_utc_midnight(UNIX_EPOCH + Duration::from_secs(24 * 60 * 60)),
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(24 * 60 * 60),
+                default_schedule,
+            ),
             Duration::from_secs(24 * 60 * 60)
+        );
+        let two_thirty_daily = ContentRetentionSchedule::new(
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(2 * 60 * 60 + 30 * 60),
+        )
+        .unwrap();
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(2 * 60 * 60),
+                two_thirty_daily,
+            ),
+            Duration::from_secs(30 * 60)
+        );
+        let hourly_at_five_past = ContentRetentionSchedule::new(
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(5 * 60),
+        )
+        .unwrap();
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(2 * 60 * 60 + 6 * 60),
+                hourly_at_five_past,
+            ),
+            Duration::from_secs(59 * 60)
         );
     }
 
@@ -1923,6 +2016,7 @@ mod tests {
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         };
         let start_future =
             start_with_store_key_source(config, StoreKeySource::static_key_for_test([17; 32]));

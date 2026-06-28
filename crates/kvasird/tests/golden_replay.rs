@@ -22,9 +22,9 @@ use kvasir_core::{
     RepoBucket, RepoIdentity, RepoName, RepoPath, StoreKey, UsageStore,
 };
 use kvasird::{
-    DaemonConfig, RunningDaemon, StoreKeySource, query_content, query_cost_rollup,
-    query_overview_rollup, query_token_rollup, query_tool_call_rollup, query_trace, start,
-    start_with_store_key_source,
+    ContentRetentionSchedule, DaemonConfig, RunningDaemon, StoreKeySource, query_content,
+    query_cost_rollup, query_overview_rollup, query_token_rollup, query_tool_call_rollup,
+    query_trace, start, start_with_store_key_source,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -54,6 +54,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -181,6 +182,7 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -257,6 +259,7 @@ async fn golden_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Resu
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -302,6 +305,7 @@ async fn golden_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::Re
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -347,6 +351,7 @@ async fn golden_claude_trace_replay_returns_canonical_span_tree() -> anyhow::Res
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -421,6 +426,7 @@ async fn protobuf_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Re
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -466,6 +472,7 @@ async fn protobuf_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -511,6 +518,7 @@ async fn protobuf_claude_trace_replay_returns_canonical_span_tree() -> anyhow::R
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -587,6 +595,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
     let client = reqwest::Client::new();
@@ -785,6 +794,7 @@ async fn daemon_content_retention_compaction_purges_replay_but_preserves_rollups
         bearer_token: bearer_token.clone(),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -940,6 +950,7 @@ async fn daemon_content_retention_startup_task_purges_without_manual_hook() -> a
             Some(Duration::from_secs(24 * 60 * 60)),
             None,
         ),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -994,6 +1005,7 @@ async fn daemon_ingest_compacts_expired_inline_content_before_replay() -> anyhow
             Some(Duration::from_secs(24 * 60 * 60)),
             None,
         ),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1082,6 +1094,7 @@ async fn claude_raw_body_file_imports_into_content_replay_and_removes_source() -
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1223,6 +1236,7 @@ async fn protobuf_claude_raw_body_file_imports_into_content_replay() -> anyhow::
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1302,6 +1316,7 @@ async fn claude_raw_body_files_arriving_after_otlp_are_imported_by_one_shot_scan
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1373,6 +1388,7 @@ async fn persisted_raw_body_row_retries_plaintext_cleanup() -> anyhow::Result<()
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1410,6 +1426,7 @@ async fn purged_raw_body_row_cleans_plaintext_without_rehydrating_replay() -> an
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1467,6 +1484,7 @@ async fn stale_queued_raw_body_import_is_compacted_before_it_can_replay() -> any
             Some(Duration::from_secs(24 * 60 * 60)),
             None,
         ),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1529,6 +1547,7 @@ async fn duplicate_persisted_raw_body_event_does_not_delete_reused_body_ref() ->
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1578,6 +1597,7 @@ async fn persisted_raw_body_row_without_source_drains_import_queue() -> anyhow::
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1592,7 +1612,8 @@ async fn persisted_raw_body_row_without_source_drains_import_queue() -> anyhow::
 }
 
 #[tokio::test]
-async fn unsupported_stored_raw_body_compression_is_repaired_by_reingest() -> anyhow::Result<()> {
+async fn unsupported_stored_raw_body_compression_cleans_plaintext_without_reingest()
+-> anyhow::Result<()> {
     let temp = tempdir()?;
     let raw_body_dir = temp.path().join("raw-bodies");
     std::fs::create_dir_all(&raw_body_dir)?;
@@ -1612,6 +1633,7 @@ async fn unsupported_stored_raw_body_compression_is_repaired_by_reingest() -> an
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1630,7 +1652,7 @@ async fn unsupported_stored_raw_body_compression_is_repaired_by_reingest() -> an
     assert!(!body_path.exists());
     let raw_body_rows = persisted_raw_body_rows(&database_path)?;
     assert_eq!(raw_body_rows.len(), 1);
-    assert_eq!(raw_body_rows[0].compression, "zstd");
+    assert_eq!(raw_body_rows[0].compression, "gzip");
     assert!(!raw_body_import_queue_body_refs(&database_path)?.contains(&body_ref.to_owned()));
     drop(daemon);
     Ok(())
@@ -1650,6 +1672,7 @@ async fn missing_raw_body_queue_rows_do_not_starve_later_ready_files() -> anyhow
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1708,6 +1731,7 @@ async fn claude_raw_body_file_import_rejects_symlink_sources() -> anyhow::Result
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1748,6 +1772,7 @@ async fn claude_raw_body_file_import_rejects_hardlinked_sources() -> anyhow::Res
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1787,6 +1812,7 @@ async fn raw_body_imports_stay_bound_to_validated_directory_after_path_swap() ->
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1832,6 +1858,7 @@ async fn uncleanable_invalid_raw_body_source_is_quarantined() -> anyhow::Result<
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1879,6 +1906,7 @@ async fn daemon_rejects_symlinked_raw_body_directory() -> anyhow::Result<()> {
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await;
 
@@ -1910,6 +1938,7 @@ async fn raw_body_file_import_ignores_non_claude_code_harnesses() -> anyhow::Res
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -1960,6 +1989,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -2122,6 +2152,7 @@ async fn opencode_trace_ingest_degrades_when_experimental_attributes_are_missing
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -2186,6 +2217,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
                 bearer_token: bearer_token.clone(),
                 price_table: PriceTable::bundled_defaults(),
                 content_retention_policy: ContentRetentionPolicy::keep_forever(),
+                content_retention_schedule: ContentRetentionSchedule::default(),
             },
             StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
         )
@@ -2209,6 +2241,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
             bearer_token,
             price_table: PriceTable::bundled_defaults(),
             content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         },
         StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
     )
@@ -2271,6 +2304,7 @@ async fn daemon_default_start_generates_reuses_and_requires_keychain_key() -> an
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     };
 
     {
@@ -2384,6 +2418,7 @@ async fn daemon_default_start_generates_key_for_empty_placeholder_database() -> 
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -2413,6 +2448,7 @@ async fn daemon_default_start_requires_key_for_empty_database_with_sidecar() -> 
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await
     {
@@ -2460,6 +2496,7 @@ async fn daemon_default_start_requires_key_for_symlinked_empty_database_with_sid
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await
     {
@@ -2506,6 +2543,7 @@ async fn daemon_default_start_rejects_dangling_database_symlink_before_key_persi
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await
     {
@@ -2547,6 +2585,7 @@ async fn daemon_default_start_opens_stable_database_path_after_alias_retarget() 
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     };
 
     let start_task = tokio::spawn(start(config));
@@ -2582,6 +2621,7 @@ async fn daemon_default_start_cleans_bootstrap_database_when_keychain_write_fail
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     };
 
     test_keyring.fail_next_set();
@@ -2628,6 +2668,7 @@ async fn daemon_default_start_restores_empty_placeholder_when_keychain_write_fai
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     };
 
     test_keyring.fail_next_set();
@@ -2682,6 +2723,7 @@ async fn daemon_default_start_preserves_key_when_store_open_bootstrap_fails() ->
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     };
 
     let error = match start(config.clone()).await {
@@ -2737,6 +2779,7 @@ async fn daemon_default_start_preserves_key_when_bootstrap_database_prepare_fail
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     };
 
     let error = match start(config.clone()).await {
@@ -2778,6 +2821,7 @@ async fn metrics_ingest_attributes_rollups_to_repo_and_no_repo_buckets() -> anyh
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -2869,6 +2913,7 @@ async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -2962,6 +3007,7 @@ async fn logs_ingest_returns_tool_call_rollups_by_tool_and_repo() -> anyhow::Res
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3049,6 +3095,7 @@ async fn metrics_and_logs_ingest_return_tool_call_rollups_for_all_harnesses() ->
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
     let client = reqwest::Client::new();
@@ -3127,6 +3174,7 @@ async fn protobuf_logs_ingest_returns_tool_call_rollups() -> anyhow::Result<()> 
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3173,6 +3221,7 @@ async fn logs_ingest_accepts_batches_without_tool_results_as_noop() -> anyhow::R
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3212,6 +3261,7 @@ async fn logs_ingest_deduplicates_replayed_tool_result_events() -> anyhow::Resul
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
     let client = reqwest::Client::new();
@@ -3280,6 +3330,7 @@ async fn daemon_refuses_to_replace_non_socket_rpc_path() -> anyhow::Result<()> {
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await;
 
@@ -3300,6 +3351,7 @@ async fn daemon_creates_private_rpc_socket() -> anyhow::Result<()> {
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3321,6 +3373,7 @@ async fn metrics_ingest_returns_mixed_cost_rollups_with_time_boundaries() -> any
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3420,6 +3473,7 @@ async fn metrics_ingest_uses_configured_price_table_for_estimated_cost() -> anyh
         bearer_token,
         price_table,
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3467,6 +3521,7 @@ async fn metrics_ingest_rejects_oversized_bodies() -> anyhow::Result<()> {
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3500,6 +3555,7 @@ async fn metrics_ingest_rejects_payloads_without_token_usage_metrics() -> anyhow
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3527,6 +3583,7 @@ async fn metrics_ingest_rejects_mixed_batches_with_empty_token_usage_metrics() -
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3611,6 +3668,7 @@ async fn rpc_subscription_closes_when_extra_input_arrives_after_subscribe_reques
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
@@ -3654,6 +3712,7 @@ async fn daemon_returns_bounded_error_for_oversized_rpc_query_response() -> anyh
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
         content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
     })
     .await?;
 
