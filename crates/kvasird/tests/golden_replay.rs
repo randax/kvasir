@@ -332,6 +332,79 @@ async fn golden_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn golden_claude_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{}/v1/traces", daemon.otlp_addr());
+    client
+        .post(&endpoint)
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(&endpoint)
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture_for(
+            "claude-session-1",
+            "claude-turn-2",
+            "cccccccccccccccccccccccccccccccc",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(&endpoint)
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_trace_fixture_for(
+            "claude-session-2",
+            "claude-turn-1",
+            "dddddddddddddddddddddddddddddddd",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = query_trace(
+        rpc_socket_path.clone(),
+        kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+    )
+    .await?;
+    assert_claude_trace_tree(&traces, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    let missing_prompt = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("missing-turn"),
+        },
+    )
+    .await?;
+    assert!(missing_prompt.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn protobuf_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
     let temp = tempdir()?;
     let rpc_socket_path = temp.path().join("kvasird.sock");
@@ -415,6 +488,79 @@ async fn protobuf_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::
     assert_eq!(traces[0].spans[1].kind, TraceSpanKind::LlmRequest);
     assert_eq!(traces[0].spans[2].kind, TraceSpanKind::ToolCall);
     assert_eq!(traces[0].spans[2].tool_name, Some(ToolName::new("Read")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn protobuf_claude_trace_replay_returns_canonical_span_tree() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+    })
+    .await?;
+
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{}/v1/traces", daemon.otlp_addr());
+    client
+        .post(&endpoint)
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(claude_trace_protobuf_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(&endpoint)
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(claude_trace_protobuf_fixture_for(
+            "claude-session-1",
+            "claude-turn-2",
+            "cccccccccccccccccccccccccccccccc",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(&endpoint)
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/x-protobuf")
+        .body(claude_trace_protobuf_fixture_for(
+            "claude-session-2",
+            "claude-turn-1",
+            "dddddddddddddddddddddddddddddddd",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let traces = query_trace(
+        rpc_socket_path.clone(),
+        kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+    )
+    .await?;
+    assert_claude_trace_tree(&traces, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    let missing_prompt = query_trace(
+        rpc_socket_path,
+        kvasir_core::rpc::TraceQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("missing-turn"),
+        },
+    )
+    .await?;
+    assert!(missing_prompt.is_empty());
 
     Ok(())
 }
@@ -3030,6 +3176,19 @@ fn cost_usd(value: &str) -> CostUsd {
     CostUsd::from_decimal_str(value).expect("test cost must be valid")
 }
 
+fn assert_claude_trace_tree(traces: &[kvasir_core::rpc::Trace], expected_trace_id: &str) {
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].trace_id.as_str(), expected_trace_id);
+    assert_eq!(traces[0].spans.len(), 3);
+    assert_eq!(traces[0].durations.ttft_ms, Some(180));
+    assert_eq!(traces[0].durations.request_ms, Some(1600));
+    assert_eq!(traces[0].durations.tool_ms, Some(320));
+    assert_eq!(traces[0].spans[0].kind, TraceSpanKind::Interaction);
+    assert_eq!(traces[0].spans[1].kind, TraceSpanKind::LlmRequest);
+    assert_eq!(traces[0].spans[2].kind, TraceSpanKind::ToolCall);
+    assert_eq!(traces[0].spans[2].tool_name, Some(ToolName::new("Read")));
+}
+
 fn codex_trace_fixture() -> &'static str {
     r#"{
         "resourceSpans": [{
@@ -3131,6 +3290,87 @@ fn copilot_trace_fixture() -> &'static str {
                         "attributes": [
                             { "key": "github.copilot.span.kind", "value": { "stringValue": "tool_call" } },
                             { "key": "gen_ai.tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }"#
+}
+
+fn claude_trace_fixture() -> String {
+    claude_trace_fixture_for(
+        "claude-session-1",
+        "claude-turn-1",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+}
+
+fn claude_trace_fixture_for(session_id: &str, prompt_id: &str, trace_id: &str) -> String {
+    claude_trace_fixture_template()
+        .replace("__SESSION_ID__", session_id)
+        .replace("__PROMPT_ID__", prompt_id)
+        .replace("__TRACE_ID__", trace_id)
+}
+
+fn claude_trace_fixture_template() -> &'static str {
+    r#"{
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "claude_code" } },
+                    { "key": "repo.name", "value": { "stringValue": "kvasir" } },
+                    { "key": "repo.path", "value": { "stringValue": "/Users/oyr/projects/kvasir" } },
+                    { "key": "session.id", "value": { "stringValue": "__SESSION_ID__" } },
+                    { "key": "prompt.id", "value": { "stringValue": "__PROMPT_ID__" } }
+                ]
+            },
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": "__TRACE_ID__",
+                        "spanId": "1111111111111111",
+                        "name": "claude_code.interaction",
+                        "startTimeUnixNano": "1781956800000000000",
+                        "endTimeUnixNano": "1781956802180000000",
+                        "attributes": [
+                            { "key": "span.type", "value": { "stringValue": "claude_code.interaction" } }
+                        ]
+                    },
+                    {
+                        "traceId": "__TRACE_ID__",
+                        "spanId": "2222222222222222",
+                        "parentSpanId": "1111111111111111",
+                        "name": "claude_code.llm_request",
+                        "startTimeUnixNano": "1781956800180000000",
+                        "endTimeUnixNano": "1781956801780000000",
+                        "attributes": [
+                            { "key": "span.type", "value": { "stringValue": "claude_code.llm_request" } },
+                            { "key": "model", "value": { "stringValue": "claude-opus-4-20250514" } }
+                        ]
+                    },
+                    {
+                        "traceId": "__TRACE_ID__",
+                        "spanId": "3333333333333333",
+                        "parentSpanId": "1111111111111111",
+                        "name": "claude_code.tool",
+                        "startTimeUnixNano": "1781956801780000000",
+                        "endTimeUnixNano": "1781956802100000000",
+                        "attributes": [
+                            { "key": "span.type", "value": { "stringValue": "claude_code.tool" } },
+                            { "key": "tool.name", "value": { "stringValue": "Read" } }
+                        ]
+                    },
+                    {
+                        "traceId": "__TRACE_ID__",
+                        "spanId": "4444444444444444",
+                        "parentSpanId": "3333333333333333",
+                        "name": "claude_code.tool.execution",
+                        "startTimeUnixNano": "1781956801800000000",
+                        "endTimeUnixNano": "1781956802090000000",
+                        "attributes": [
+                            { "key": "span.type", "value": { "stringValue": "claude_code.tool.execution" } },
+                            { "key": "tool.name", "value": { "stringValue": "Read" } }
                         ]
                     }
                 ]
@@ -3527,6 +3767,121 @@ fn copilot_trace_protobuf_fixture() -> Vec<u8> {
                         attributes: vec![
                             string_attribute("github.copilot.span.kind", "tool_call"),
                             string_attribute("gen_ai.tool.name", "Read"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn claude_trace_protobuf_fixture() -> Vec<u8> {
+    claude_trace_protobuf_fixture_for(
+        "claude-session-1",
+        "claude-turn-1",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+}
+
+fn claude_trace_protobuf_fixture_for(session_id: &str, prompt_id: &str, trace_id: &str) -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "claude_code"),
+                    string_attribute("repo.name", "kvasir"),
+                    string_attribute("repo.path", "/Users/oyr/projects/kvasir"),
+                    string_attribute("session.id", session_id),
+                    string_attribute("prompt.id", prompt_id),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![
+                    Span {
+                        trace_id: hex_bytes(trace_id),
+                        span_id: hex_bytes("1111111111111111"),
+                        trace_state: String::new(),
+                        parent_span_id: Vec::new(),
+                        flags: 0,
+                        name: "claude_code.interaction".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_000_000_000,
+                        end_time_unix_nano: 1_781_956_802_180_000_000,
+                        attributes: vec![string_attribute("span.type", "claude_code.interaction")],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes(trace_id),
+                        span_id: hex_bytes("2222222222222222"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "claude_code.llm_request".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_800_180_000_000,
+                        end_time_unix_nano: 1_781_956_801_780_000_000,
+                        attributes: vec![
+                            string_attribute("span.type", "claude_code.llm_request"),
+                            string_attribute("model", "claude-opus-4-20250514"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes(trace_id),
+                        span_id: hex_bytes("3333333333333333"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("1111111111111111"),
+                        flags: 0,
+                        name: "claude_code.tool".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_801_780_000_000,
+                        end_time_unix_nano: 1_781_956_802_100_000_000,
+                        attributes: vec![
+                            string_attribute("span.type", "claude_code.tool"),
+                            string_attribute("tool.name", "Read"),
+                        ],
+                        dropped_attributes_count: 0,
+                        events: Vec::new(),
+                        dropped_events_count: 0,
+                        links: Vec::new(),
+                        dropped_links_count: 0,
+                        status: None,
+                    },
+                    Span {
+                        trace_id: hex_bytes(trace_id),
+                        span_id: hex_bytes("4444444444444444"),
+                        trace_state: String::new(),
+                        parent_span_id: hex_bytes("3333333333333333"),
+                        flags: 0,
+                        name: "claude_code.tool.execution".to_owned(),
+                        kind: 0,
+                        start_time_unix_nano: 1_781_956_801_800_000_000,
+                        end_time_unix_nano: 1_781_956_802_090_000_000,
+                        attributes: vec![
+                            string_attribute("span.type", "claude_code.tool.execution"),
+                            string_attribute("tool.name", "Read"),
                         ],
                         dropped_attributes_count: 0,
                         events: Vec::new(),
