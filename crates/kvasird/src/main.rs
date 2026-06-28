@@ -1,7 +1,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use kvasir_core::{BearerToken, KvasirEndpoint, RawBodyDirectory};
+use kvasir_core::{BearerToken, ContentRetentionPolicy, KvasirEndpoint, RawBodyDirectory};
 use kvasird::{DaemonConfig, SetupSecretSource, start};
 
 #[cfg(unix)]
@@ -27,14 +28,11 @@ async fn main() -> anyhow::Result<()> {
         bearer_token_from_environment_or_setup(std::env::var("KVASIR_BEARER_TOKEN").ok(), || {
             daemon_setup_bearer_token(otlp_bind, &data_dir)
         })?;
+    let content_retention_policy = content_retention_policy_from_environment()?;
 
-    let daemon = start(DaemonConfig::new(
-        otlp_bind,
-        rpc_socket_path,
-        database_path,
-        bearer_token,
-    ))
-    .await?;
+    let mut config = DaemonConfig::new(otlp_bind, rpc_socket_path, database_path, bearer_token);
+    config.content_retention_policy = content_retention_policy;
+    let daemon = start(config).await?;
     eprintln!("kvasird listening for OTLP on {}", daemon.otlp_addr());
 
     tokio::signal::ctrl_c().await?;
@@ -87,6 +85,68 @@ fn bearer_token_from_environment_or_setup(
         Some(token) if !token.trim().is_empty() => Ok(BearerToken::new(token)),
         _ => setup_token(),
     }
+}
+
+fn content_retention_policy_from_environment() -> anyhow::Result<ContentRetentionPolicy> {
+    content_retention_policy_from_values(
+        std::env::var("KVASIR_CONTENT_RETENTION_MAX_AGE_DAYS").ok(),
+        std::env::var("KVASIR_CONTENT_RETENTION_MAX_BYTES").ok(),
+    )
+}
+
+fn content_retention_policy_from_values(
+    max_age_days: Option<String>,
+    max_bytes: Option<String>,
+) -> anyhow::Result<ContentRetentionPolicy> {
+    let mut policy = ContentRetentionPolicy::default();
+    if let Some(max_age) =
+        optional_duration_days_from_value("KVASIR_CONTENT_RETENTION_MAX_AGE_DAYS", max_age_days)?
+    {
+        policy = policy.with_max_age(max_age);
+    }
+    if let Some(max_bytes) =
+        optional_u64_from_value("KVASIR_CONTENT_RETENTION_MAX_BYTES", max_bytes)?
+    {
+        policy = policy.with_max_bytes(max_bytes);
+    }
+    Ok(policy)
+}
+
+fn optional_duration_days_from_value(
+    name: &str,
+    value: Option<String>,
+) -> anyhow::Result<Option<Option<Duration>>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if is_forever_value(&value) {
+        return Ok(Some(None));
+    }
+    let days = value.trim().parse::<u64>()?;
+    let seconds = days
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| anyhow::anyhow!("{name} is too large"))?;
+    Ok(Some(Some(Duration::from_secs(seconds))))
+}
+
+fn optional_u64_from_value(
+    _name: &str,
+    value: Option<String>,
+) -> anyhow::Result<Option<Option<u64>>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if is_forever_value(&value) {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(value.trim().parse()?)))
+}
+
+fn is_forever_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "forever" | "keep_forever" | "keep-forever"
+    )
 }
 
 fn daemon_setup_bearer_token(
@@ -381,6 +441,42 @@ mod tests {
                 .to_string()
                 .contains("HOME or passwd home directory must be available")
         );
+    }
+
+    #[test]
+    fn content_retention_policy_defaults_to_age_and_size_caps() -> anyhow::Result<()> {
+        let policy = content_retention_policy_from_values(None, None)?;
+
+        assert_eq!(
+            policy.max_age(),
+            Some(Duration::from_secs(90 * 24 * 60 * 60))
+        );
+        assert_eq!(policy.max_bytes(), Some(20_000_000_000));
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_policy_reads_numeric_overrides() -> anyhow::Result<()> {
+        let policy =
+            content_retention_policy_from_values(Some("7".to_owned()), Some("1024".to_owned()))?;
+
+        assert_eq!(
+            policy.max_age(),
+            Some(Duration::from_secs(7 * 24 * 60 * 60))
+        );
+        assert_eq!(policy.max_bytes(), Some(1024));
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_policy_supports_keep_forever_caps() -> anyhow::Result<()> {
+        let policy = content_retention_policy_from_values(
+            Some("forever".to_owned()),
+            Some("keep-forever".to_owned()),
+        )?;
+
+        assert!(policy.keeps_forever());
+        Ok(())
     }
 
     fn path_environment(

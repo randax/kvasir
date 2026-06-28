@@ -18,12 +18,13 @@ use kvasir_core::rpc::{
     TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName, TraceSpanKind,
 };
 use kvasir_core::{
-    ContentKind, ContentText, CostUsd, ModelTokenPrices, PriceTable, RepoBucket, RepoIdentity,
-    RepoName, RepoPath, StoreKey, UsageStore,
+    ContentKind, ContentRetentionPolicy, ContentText, CostUsd, ModelTokenPrices, PriceTable,
+    RepoBucket, RepoIdentity, RepoName, RepoPath, StoreKey, UsageStore,
 };
 use kvasird::{
     DaemonConfig, RunningDaemon, StoreKeySource, query_content, query_cost_rollup,
-    query_token_rollup, query_tool_call_rollup, query_trace, start, start_with_store_key_source,
+    query_overview_rollup, query_token_rollup, query_tool_call_rollup, query_trace, start,
+    start_with_store_key_source,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -52,6 +53,7 @@ async fn golden_claude_metrics_replay_returns_per_model_day_rollup() -> anyhow::
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -178,6 +180,7 @@ async fn golden_copilot_metrics_replay_returns_repo_model_rollups_with_cost() ->
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -253,6 +256,7 @@ async fn golden_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Resu
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -297,6 +301,7 @@ async fn golden_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::Re
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -341,6 +346,7 @@ async fn golden_claude_trace_replay_returns_canonical_span_tree() -> anyhow::Res
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -414,6 +420,7 @@ async fn protobuf_codex_trace_replay_returns_canonical_span_tree() -> anyhow::Re
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -458,6 +465,7 @@ async fn protobuf_copilot_trace_replay_returns_canonical_span_tree() -> anyhow::
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -502,6 +510,7 @@ async fn protobuf_claude_trace_replay_returns_canonical_span_tree() -> anyhow::R
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -577,6 +586,7 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
         database_path: database_path.clone(),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
     let client = reqwest::Client::new();
@@ -763,6 +773,290 @@ async fn golden_opencode_trace_log_replay_returns_trace_primary_rollups() -> any
 }
 
 #[tokio::test]
+async fn daemon_content_retention_compaction_purges_replay_but_preserves_rollups()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: bearer_token.clone(),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(opencode_trace_fixture())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let content_query = ContentQuery {
+        harness: HarnessName::new("opencode"),
+        session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+        prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+    };
+    assert_eq!(
+        query_content(
+            rpc_socket_path.clone(),
+            content_query.clone(),
+            bearer_token.clone(),
+        )
+        .await?
+        .items
+        .len(),
+        4
+    );
+
+    let report = daemon
+        .compact_content_retention_once(
+            &ContentRetentionPolicy::new(Some(Duration::from_secs(24 * 60 * 60)), None),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        )
+        .await?;
+
+    assert_eq!(report.inline_blobs_evicted, 4);
+    assert_eq!(report.raw_body_blobs_evicted, 0);
+    assert_eq!(report.bytes_retained, 0);
+    let purged_replay =
+        query_content(rpc_socket_path.clone(), content_query, bearer_token.clone()).await?;
+    assert!(purged_replay.items.is_empty());
+    assert_eq!(
+        purged_replay.availability,
+        ContentAvailability::Captured {
+            harness: HarnessName::new("opencode"),
+            kinds: vec![
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::UserPrompt,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::AssistantMessage,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::ToolInput,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::ToolOutput,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::RawApiRequest,
+                    reason: ContentUnavailableReason::NotProvidedByHarness,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::RawApiResponse,
+                    reason: ContentUnavailableReason::NotProvidedByHarness,
+                },
+            ],
+        }
+    );
+    let rollup_query = RollupQuery::new(
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+        TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+    );
+    assert_eq!(
+        query_token_rollup(rpc_socket_path.clone(), rollup_query.clone()).await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            input_tokens: 1200,
+            output_tokens: 450,
+            cache_tokens: 80,
+        }]
+    );
+    assert_eq!(
+        query_cost_rollup(
+            rpc_socket_path.clone(),
+            CostRollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        vec![CostRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            cost_usd: CostUsd::from_nanos(6_040_000).unwrap(),
+            source: CostSource::Estimated,
+        }]
+    );
+    assert_eq!(
+        query_tool_call_rollup(
+            rpc_socket_path.clone(),
+            ToolCallRollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        vec![ToolCallRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            harness: HarnessName::new("opencode"),
+            tool_name: ToolName::new("Read"),
+            call_count: 1,
+        }]
+    );
+    let overview = query_overview_rollup(rpc_socket_path, rollup_query).await?;
+    assert_eq!(overview.token_rollups.len(), 1);
+    assert_eq!(overview.cost_rollups.len(), 1);
+    assert_eq!(overview.tool_call_rollups.len(), 1);
+    assert_eq!(overview.harness_summaries[0].totals.tool_calls, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_content_retention_startup_task_purges_without_manual_hook() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    let bearer_token = BearerToken::new("test-token");
+    {
+        let mut store = UsageStore::open(&database_path, &test_store_key())?;
+        store.ingest_usage(&kvasir_core::parse_otlp_json_traces(
+            opencode_trace_fixture().as_bytes(),
+        )?)?;
+    }
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path,
+        bearer_token: bearer_token.clone(),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::new(
+            Some(Duration::from_secs(24 * 60 * 60)),
+            None,
+        ),
+    })
+    .await?;
+
+    let purged_replay = wait_for_content_item_count(
+        &rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+        },
+        bearer_token,
+        0,
+        Duration::from_secs(2),
+    )
+    .await?;
+    assert!(purged_replay.items.is_empty());
+    assert_eq!(
+        query_token_rollup(
+            rpc_socket_path,
+            RollupQuery::new(
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+                TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+            )
+        )
+        .await?,
+        vec![TokenRollup {
+            day: RollupDay::parse("2026-06-20")?,
+            repo: kvasir_repo(),
+            model: ModelName::new("gpt-4.1"),
+            input_tokens: 1200,
+            output_tokens: 450,
+            cache_tokens: 80,
+        }]
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_ingest_compacts_expired_inline_content_before_replay() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let bearer_token = BearerToken::new("test-token");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: bearer_token.clone(),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::new(
+            Some(Duration::from_secs(24 * 60 * 60)),
+            None,
+        ),
+    })
+    .await?;
+
+    let old_fixture = opencode_trace_fixture().replace("178195680", "100000000");
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(old_fixture)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let replay = query_content(
+        rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: kvasir_core::rpc::SessionId::new("opencode-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("opencode-turn-1"),
+        },
+        bearer_token,
+    )
+    .await?;
+
+    assert!(replay.items.is_empty());
+    assert_eq!(
+        replay.availability,
+        ContentAvailability::Captured {
+            harness: HarnessName::new("opencode"),
+            kinds: vec![
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::UserPrompt,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::AssistantMessage,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::ToolInput,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::ToolOutput,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::RawApiRequest,
+                    reason: ContentUnavailableReason::NotProvidedByHarness,
+                },
+                ContentKindAvailability::Unavailable {
+                    kind: ContentKind::RawApiResponse,
+                    reason: ContentUnavailableReason::NotProvidedByHarness,
+                },
+            ],
+        }
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
 async fn claude_raw_body_file_imports_into_content_replay_and_removes_source() -> anyhow::Result<()>
 {
     let temp = tempdir()?;
@@ -787,6 +1081,7 @@ async fn claude_raw_body_file_imports_into_content_replay_and_removes_source() -
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -927,6 +1222,7 @@ async fn protobuf_claude_raw_body_file_imports_into_content_replay() -> anyhow::
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1005,6 +1301,7 @@ async fn claude_raw_body_files_arriving_after_otlp_are_imported_by_one_shot_scan
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1075,6 +1372,7 @@ async fn persisted_raw_body_row_retries_plaintext_cleanup() -> anyhow::Result<()
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1084,6 +1382,125 @@ async fn persisted_raw_body_row_retries_plaintext_cleanup() -> anyhow::Result<()
     assert!(
         !raw_body_import_queue_body_refs(&database_path)?
             .contains(&"orphan-request.json".to_owned())
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn purged_raw_body_row_cleans_plaintext_without_rehydrating_replay() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("purged-request.json");
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    std::fs::write(&request_body_path, r#"{"plaintext":"should not return"}"#)?;
+    initialize_test_store(&database_path)?;
+    let event_key =
+        insert_raw_body_import_queue_row(&database_path, "purged-request.json", 1_781_956_802_180)?;
+    insert_persisted_raw_body_row_for_event(&database_path, &event_key, "zstd")?;
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+    })
+    .await?;
+
+    let report = daemon
+        .compact_content_retention_once(
+            &ContentRetentionPolicy::new(Some(Duration::from_secs(24 * 60 * 60)), None),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        )
+        .await?;
+    assert_eq!(report.raw_body_blobs_evicted, 1);
+
+    daemon.import_available_raw_bodies_once().await?;
+
+    assert!(!request_body_path.exists());
+    assert!(
+        !raw_body_import_queue_body_refs(&database_path)?
+            .contains(&"purged-request.json".to_owned())
+    );
+    let replay = query_content(
+        rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+    assert!(replay.items.is_empty());
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_queued_raw_body_import_is_compacted_before_it_can_replay() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("stale-request.json");
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    std::fs::write(&request_body_path, r#"{"plaintext":"already too old"}"#)?;
+    initialize_test_store(&database_path)?;
+    insert_raw_body_import_queue_row(&database_path, "stale-request.json", 1_781_956_802_180)?;
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::new(
+            Some(Duration::from_secs(24 * 60 * 60)),
+            None,
+        ),
+    })
+    .await?;
+
+    daemon.import_available_raw_bodies_once().await?;
+
+    assert!(!request_body_path.exists());
+    assert!(
+        !raw_body_import_queue_body_refs(&database_path)?
+            .contains(&"stale-request.json".to_owned())
+    );
+    let replay = query_content(
+        rpc_socket_path,
+        ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+    assert!(replay.items.is_empty());
+    assert_eq!(
+        replay.availability,
+        ContentAvailability::Captured {
+            harness: HarnessName::new("claude_code"),
+            kinds: ContentKind::ALL
+                .iter()
+                .copied()
+                .map(|kind| ContentKindAvailability::Unavailable {
+                    kind,
+                    reason: ContentUnavailableReason::NotCapturedForPrompt,
+                })
+                .collect(),
+        }
     );
 
     drop(daemon);
@@ -1111,6 +1528,7 @@ async fn duplicate_persisted_raw_body_event_does_not_delete_reused_body_ref() ->
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1159,6 +1577,7 @@ async fn persisted_raw_body_row_without_source_drains_import_queue() -> anyhow::
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1192,6 +1611,7 @@ async fn unsupported_stored_raw_body_compression_is_repaired_by_reingest() -> an
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1229,6 +1649,7 @@ async fn missing_raw_body_queue_rows_do_not_starve_later_ready_files() -> anyhow
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1286,6 +1707,7 @@ async fn claude_raw_body_file_import_rejects_symlink_sources() -> anyhow::Result
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1302,7 +1724,7 @@ async fn claude_raw_body_file_import_rejects_symlink_sources() -> anyhow::Result
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert!(secret_path.exists());
-    assert!(raw_body_dir.join("request-1.json").exists());
+    assert!(!raw_body_dir.join("request-1.json").exists());
 
     drop(daemon);
     Ok(())
@@ -1325,6 +1747,7 @@ async fn claude_raw_body_file_import_rejects_hardlinked_sources() -> anyhow::Res
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1340,9 +1763,101 @@ async fn claude_raw_body_file_import_rejects_hardlinked_sources() -> anyhow::Res
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(!raw_body_dir.join("request-1.json").exists());
     assert_eq!(
         std::fs::read_to_string(secret_path)?,
         r#"{"secret":"do not import"}"#
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn raw_body_imports_stay_bound_to_validated_directory_after_path_swap() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path,
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+    })
+    .await?;
+
+    let moved_raw_body_dir = temp.path().join("raw-bodies-original");
+    std::fs::rename(&raw_body_dir, &moved_raw_body_dir)?;
+    let outside_dir = temp.path().join("outside-raw-bodies");
+    std::fs::create_dir_all(&outside_dir)?;
+    let outside_body = outside_dir.join("request-1.json");
+    std::fs::write(&outside_body, r#"{"secret":"outside directory"}"#)?;
+    std::os::unix::fs::symlink(&outside_dir, &raw_body_dir)?;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "request-1.json",
+            "missing-response.json",
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        std::fs::read_to_string(outside_body)?,
+        r#"{"secret":"outside directory"}"#
+    );
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn uncleanable_invalid_raw_body_source_is_quarantined() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(raw_body_dir.join("request-1.json"))?;
+    let database_path = temp.path().join("usage.sqlite3");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: temp.path().join("kvasird.sock"),
+        database_path: database_path.clone(),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+    })
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "request-1.json",
+            "missing-response.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let connection = open_test_store_connection(&database_path)?;
+    let failure: (String, String) = connection.query_row(
+        "SELECT state, last_failure_kind
+         FROM raw_body_import_queue
+         WHERE body_ref = 'request-1.json'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        failure,
+        ("quarantined".to_owned(), "invalid_source".to_owned())
     );
 
     drop(daemon);
@@ -1363,6 +1878,7 @@ async fn daemon_rejects_symlinked_raw_body_directory() -> anyhow::Result<()> {
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await;
 
@@ -1393,6 +1909,7 @@ async fn raw_body_file_import_ignores_non_claude_code_harnesses() -> anyhow::Res
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1442,6 +1959,7 @@ async fn protobuf_opencode_trace_replay_returns_trace_primary_rollups() -> anyho
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1603,6 +2121,7 @@ async fn opencode_trace_ingest_degrades_when_experimental_attributes_are_missing
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1666,6 +2185,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
                 database_path: database_path.clone(),
                 bearer_token: bearer_token.clone(),
                 price_table: PriceTable::bundled_defaults(),
+                content_retention_policy: ContentRetentionPolicy::keep_forever(),
             },
             StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
         )
@@ -1688,6 +2208,7 @@ async fn daemon_reopens_encrypted_store_with_configured_key() -> anyhow::Result<
             database_path,
             bearer_token,
             price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
         },
         StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
     )
@@ -1749,6 +2270,7 @@ async fn daemon_default_start_generates_reuses_and_requires_keychain_key() -> an
         database_path,
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     };
 
     {
@@ -1861,6 +2383,7 @@ async fn daemon_default_start_generates_key_for_empty_placeholder_database() -> 
         database_path,
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -1889,6 +2412,7 @@ async fn daemon_default_start_requires_key_for_empty_database_with_sidecar() -> 
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await
     {
@@ -1935,6 +2459,7 @@ async fn daemon_default_start_requires_key_for_symlinked_empty_database_with_sid
         database_path: symlink_database_path,
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await
     {
@@ -1980,6 +2505,7 @@ async fn daemon_default_start_rejects_dangling_database_symlink_before_key_persi
         database_path,
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await
     {
@@ -2020,6 +2546,7 @@ async fn daemon_default_start_opens_stable_database_path_after_alias_retarget() 
         database_path: symlink_database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     };
 
     let start_task = tokio::spawn(start(config));
@@ -2054,6 +2581,7 @@ async fn daemon_default_start_cleans_bootstrap_database_when_keychain_write_fail
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     };
 
     test_keyring.fail_next_set();
@@ -2099,6 +2627,7 @@ async fn daemon_default_start_restores_empty_placeholder_when_keychain_write_fai
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     };
 
     test_keyring.fail_next_set();
@@ -2152,6 +2681,7 @@ async fn daemon_default_start_preserves_key_when_store_open_bootstrap_fails() ->
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     };
 
     let error = match start(config.clone()).await {
@@ -2206,6 +2736,7 @@ async fn daemon_default_start_preserves_key_when_bootstrap_database_prepare_fail
         database_path: database_path.clone(),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     };
 
     let error = match start(config.clone()).await {
@@ -2246,6 +2777,7 @@ async fn metrics_ingest_attributes_rollups_to_repo_and_no_repo_buckets() -> anyh
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2336,6 +2868,7 @@ async fn metrics_ingest_returns_native_cost_rollups() -> anyhow::Result<()> {
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2428,6 +2961,7 @@ async fn logs_ingest_returns_tool_call_rollups_by_tool_and_repo() -> anyhow::Res
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2514,6 +3048,7 @@ async fn metrics_and_logs_ingest_return_tool_call_rollups_for_all_harnesses() ->
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
     let client = reqwest::Client::new();
@@ -2591,6 +3126,7 @@ async fn protobuf_logs_ingest_returns_tool_call_rollups() -> anyhow::Result<()> 
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2636,6 +3172,7 @@ async fn logs_ingest_accepts_batches_without_tool_results_as_noop() -> anyhow::R
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2674,6 +3211,7 @@ async fn logs_ingest_deduplicates_replayed_tool_result_events() -> anyhow::Resul
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
     let client = reqwest::Client::new();
@@ -2741,6 +3279,7 @@ async fn daemon_refuses_to_replace_non_socket_rpc_path() -> anyhow::Result<()> {
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await;
 
@@ -2760,6 +3299,7 @@ async fn daemon_creates_private_rpc_socket() -> anyhow::Result<()> {
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2780,6 +3320,7 @@ async fn metrics_ingest_returns_mixed_cost_rollups_with_time_boundaries() -> any
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2878,6 +3419,7 @@ async fn metrics_ingest_uses_configured_price_table_for_estimated_cost() -> anyh
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token,
         price_table,
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2924,6 +3466,7 @@ async fn metrics_ingest_rejects_oversized_bodies() -> anyhow::Result<()> {
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2956,6 +3499,7 @@ async fn metrics_ingest_rejects_payloads_without_token_usage_metrics() -> anyhow
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -2982,6 +3526,7 @@ async fn metrics_ingest_rejects_mixed_batches_with_empty_token_usage_metrics() -
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -3065,6 +3610,7 @@ async fn rpc_subscription_closes_when_extra_input_arrives_after_subscribe_reques
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -3107,6 +3653,7 @@ async fn daemon_returns_bounded_error_for_oversized_rpc_query_response() -> anyh
         database_path: temp.path().join("usage.sqlite3"),
         bearer_token: BearerToken::new("test-token"),
         price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
     })
     .await?;
 
@@ -3145,6 +3692,34 @@ async fn start_test_daemon(config: DaemonConfig) -> anyhow::Result<RunningDaemon
         StoreKeySource::static_key_for_test(TEST_STORE_KEY_BYTES),
     )
     .await
+}
+
+async fn wait_for_content_item_count(
+    rpc_socket_path: &Path,
+    query: ContentQuery,
+    bearer_token: BearerToken,
+    expected_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<ContentReplay> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let replay = query_content(
+            rpc_socket_path.to_path_buf(),
+            query.clone(),
+            bearer_token.clone(),
+        )
+        .await?;
+        if replay.items.len() == expected_count {
+            return Ok(replay);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for {expected_count} content items; last count was {}",
+                replay.items.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn kvasir_repo() -> RepoBucket {
@@ -5025,6 +5600,7 @@ fn insert_persisted_raw_body_row_for_event(
             repo_path,
             harness,
             content_kind,
+            retention_basis_ms,
             compression,
             compressed_body
         )
@@ -5039,6 +5615,7 @@ fn insert_persisted_raw_body_row_for_event(
             repo_path,
             harness,
             content_kind,
+            occurred_at_ms,
             ?2,
             x'00'
         FROM raw_body_import_queue
