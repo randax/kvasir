@@ -1,8 +1,9 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use kvasir_core::{BearerToken, KvasirEndpoint, RawBodyDirectory};
-use kvasird::{DaemonConfig, SetupSecretSource, start};
+use kvasir_core::{BearerToken, ContentRetentionPolicy, KvasirEndpoint, RawBodyDirectory};
+use kvasird::{ContentRetentionSchedule, DaemonConfig, SetupSecretSource, start};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -27,14 +28,13 @@ async fn main() -> anyhow::Result<()> {
         bearer_token_from_environment_or_setup(std::env::var("KVASIR_BEARER_TOKEN").ok(), || {
             daemon_setup_bearer_token(otlp_bind, &data_dir)
         })?;
+    let content_retention_policy = content_retention_policy_from_environment()?;
+    let content_retention_schedule = content_retention_schedule_from_environment()?;
 
-    let daemon = start(DaemonConfig::new(
-        otlp_bind,
-        rpc_socket_path,
-        database_path,
-        bearer_token,
-    ))
-    .await?;
+    let mut config = DaemonConfig::new(otlp_bind, rpc_socket_path, database_path, bearer_token);
+    config.content_retention_policy = content_retention_policy;
+    config.content_retention_schedule = content_retention_schedule;
+    let daemon = start(config).await?;
     eprintln!("kvasird listening for OTLP on {}", daemon.otlp_addr());
 
     tokio::signal::ctrl_c().await?;
@@ -87,6 +87,135 @@ fn bearer_token_from_environment_or_setup(
         Some(token) if !token.trim().is_empty() => Ok(BearerToken::new(token)),
         _ => setup_token(),
     }
+}
+
+fn content_retention_policy_from_environment() -> anyhow::Result<ContentRetentionPolicy> {
+    content_retention_policy_from_values(
+        std::env::var("KVASIR_CONTENT_RETENTION_MAX_AGE_DAYS").ok(),
+        std::env::var("KVASIR_CONTENT_RETENTION_MAX_BYTES").ok(),
+    )
+}
+
+fn content_retention_schedule_from_environment() -> anyhow::Result<ContentRetentionSchedule> {
+    content_retention_schedule_from_values(
+        std::env::var("KVASIR_CONTENT_RETENTION_COMPACTION_INTERVAL_SECONDS").ok(),
+        std::env::var("KVASIR_CONTENT_RETENTION_COMPACTION_WINDOW_START_UTC").ok(),
+    )
+}
+
+fn content_retention_schedule_from_values(
+    interval_seconds: Option<String>,
+    window_start_utc: Option<String>,
+) -> anyhow::Result<ContentRetentionSchedule> {
+    let mut schedule = ContentRetentionSchedule::default();
+    if let Some(interval) = optional_duration_seconds_from_value(
+        "KVASIR_CONTENT_RETENTION_COMPACTION_INTERVAL_SECONDS",
+        interval_seconds,
+    )? {
+        schedule = ContentRetentionSchedule::new(interval, schedule.window_start_utc())?;
+    }
+    if let Some(window_start) = optional_utc_day_offset_from_value(
+        "KVASIR_CONTENT_RETENTION_COMPACTION_WINDOW_START_UTC",
+        window_start_utc,
+    )? {
+        schedule = ContentRetentionSchedule::new(schedule.interval(), window_start)?;
+    }
+    Ok(schedule)
+}
+
+fn content_retention_policy_from_values(
+    max_age_days: Option<String>,
+    max_bytes: Option<String>,
+) -> anyhow::Result<ContentRetentionPolicy> {
+    let mut policy = ContentRetentionPolicy::default();
+    if let Some(max_age) =
+        optional_duration_days_from_value("KVASIR_CONTENT_RETENTION_MAX_AGE_DAYS", max_age_days)?
+    {
+        policy = policy.with_max_age(max_age);
+    }
+    if let Some(max_bytes) =
+        optional_u64_from_value("KVASIR_CONTENT_RETENTION_MAX_BYTES", max_bytes)?
+    {
+        policy = policy.with_max_bytes(max_bytes);
+    }
+    Ok(policy)
+}
+
+fn optional_duration_days_from_value(
+    name: &str,
+    value: Option<String>,
+) -> anyhow::Result<Option<Option<Duration>>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if is_forever_value(&value) {
+        return Ok(Some(None));
+    }
+    let days = value.trim().parse::<u64>()?;
+    let seconds = days
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| anyhow::anyhow!("{name} is too large"))?;
+    Ok(Some(Some(Duration::from_secs(seconds))))
+}
+
+fn optional_duration_seconds_from_value(
+    name: &str,
+    value: Option<String>,
+) -> anyhow::Result<Option<Duration>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let seconds = value.trim().parse::<u64>()?;
+    if seconds == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(Some(Duration::from_secs(seconds)))
+}
+
+fn optional_utc_day_offset_from_value(
+    name: &str,
+    value: Option<String>,
+) -> anyhow::Result<Option<Duration>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let parts = value.trim().split(':').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) {
+        anyhow::bail!("{name} must use HH:MM or HH:MM:SS");
+    }
+    let hours = parts[0].parse::<u64>()?;
+    let minutes = parts[1].parse::<u64>()?;
+    let seconds = if parts.len() == 3 {
+        parts[2].parse::<u64>()?
+    } else {
+        0
+    };
+    if hours >= 24 || minutes >= 60 || seconds >= 60 {
+        anyhow::bail!("{name} must be within one UTC day");
+    }
+    Ok(Some(Duration::from_secs(
+        hours * 60 * 60 + minutes * 60 + seconds,
+    )))
+}
+
+fn optional_u64_from_value(
+    _name: &str,
+    value: Option<String>,
+) -> anyhow::Result<Option<Option<u64>>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if is_forever_value(&value) {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(value.trim().parse()?)))
+}
+
+fn is_forever_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "forever" | "keep_forever" | "keep-forever"
+    )
 }
 
 fn daemon_setup_bearer_token(
@@ -381,6 +510,82 @@ mod tests {
                 .to_string()
                 .contains("HOME or passwd home directory must be available")
         );
+    }
+
+    #[test]
+    fn content_retention_policy_defaults_to_age_and_size_caps() -> anyhow::Result<()> {
+        let policy = content_retention_policy_from_values(None, None)?;
+
+        assert_eq!(
+            policy.max_age(),
+            Some(Duration::from_secs(90 * 24 * 60 * 60))
+        );
+        assert_eq!(policy.max_bytes(), Some(20_000_000_000));
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_policy_reads_numeric_overrides() -> anyhow::Result<()> {
+        let policy =
+            content_retention_policy_from_values(Some("7".to_owned()), Some("1024".to_owned()))?;
+
+        assert_eq!(
+            policy.max_age(),
+            Some(Duration::from_secs(7 * 24 * 60 * 60))
+        );
+        assert_eq!(policy.max_bytes(), Some(1024));
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_policy_supports_keep_forever_caps() -> anyhow::Result<()> {
+        let policy = content_retention_policy_from_values(
+            Some("forever".to_owned()),
+            Some("keep-forever".to_owned()),
+        )?;
+
+        assert!(policy.keeps_forever());
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_schedule_defaults_to_daily_utc_midnight() -> anyhow::Result<()> {
+        let schedule = content_retention_schedule_from_values(None, None)?;
+
+        assert_eq!(schedule.interval(), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(schedule.window_start_utc(), Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_schedule_reads_interval_and_window_overrides() -> anyhow::Result<()> {
+        let schedule = content_retention_schedule_from_values(
+            Some("3600".to_owned()),
+            Some("02:30:15".to_owned()),
+        )?;
+
+        assert_eq!(schedule.interval(), Duration::from_secs(60 * 60));
+        assert_eq!(
+            schedule.window_start_utc(),
+            Duration::from_secs(2 * 60 * 60 + 30 * 60 + 15)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_retention_schedule_rejects_zero_interval() {
+        let error = content_retention_schedule_from_values(Some("0".to_owned()), None)
+            .expect_err("zero interval must be rejected");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn content_retention_schedule_rejects_out_of_day_window_start() {
+        let error = content_retention_schedule_from_values(None, Some("24:00".to_owned()))
+            .expect_err("window outside UTC day must be rejected");
+
+        assert!(error.to_string().contains("within one UTC day"));
     }
 
     fn path_environment(

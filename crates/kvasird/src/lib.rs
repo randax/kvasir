@@ -7,7 +7,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::to_bytes;
@@ -21,11 +21,12 @@ use kvasir_core::rpc::{
     ToolCallRollupQuery, Trace, TraceQuery, UsageUpdateKind,
 };
 use kvasir_core::{
-    PriceTable, RawBodyImportFailure, RawBodyImportFailureKind, RawBodyImportPreparation,
-    StoreError, StoreKey, UsageStore, cleanup_prepared_raw_body_imports, parse_otlp_json_traces,
-    parse_otlp_json_usage_logs, parse_otlp_json_usage_metrics, parse_otlp_protobuf_traces,
-    parse_otlp_protobuf_usage_logs, parse_otlp_protobuf_usage_metrics,
-    prepare_raw_body_import_candidate,
+    ContentRetentionPolicy, ContentRetentionReport, PriceTable, RawBodyImportFailure,
+    RawBodyImportFailureKind, RawBodyImportPreparation, StoreError, StoreKey, UsageStore,
+    VerifiedRawBodyDirectory, cleanup_invalid_raw_body_candidate,
+    cleanup_prepared_raw_body_imports, parse_otlp_json_traces, parse_otlp_json_usage_logs,
+    parse_otlp_json_usage_metrics, parse_otlp_protobuf_traces, parse_otlp_protobuf_usage_logs,
+    parse_otlp_protobuf_usage_metrics, prepare_raw_body_import_candidate,
 };
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -44,9 +45,11 @@ const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const RAW_BODY_IMPORT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const RAW_BODY_IMPORT_BATCH_SIZE: usize = 64;
+const DEFAULT_CONTENT_RETENTION_COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 pub use setup::{KeychainSetupSecretSource, SetupSecretSource};
 
@@ -61,6 +64,8 @@ pub struct DaemonConfig {
     pub database_path: PathBuf,
     pub bearer_token: BearerToken,
     pub price_table: PriceTable,
+    pub content_retention_policy: ContentRetentionPolicy,
+    pub content_retention_schedule: ContentRetentionSchedule,
 }
 
 impl DaemonConfig {
@@ -76,8 +81,56 @@ impl DaemonConfig {
             database_path,
             bearer_token,
             price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRetentionSchedule {
+    interval: Duration,
+    window_start_utc: Duration,
+}
+
+impl ContentRetentionSchedule {
+    pub fn new(interval: Duration, window_start_utc: Duration) -> Result<Self, ScheduleError> {
+        if interval.is_zero() {
+            return Err(ScheduleError::ZeroInterval);
+        }
+        if window_start_utc >= Duration::from_secs(SECONDS_PER_DAY) {
+            return Err(ScheduleError::WindowStartOutsideDay);
+        }
+        Ok(Self {
+            interval,
+            window_start_utc,
+        })
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub fn window_start_utc(&self) -> Duration {
+        self.window_start_utc
+    }
+}
+
+impl Default for ContentRetentionSchedule {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_CONTENT_RETENTION_COMPACTION_INTERVAL,
+            window_start_utc: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScheduleError {
+    #[error("content retention compaction interval must be greater than zero")]
+    ZeroInterval,
+    #[error("content retention compaction window start must be within one UTC day")]
+    WindowStartOutsideDay,
 }
 
 #[derive(Clone)]
@@ -338,6 +391,17 @@ impl RunningDaemon {
             .await
             .map_err(anyhow::Error::from)
     }
+
+    #[doc(hidden)]
+    pub async fn compact_content_retention_once(
+        &self,
+        policy: &ContentRetentionPolicy,
+        compacted_at: kvasir_core::rpc::TimestampMillis,
+    ) -> anyhow::Result<ContentRetentionReport> {
+        compact_content_retention(&self.state, policy, compacted_at, true)
+            .await
+            .map_err(anyhow::Error::from)
+    }
 }
 
 impl Drop for RunningDaemon {
@@ -354,7 +418,8 @@ impl Drop for RunningDaemon {
 struct DaemonState {
     store: Arc<Mutex<UsageStore>>,
     bearer_token: BearerToken,
-    raw_body_directory: PathBuf,
+    content_retention_policy: ContentRetentionPolicy,
+    raw_body_directory: VerifiedRawBodyDirectory,
     overview_updates: broadcast::Sender<()>,
     usage_updates: broadcast::Sender<()>,
     shutdown: broadcast::Sender<()>,
@@ -417,6 +482,7 @@ async fn start_with_store_key_source_at_stable_path(
     let state = DaemonState {
         store: Arc::new(Mutex::new(store)),
         bearer_token: config.bearer_token,
+        content_retention_policy: config.content_retention_policy.clone(),
         raw_body_directory,
         overview_updates,
         usage_updates,
@@ -451,12 +517,30 @@ async fn start_with_store_key_source_at_stable_path(
     let raw_body_import_task = tokio::spawn(async move {
         run_raw_body_import_scanner(raw_body_state, raw_body_shutdown).await;
     });
+    let content_retention_state = state.clone();
+    let content_retention_shutdown = shutdown.clone();
+    let content_retention_policy = config.content_retention_policy.clone();
+    let content_retention_schedule = config.content_retention_schedule;
+    let content_retention_task = tokio::spawn(async move {
+        run_content_retention_compactor(
+            content_retention_state,
+            content_retention_shutdown,
+            content_retention_policy,
+            content_retention_schedule,
+        )
+        .await;
+    });
 
     Ok(RunningDaemon {
         otlp_addr,
         rpc_socket_path: config.rpc_socket_path,
         shutdown,
-        tasks: vec![http_task, rpc_task, raw_body_import_task],
+        tasks: vec![
+            http_task,
+            rpc_task,
+            raw_body_import_task,
+            content_retention_task,
+        ],
         state,
     })
 }
@@ -478,6 +562,81 @@ async fn run_raw_body_import_scanner(state: DaemonState, shutdown: broadcast::Se
     }
 }
 
+async fn run_content_retention_compactor(
+    state: DaemonState,
+    shutdown: broadcast::Sender<()>,
+    policy: ContentRetentionPolicy,
+    schedule: ContentRetentionSchedule,
+) {
+    if policy.keeps_forever() {
+        return;
+    }
+    let mut shutdown = shutdown.subscribe();
+    if let Err(error) =
+        compact_content_retention(&state, &policy, current_timestamp_millis(), false).await
+    {
+        eprintln!("content retention compaction failed: {error:?}");
+    }
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now()
+            + duration_until_next_retention_window(SystemTime::now(), schedule),
+        schedule.interval(),
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = interval.tick() => {
+                if let Err(error) = compact_content_retention(&state, &policy, current_timestamp_millis(), true).await {
+                    eprintln!("content retention compaction failed: {error:?}");
+                }
+            }
+        }
+    }
+}
+
+async fn compact_content_retention(
+    state: &DaemonState,
+    policy: &ContentRetentionPolicy,
+    compacted_at: kvasir_core::rpc::TimestampMillis,
+    run_maintenance: bool,
+) -> Result<ContentRetentionReport, StoreError> {
+    let mut store = state.store.lock().await;
+    let report = store.compact_content_retention(policy, compacted_at)?;
+    if run_maintenance {
+        store.run_pending_maintenance();
+    }
+    Ok(report)
+}
+
+fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let millis = i64::try_from(millis).unwrap_or(i64::MAX);
+    kvasir_core::rpc::TimestampMillis::from_millis(millis)
+}
+
+fn duration_until_next_retention_window(
+    now: SystemTime,
+    schedule: ContentRetentionSchedule,
+) -> Duration {
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now_ms = i128::try_from(now.as_millis()).unwrap_or(i128::MAX);
+    let interval_ms = i128::try_from(schedule.interval().as_millis()).unwrap_or(i128::MAX);
+    let window_start_ms =
+        i128::try_from(schedule.window_start_utc().as_millis()).unwrap_or(i128::MAX);
+    let elapsed_since_window = (now_ms - window_start_ms).rem_euclid(interval_ms);
+    let wait_ms = if elapsed_since_window == 0 {
+        interval_ms
+    } else {
+        interval_ms - elapsed_since_window
+    };
+    Duration::from_millis(u64::try_from(wait_ms).unwrap_or(u64::MAX))
+}
+
 fn bind_private_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
     require_private_socket_parent(path)?;
     UnixListener::bind(path)
@@ -490,7 +649,7 @@ fn raw_body_directory_for_database(database_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("raw-bodies"))
 }
 
-fn prepare_raw_body_directory(database_path: &Path) -> std::io::Result<PathBuf> {
+fn prepare_raw_body_directory(database_path: &Path) -> std::io::Result<VerifiedRawBodyDirectory> {
     let raw_body_directory = raw_body_directory_for_database(database_path);
     std::fs::create_dir_all(&raw_body_directory)?;
     let metadata = std::fs::symlink_metadata(&raw_body_directory)?;
@@ -501,7 +660,8 @@ fn prepare_raw_body_directory(database_path: &Path) -> std::io::Result<PathBuf> 
         ));
     }
     set_private_directory_permissions(&raw_body_directory)?;
-    raw_body_directory.canonicalize()
+    VerifiedRawBodyDirectory::open(&raw_body_directory)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
@@ -874,6 +1034,30 @@ pub async fn query_tool_call_rollup(
     }
 }
 
+pub async fn query_overview_rollup(
+    socket_path: impl Into<PathBuf>,
+    query: RollupQuery,
+) -> anyhow::Result<OverviewRollup> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::OverviewRollup { query };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::OverviewRollup { rollup } => Ok(rollup),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
 pub async fn query_trace(
     socket_path: impl Into<PathBuf>,
     query: TraceQuery,
@@ -1003,6 +1187,14 @@ async fn ingest_otlp(
         store
             .record_raw_body_references(&records.raw_body_references)
             .map_err(|_| IngestError::StoreWriteFailed)?;
+        if !state.content_retention_policy.keeps_forever() {
+            store
+                .compact_content_retention(
+                    &state.content_retention_policy,
+                    current_timestamp_millis(),
+                )
+                .map_err(|_| IngestError::StoreWriteFailed)?;
+        }
     }
     import_available_raw_bodies(&state).await?;
     let _ = state.overview_updates.send(());
@@ -1029,6 +1221,7 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     let mut import_failures = Vec::new();
     for candidate in candidates {
         let event_key = candidate.event_key().to_owned();
+        let cleanup_candidate = candidate.clone();
         match prepare_raw_body_import_candidate(&state.raw_body_directory, candidate) {
             Ok(RawBodyImportPreparation::Prepared(prepared)) => {
                 prepared_imports.push(prepared);
@@ -1044,9 +1237,29 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
             }
             Err(error) => {
                 eprintln!("raw body source preparation failed: {error:?}");
+                let failure_kind = raw_body_failure_kind(&error);
+                if failure_kind == RawBodyImportFailureKind::InvalidSource {
+                    match cleanup_invalid_raw_body_candidate(
+                        &state.raw_body_directory,
+                        &cleanup_candidate,
+                    ) {
+                        Ok(()) => {
+                            completed_event_keys.push(event_key);
+                            continue;
+                        }
+                        Err(cleanup_error) => {
+                            eprintln!("raw body invalid source cleanup failed: {cleanup_error:?}");
+                            import_failures.push(RawBodyImportFailure {
+                                event_key,
+                                failure_kind,
+                            });
+                            continue;
+                        }
+                    }
+                }
                 import_failures.push(RawBodyImportFailure {
                     event_key,
-                    failure_kind: raw_body_failure_kind(&error),
+                    failure_kind,
                 });
             }
         }
@@ -1060,7 +1273,11 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     } else {
         let mut store = state.store.lock().await;
         store
-            .commit_prepared_raw_body_imports(&prepared_imports)
+            .commit_prepared_raw_body_imports_with_retention(
+                &prepared_imports,
+                &state.content_retention_policy,
+                current_timestamp_millis(),
+            )
             .map_err(|error| {
                 eprintln!("raw body import commit failed: {error:?}");
                 IngestError::StoreWriteFailed
@@ -1119,7 +1336,17 @@ fn raw_body_failure_kind(error: &StoreError) -> RawBodyImportFailureKind {
         StoreError::RawBodyPathEscapesDirectory
         | StoreError::RawBodyNotRegularFile
         | StoreError::RawBodyPathChangedBeforeDelete => RawBodyImportFailureKind::InvalidSource,
+        StoreError::RawBodyImportUnsupportedPlatform => {
+            RawBodyImportFailureKind::UnsupportedPlatform
+        }
         StoreError::RawBodySourceGrewBeforeDelete => RawBodyImportFailureKind::Io,
+        #[cfg(unix)]
+        StoreError::RawBodyIo(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            RawBodyImportFailureKind::InvalidSource
+        }
+        StoreError::RawBodyIo(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
+            RawBodyImportFailureKind::InvalidSource
+        }
         StoreError::RawBodyIo(error) if error.kind() == std::io::ErrorKind::NotFound => {
             RawBodyImportFailureKind::Missing
         }
@@ -1658,6 +1885,58 @@ mod tests {
     }
 
     #[test]
+    fn content_retention_scheduler_targets_configured_utc_window() {
+        let default_schedule = ContentRetentionSchedule::default();
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(23 * 60 * 60 + 59 * 60 + 59),
+                default_schedule,
+            ),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH
+                    + Duration::from_secs(23 * 60 * 60 + 59 * 60 + 59)
+                    + Duration::from_millis(750),
+                default_schedule,
+            ),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(24 * 60 * 60),
+                default_schedule,
+            ),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        let two_thirty_daily = ContentRetentionSchedule::new(
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(2 * 60 * 60 + 30 * 60),
+        )
+        .unwrap();
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(2 * 60 * 60),
+                two_thirty_daily,
+            ),
+            Duration::from_secs(30 * 60)
+        );
+        let hourly_at_five_past = ContentRetentionSchedule::new(
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(5 * 60),
+        )
+        .unwrap();
+        assert_eq!(
+            duration_until_next_retention_window(
+                UNIX_EPOCH + Duration::from_secs(2 * 60 * 60 + 6 * 60),
+                hourly_at_five_past,
+            ),
+            Duration::from_secs(59 * 60)
+        );
+    }
+
+    #[test]
     fn relative_database_path_spellings_share_keychain_and_lock_identity() {
         let bare_path = Path::new("usage.sqlite3");
         let dot_path = Path::new("./usage.sqlite3");
@@ -1736,6 +2015,8 @@ mod tests {
             database_path: symlink_database_path.clone(),
             bearer_token: BearerToken::new("test-token"),
             price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
         };
         let start_future =
             start_with_store_key_source(config, StoreKeySource::static_key_for_test([17; 32]));
