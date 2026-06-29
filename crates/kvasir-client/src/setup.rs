@@ -145,6 +145,22 @@ pub fn load_kvasir_content_replay(
 }
 
 #[uniffi::export]
+pub fn clear_kvasir_data(
+    socket_path: KvasirSocketPath,
+    config: KvasirHarnessTelemetrySetup,
+) -> Result<(), KvasirClientError> {
+    clear_kvasir_data_from_source(
+        socket_path,
+        config,
+        bearer_token_from_environment,
+        |socket_path, bearer_token| {
+            let client = KvasirClient::connect(socket_path)?;
+            client.clear_all_data(bearer_token)
+        },
+    )
+}
+
+#[uniffi::export]
 pub fn uninstall_kvasir_harness_telemetry(
     config: KvasirHarnessTelemetrySetup,
 ) -> Result<(), KvasirClientError> {
@@ -192,6 +208,16 @@ fn load_kvasir_content_replay_from_source(
     let bearer_token = resolve_kvasir_bearer_token_from_source(config, environment_token)?;
     let query = content_replay_query_with_token(query, bearer_token);
     content_replay(socket_path, query)
+}
+
+fn clear_kvasir_data_from_source(
+    socket_path: KvasirSocketPath,
+    config: KvasirHarnessTelemetrySetup,
+    environment_token: impl FnOnce() -> Option<String>,
+    clear_all_data: impl FnOnce(KvasirSocketPath, KvasirBearerToken) -> Result<(), KvasirClientError>,
+) -> Result<(), KvasirClientError> {
+    let bearer_token = resolve_kvasir_bearer_token_from_source(config, environment_token)?;
+    clear_all_data(socket_path, bearer_token)
 }
 
 fn content_replay_query_with_token(
@@ -887,6 +913,38 @@ mod tests {
         assert_eq!(loaded, replay);
         assert_eq!(token_reads.get(), 1);
         assert_eq!(replay_calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_data_resolves_token_and_forwards_typed_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = full_harness_setup_config(temp.path());
+        let socket_path = KvasirSocketPath::try_from("/tmp/kvasird.sock".to_owned())?;
+        let token_reads = Rc::new(Cell::new(0));
+        let clear_calls = Rc::new(Cell::new(0));
+
+        clear_kvasir_data_from_source(
+            socket_path.clone(),
+            config,
+            {
+                let token_reads = Rc::clone(&token_reads);
+                move || {
+                    token_reads.set(token_reads.get() + 1);
+                    Some("operator-token".to_owned())
+                }
+            },
+            |received_socket_path, bearer_token| {
+                clear_calls.set(clear_calls.get() + 1);
+                assert_eq!(received_socket_path, socket_path);
+                assert_eq!(String::from(bearer_token), "operator-token");
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(token_reads.get(), 1);
+        assert_eq!(clear_calls.get(), 1);
         Ok(())
     }
 

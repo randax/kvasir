@@ -1,6 +1,37 @@
 import Combine
 import Foundation
 
+public protocol UsageDataManagement: Sendable {
+    var canClearAllData: Bool { get }
+    func clearAllData() async throws
+}
+
+public struct UnavailableUsageDataManagement: UsageDataManagement {
+    public init() {}
+
+    public var canClearAllData: Bool { false }
+
+    public func clearAllData() async throws {
+        throw UsageDataManagementError.unavailable
+    }
+}
+
+public enum UsageDataManagementError: LocalizedError {
+    case unavailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            return "Data management is unavailable"
+        }
+    }
+}
+
+public enum ClearAllDataOutcome: Equatable, Sendable {
+    case refreshed
+    case refreshFailed(message: String)
+}
+
 public enum OverviewRangePreset: String, CaseIterable, Identifiable, Sendable {
     case today
     case lastSevenDays
@@ -53,8 +84,13 @@ public final class KvasirViewerModel: ObservableObject {
         traceInspector != nil
     }
 
+    public var canClearAllData: Bool {
+        usageDataManagement.canClearAllData
+    }
+
     private let dashboard: OverviewDashboard
     private let traceInspector: TraceInspector?
+    private let usageDataManagement: any UsageDataManagement
     private let telemetrySetup: any HarnessTelemetrySetup
     private let launchAgent: DaemonLaunchAgent
     private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
@@ -68,6 +104,7 @@ public final class KvasirViewerModel: ObservableObject {
     public init(
         dashboard: OverviewDashboard,
         traceInspector: TraceInspector? = nil,
+        usageDataManagement: any UsageDataManagement = UnavailableUsageDataManagement(),
         telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
         launchAgent: DaemonLaunchAgent,
         shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
@@ -78,6 +115,7 @@ public final class KvasirViewerModel: ObservableObject {
     ) {
         self.dashboard = dashboard
         self.traceInspector = traceInspector
+        self.usageDataManagement = usageDataManagement
         self.telemetrySetup = telemetrySetup
         self.launchAgent = launchAgent
         self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
@@ -183,6 +221,24 @@ public final class KvasirViewerModel: ObservableObject {
         try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: selectedSession, prompt: nil) {
             selectedPrompt = nil
             clearTraceInspector()
+        }
+    }
+
+    public func clearAllData() async throws -> ClearAllDataOutcome {
+        try await usageDataManagement.clearAllData()
+        selectedRepo = nil
+        selectedModel = nil
+        selectedHarness = nil
+        selectedSession = nil
+        selectedPrompt = nil
+        overviewSnapshot = nil
+        clearTraceInspector()
+        do {
+            try await refreshOverview(repo: nil, model: nil, harness: nil, session: nil, prompt: nil)
+            return .refreshed
+        } catch {
+            errorMessage = "All data was cleared, but the overview could not be refreshed: \(error.localizedDescription)"
+            return .refreshFailed(message: error.localizedDescription)
         }
     }
 

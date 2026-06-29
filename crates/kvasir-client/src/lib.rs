@@ -13,11 +13,12 @@ pub use error::KvasirClientError;
 pub use setup::{
     KvasirClaudeSettingsPath, KvasirCodexConfigPath, KvasirHarnessTelemetrySetup,
     KvasirOpenCodeConfigPath, KvasirOpenCodeEnvPath, KvasirOtlpEndpoint, KvasirRawBodyDirectory,
-    KvasirRepoHookPath, KvasirShellProfilePath, configure_kvasir_harness_telemetry,
-    load_kvasir_content_replay, uninstall_kvasir_harness_telemetry,
+    KvasirRepoHookPath, KvasirShellProfilePath, clear_kvasir_data,
+    configure_kvasir_harness_telemetry, load_kvasir_content_replay,
+    uninstall_kvasir_harness_telemetry,
 };
 pub use types::{
-    KvasirAttributionStatus, KvasirContentAvailability, KvasirContentKind,
+    KvasirAttributionStatus, KvasirBearerToken, KvasirContentAvailability, KvasirContentKind,
     KvasirContentKindAvailability, KvasirContentReplay, KvasirContentReplayItem,
     KvasirContentReplayQuery, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
     KvasirCostSource, KvasirCostUsd, KvasirDimensionValue, KvasirHarnessName, KvasirModelName,

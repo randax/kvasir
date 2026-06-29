@@ -10,17 +10,18 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use kvasir_client::{
-    KvasirClient, KvasirClientError, KvasirContentAvailability, KvasirContentKind,
-    KvasirContentKindAvailability, KvasirContentReplay, KvasirContentReplayItem, KvasirContentText,
-    KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource, KvasirCostUsd,
-    KvasirHarnessName, KvasirModelName, KvasirOverviewHarnessSummary, KvasirOverviewModelSummary,
-    KvasirOverviewRefreshSubscription, KvasirOverviewRepoSummary, KvasirOverviewRollup,
-    KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute, KvasirOverviewSnapshot,
-    KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName,
-    KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirSessionId, KvasirSocketPath,
-    KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
-    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTraceDurationMeasures,
-    KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind, KvasirUsageUpdateKind,
+    KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
+    KvasirContentKind, KvasirContentKindAvailability, KvasirContentReplay, KvasirContentReplayItem,
+    KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource,
+    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewHarnessSummary,
+    KvasirOverviewModelSummary, KvasirOverviewRefreshSubscription, KvasirOverviewRepoSummary,
+    KvasirOverviewRollup, KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute,
+    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
+    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
+    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
+    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
+    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
+    KvasirTraceSpanKind, KvasirUsageUpdateKind,
 };
 use kvasir_core::PriceTable;
 use kvasir_core::rpc::{
@@ -118,6 +119,106 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
             },
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_clears_all_data_through_daemon_socket() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: None,
+        harness: None,
+        model: None,
+        session: None,
+        prompt: None,
+    };
+    let clear_socket_path = rpc_socket_path.clone();
+    let rollups_after_clear = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(clear_socket_path))?;
+        assert!(!client.token_rollups(query.clone())?.is_empty());
+        client.clear_all_data(KvasirBearerToken::try_from("test-token".to_owned())?)?;
+        client.token_rollups(query)
+    })
+    .await??;
+
+    assert!(rollups_after_clear.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_clear_all_data_requires_bearer_token() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = KvasirRollupQuery {
+        start: timestamp(2026, 6, 19),
+        end: timestamp(2026, 6, 22),
+        repo: None,
+        harness: None,
+        model: None,
+        session: None,
+        prompt: None,
+    };
+    let rollups_after_failed_clear = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        let clear_result =
+            client.clear_all_data(KvasirBearerToken::try_from("wrong-token".to_owned())?);
+        assert!(matches!(clear_result, Err(KvasirClientError::DaemonError)));
+        client.token_rollups(query)
+    })
+    .await??;
+
+    assert!(!rollups_after_failed_clear.is_empty());
 
     Ok(())
 }

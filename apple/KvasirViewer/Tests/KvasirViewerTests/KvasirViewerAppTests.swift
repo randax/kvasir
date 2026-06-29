@@ -768,6 +768,20 @@ func productionFactoryWiresLiveOverviewUpdateSourceIntoModel() async throws {
 
 @MainActor
 @Test
+func productionFactoryDisablesClearDataWhenOnlyOverviewClientIsInjected() {
+    let primary = SequenceOverviewClient(results: [
+        .success(overviewSnapshot(totalTokens: 3)),
+    ])
+    let model = ProductionModelFactory.make(
+        overviewClient: primary,
+        launchAgent: DaemonLaunchAgent(registry: RecordingLaunchAgentRegistry(status: .enabled))
+    )
+
+    #expect(model.canClearAllData == false)
+}
+
+@MainActor
+@Test
 func productionFactoryDoesNotStartBundledDaemonBeforeStartupGateOpens() async throws {
     let primary = SequenceOverviewClient(results: [
         .failure(DaemonFallbackTestError.recoverable),
