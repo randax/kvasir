@@ -21,7 +21,12 @@ pub use types::{
     KvasirAttributionStatus, KvasirBearerToken, KvasirContentAvailability, KvasirContentKind,
     KvasirContentKindAvailability, KvasirContentReplay, KvasirContentReplayItem,
     KvasirContentReplayQuery, KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup,
-    KvasirCostSource, KvasirCostUsd, KvasirDimensionValue, KvasirHarnessName, KvasirModelName,
+    KvasirCostSource, KvasirCostUsd, KvasirDimensionValue, KvasirExplorerCatalog,
+    KvasirExplorerDataset, KvasirExplorerDatasetCatalog, KvasirExplorerDimension,
+    KvasirExplorerFilter, KvasirExplorerGroupValue, KvasirExplorerMeasure, KvasirExplorerQuery,
+    KvasirExplorerResult, KvasirExplorerResultRow, KvasirExplorerSavedPanel,
+    KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun, KvasirExplorerTimeRange,
+    KvasirExplorerValidationError, KvasirExplorerVisualization, KvasirHarnessName, KvasirModelName,
     KvasirOverviewDimensionFilter, KvasirOverviewDimensionKind, KvasirOverviewHarnessSummary,
     KvasirOverviewModelSummary, KvasirOverviewPromptRoute, KvasirOverviewPromptSummary,
     KvasirOverviewRepoSummary, KvasirOverviewRollup, KvasirOverviewSeriesPoint,
@@ -31,7 +36,7 @@ pub use types::{
     KvasirSpanId, KvasirSpanName, KvasirTimestampMillis, KvasirTokenRollup,
     KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName, KvasirTrace,
     KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind, KvasirUsageUpdateKind,
+    KvasirTraceSpanKind, KvasirUsageRollupExplorerMeasures, KvasirUsageUpdateKind,
 };
 
 uniffi::setup_scaffolding!();

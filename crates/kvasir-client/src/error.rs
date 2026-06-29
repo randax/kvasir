@@ -1,7 +1,13 @@
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+use crate::types::KvasirExplorerValidationError;
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum KvasirClientError {
     #[error("invalid query")]
     InvalidQuery,
+    #[error("explorer validation failed")]
+    ExplorerValidation {
+        errors: Vec<KvasirExplorerValidationError>,
+    },
     #[error("socket io failed")]
     SocketIo,
     #[error("rpc serialization failed")]

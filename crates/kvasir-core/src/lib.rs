@@ -1,3 +1,4 @@
+pub mod explorer;
 pub mod otlp;
 pub mod pricing;
 pub mod rpc;

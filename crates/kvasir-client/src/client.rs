@@ -14,9 +14,11 @@ use crate::error::KvasirClientError;
 use crate::transport::{connect_with_retries, read_rpc_stream_event, send_rpc_request};
 use crate::types::{
     KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirCostRollup,
-    KvasirOverviewRollup, KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath,
-    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace,
-    KvasirTraceQuery, KvasirUsageUpdateKind,
+    KvasirExplorerCatalog, KvasirExplorerQuery, KvasirExplorerResult, KvasirExplorerSavedPanel,
+    KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun, KvasirOverviewRollup,
+    KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
+    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
+    KvasirUsageUpdateKind,
 };
 
 #[derive(Debug, uniffi::Object)]
@@ -86,6 +88,66 @@ impl KvasirClient {
         )?;
         match response {
             RpcResponse::ClearAllData => Ok(()),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn explorer_catalog(&self) -> Result<KvasirExplorerCatalog, KvasirClientError> {
+        let response = send_rpc_request(&self.socket_path, RpcRequest::ExplorerCatalog)?;
+        match response {
+            RpcResponse::ExplorerCatalog { catalog } => Ok(catalog.into()),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn explorer_saved_panel(
+        &self,
+        panel: KvasirExplorerSavedPanel,
+    ) -> Result<KvasirExplorerSavedPanelDefinition, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerSavedPanel {
+                panel: panel.into(),
+            },
+        )?;
+        match response {
+            RpcResponse::ExplorerSavedPanel { panel } => Ok(panel.into()),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn run_explorer_query(
+        &self,
+        query: KvasirExplorerQuery,
+    ) -> Result<KvasirExplorerResult, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerQuery {
+                query: query.try_into()?,
+            },
+        )?;
+        match response {
+            RpcResponse::ExplorerQuery { result } => result.try_into(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn run_explorer_saved_panel(
+        &self,
+        run: KvasirExplorerSavedPanelRun,
+    ) -> Result<KvasirExplorerResult, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerSavedPanelRun {
+                run: run.try_into()?,
+            },
+        )?;
+        match response {
+            RpcResponse::ExplorerSavedPanelRun { result } => result.try_into(),
             RpcResponse::Error { error } => Err(error.into()),
             _ => Err(KvasirClientError::WrongResponseType),
         }
