@@ -29,7 +29,7 @@ public enum UsageDataManagementError: LocalizedError {
 
 public enum ClearAllDataOutcome: Equatable, Sendable {
     case refreshed
-    case refreshFailed(message: String)
+    case refreshFailed
 }
 
 public enum OverviewRangePreset: String, CaseIterable, Identifiable, Sendable {
@@ -238,7 +238,7 @@ public final class KvasirViewerModel: ObservableObject {
             return .refreshed
         } catch {
             errorMessage = "All data was cleared, but the overview could not be refreshed: \(error.localizedDescription)"
-            return .refreshFailed(message: error.localizedDescription)
+            return .refreshFailed
         }
     }
 

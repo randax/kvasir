@@ -618,7 +618,7 @@ func clearAllDataRefreshFailureStillReportsDeleteSuccessAndClearsLocalState() as
     let outcome = try await viewer.clearAllData()
 
     #expect(usageDataManagement.clearCount == 1)
-    #expect(outcome == .refreshFailed(message: "transient"))
+    #expect(outcome == .refreshFailed)
     #expect(viewer.selectedHarness == nil)
     #expect(viewer.selectedSession == nil)
     #expect(viewer.selectedPrompt == nil)

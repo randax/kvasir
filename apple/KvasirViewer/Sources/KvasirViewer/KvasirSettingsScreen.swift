@@ -21,7 +21,7 @@ struct KvasirSettingsScreen: View {
                     } label: {
                         Label("Clear All Data", systemImage: "trash")
                     }
-                    .disabled(!model.canClearAllData)
+                    .disabled(!model.canClearAllData || isClearingAllData)
 
                     if let clearAllDataStatusMessage {
                         Text(clearAllDataStatusMessage)
@@ -41,6 +41,7 @@ struct KvasirSettingsScreen: View {
         .frame(width: 420)
         .sheet(isPresented: $isConfirmingClearAllData) {
             clearAllDataConfirmation
+                .interactiveDismissDisabled(isClearingAllData)
         }
     }
 
@@ -90,6 +91,9 @@ struct KvasirSettingsScreen: View {
 
     @MainActor
     private func clearAllData() async {
+        guard !isClearingAllData else {
+            return
+        }
         isClearingAllData = true
         clearAllDataErrorMessage = nil
         defer {
@@ -101,8 +105,9 @@ struct KvasirSettingsScreen: View {
             confirmationText = ""
             clearAllDataStatusMessage = "All data cleared"
             isConfirmingClearAllData = false
-            if case .refreshFailed(let message) = outcome {
-                clearAllDataErrorMessage = "Data was cleared, but the overview could not be refreshed: \(message)"
+            if case .refreshFailed = outcome {
+                clearAllDataErrorMessage = model.errorMessage
+                    ?? "All data was cleared, but the overview could not be refreshed."
             }
         } catch {
             clearAllDataErrorMessage = error.localizedDescription

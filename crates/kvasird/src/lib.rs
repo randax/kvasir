@@ -1204,9 +1204,12 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                         let _ = state.usage_updates.send(());
                         RpcResponse::ClearAllData
                     }
-                    Err(_err) => RpcResponse::Error {
-                        error: RpcError::Internal,
-                    },
+                    Err(err) => {
+                        eprintln!("clear_all_data failed: {err:?}");
+                        RpcResponse::Error {
+                            error: RpcError::Internal,
+                        }
+                    }
                 }
             }
         }
