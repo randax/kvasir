@@ -1419,6 +1419,27 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
     )
     .await?;
     let response = match serde_json::from_str::<RpcRequest>(&request) {
+        Ok(RpcRequest::ClearAllData { bearer_token }) => {
+            if bearer_token != state.bearer_token {
+                RpcResponse::Error {
+                    error: RpcError::Unauthorized,
+                }
+            } else {
+                match state.store.lock().await.clear_all_data() {
+                    Ok(()) => {
+                        let _ = state.overview_updates.send(());
+                        let _ = state.usage_updates.send(());
+                        RpcResponse::ClearAllData
+                    }
+                    Err(err) => {
+                        eprintln!("clear_all_data failed: {err:?}");
+                        RpcResponse::Error {
+                            error: RpcError::Internal,
+                        }
+                    }
+                }
+            }
+        }
         Ok(RpcRequest::TokenRollup { query }) => {
             match state.store.lock().await.token_rollups(query) {
                 Ok(rollups) => RpcResponse::TokenRollup { rollups },

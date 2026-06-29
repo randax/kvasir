@@ -23,6 +23,10 @@ struct KvasirViewerApp: App {
                 }
             }
         }
+
+        Settings {
+            KvasirSettingsScreen(model: model)
+        }
     }
 
     @MainActor

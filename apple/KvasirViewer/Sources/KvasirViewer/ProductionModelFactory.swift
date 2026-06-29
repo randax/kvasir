@@ -11,6 +11,7 @@ enum ProductionModelFactory {
         overviewClient: (any OverviewClient)? = nil,
         traceInspectorClient: (any TraceInspectorClient)? = nil,
         overviewUpdateSource: (any OverviewUpdateSource)? = nil,
+        usageDataManagement: (any UsageDataManagement)? = nil,
         daemonStarter: any DaemonProcessStarter = BundledDaemonProcess.shared,
         daemonFallbackGate: DaemonFallbackGate = DaemonFallbackGate(),
         launchAgent: DaemonLaunchAgent = DaemonLaunchAgent(),
@@ -29,6 +30,8 @@ enum ProductionModelFactory {
                 updateSource: overviewUpdateSource ?? makeOverviewUpdateSource(primary: overviewClient)
             ),
             traceInspector: makeTraceInspector(client: traceInspectorClient),
+            usageDataManagement: usageDataManagement
+                ?? makeUsageDataManagement(usesInjectedOverviewClient: overviewClient != nil),
             telemetrySetup: makeHarnessTelemetrySetup(),
             launchAgent: launchAgent,
             shouldRefreshLaunchAgentAfterStartupOverviewError: shouldRefreshLaunchAgentAfterStartupOverviewError,
@@ -97,6 +100,21 @@ enum ProductionModelFactory {
         return KvasirClientUsageUpdateSource(socketPath: rpcSocketPath)
         #else
         return nil
+        #endif
+    }
+
+    @MainActor
+    private static func makeUsageDataManagement(usesInjectedOverviewClient: Bool) -> any UsageDataManagement {
+        guard !usesInjectedOverviewClient else {
+            return UnavailableUsageDataManagement()
+        }
+        #if canImport(kvasir_client)
+        return KvasirClientUsageDataManagement(
+            socketPath: rpcSocketPath,
+            setupConfig: harnessTelemetrySetupConfig
+        )
+        #else
+        return UnavailableUsageDataManagement()
         #endif
     }
 

@@ -722,6 +722,9 @@ pub enum CostSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcRequest {
+    ClearAllData {
+        bearer_token: BearerToken,
+    },
     TokenRollup {
         query: RollupQuery,
     },
@@ -750,6 +753,7 @@ pub enum RpcRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcResponse {
+    ClearAllData,
     TokenRollup { rollups: Vec<TokenRollup> },
     OverviewRollup { rollup: OverviewRollup },
     CostRollup { rollups: Vec<CostRollup> },
@@ -926,6 +930,30 @@ mod tests {
                 "payload": {
                     "kind": "changed"
                 }
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_all_data_rpc_contract_is_typed() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            serde_json::to_value(RpcRequest::ClearAllData {
+                bearer_token: BearerToken::new("secret-token")
+            })?,
+            json!({
+                "type": "clear_all_data",
+                "payload": {
+                    "bearer_token": "secret-token"
+                }
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RpcResponse::ClearAllData)?,
+            json!({
+                "type": "clear_all_data"
             })
         );
 

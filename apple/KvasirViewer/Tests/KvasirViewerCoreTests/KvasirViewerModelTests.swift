@@ -538,6 +538,146 @@ func drillDownProgressesFromRepoToModelToSessionToPrompt() async throws {
 
 @MainActor
 @Test
+func clearAllDataDeletesThroughDataManagerAndReloadsUnfilteredOverview() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt)),
+            .success(overviewSnapshot(totalTokens: 0))
+        ]
+    )
+    let traceInspectorClient = RecordingTraceInspectorClient(
+        snapshot: TraceInspectorSnapshot(
+            prompt: prompt,
+            traces: [],
+            content: [],
+            contentAvailability: .unavailable(reason: .notCapturedForPrompt)
+        )
+    )
+    let usageDataManagement = RecordingUsageDataManagement()
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        traceInspector: TraceInspector(client: traceInspectorClient),
+        usageDataManagement: usageDataManagement,
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+    let outcome = try await viewer.clearAllData()
+
+    #expect(usageDataManagement.clearCount == 1)
+    #expect(outcome == .refreshed)
+    #expect(viewer.selectedHarness == nil)
+    #expect(viewer.selectedSession == nil)
+    #expect(viewer.selectedPrompt == nil)
+    #expect(viewer.traceInspectorSnapshot == nil)
+    #expect(viewer.overviewSnapshot?.totals.totalTokens == 0)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC)
+            .query(harness: prompt.session.harness, session: session, prompt: prompt),
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query
+    ])
+}
+
+@MainActor
+@Test
+func clearAllDataRefreshFailureStillReportsDeleteSuccessAndClearsLocalState() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5, selectedSession: session, selectedPrompt: prompt)),
+            .failure(StartupTestError.transient)
+        ]
+    )
+    let usageDataManagement = RecordingUsageDataManagement()
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        usageDataManagement: usageDataManagement,
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+    let outcome = try await viewer.clearAllData()
+
+    #expect(usageDataManagement.clearCount == 1)
+    #expect(outcome == .refreshFailed)
+    #expect(viewer.selectedHarness == nil)
+    #expect(viewer.selectedSession == nil)
+    #expect(viewer.selectedPrompt == nil)
+    #expect(viewer.overviewSnapshot == nil)
+    #expect(viewer.errorMessage == "All data was cleared, but the overview could not be refreshed: transient")
+}
+
+@MainActor
+@Test
+func clearAllDataFailureKeepsCurrentOverviewState() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let session = OverviewSessionRoute(
+        harness: OverviewHarnessName("opencode"),
+        sessionID: OverviewSessionID("opencode-session-1")
+    )
+    let prompt = OverviewPromptRoute(
+        session: session,
+        promptID: OverviewPromptID("opencode-turn-1")
+    )
+    let selectedSnapshot = overviewSnapshot(
+        totalTokens: 5,
+        selectedSession: session,
+        selectedPrompt: prompt
+    )
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(selectedSnapshot)
+        ]
+    )
+    let usageDataManagement = FailingUsageDataManagement(error: StartupTestError.transient)
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        usageDataManagement: usageDataManagement,
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await viewer.drillDown(to: .prompt(prompt))
+
+    do {
+        _ = try await viewer.clearAllData()
+        Issue.record("expected clear-all-data failure")
+    } catch {
+        #expect(error as? StartupTestError == .transient)
+    }
+
+    #expect(usageDataManagement.clearCount == 1)
+    #expect(viewer.selectedHarness == prompt.session.harness)
+    #expect(viewer.selectedSession == prompt.session)
+    #expect(viewer.selectedPrompt == prompt)
+    #expect(viewer.overviewSnapshot == selectedSnapshot)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC)
+            .query(harness: prompt.session.harness, session: session, prompt: prompt)
+    ])
+}
+
+@MainActor
+@Test
 func promptDrillDownLoadsTraceInspectorSnapshot() async throws {
     let session = OverviewSessionRoute(
         harness: OverviewHarnessName("opencode"),
@@ -1140,6 +1280,32 @@ private final class RecordingTraceInspectorClient: TraceInspectorClient, @unchec
     func loadTraceInspector(query: TraceInspectorQuery) async throws -> TraceInspectorSnapshot {
         queries.append(query)
         return snapshot
+    }
+}
+
+private final class RecordingUsageDataManagement: UsageDataManagement, @unchecked Sendable {
+    private(set) var clearCount = 0
+
+    var canClearAllData: Bool { true }
+
+    func clearAllData() async throws {
+        clearCount += 1
+    }
+}
+
+private final class FailingUsageDataManagement: UsageDataManagement, @unchecked Sendable {
+    private let error: any Error
+    private(set) var clearCount = 0
+
+    var canClearAllData: Bool { true }
+
+    init(error: any Error) {
+        self.error = error
+    }
+
+    func clearAllData() async throws {
+        clearCount += 1
+        throw error
     }
 }
 

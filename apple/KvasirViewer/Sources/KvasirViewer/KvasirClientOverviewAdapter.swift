@@ -61,6 +61,22 @@ struct KvasirClientUsageUpdateSource: OverviewUpdateSource {
     }
 }
 
+struct KvasirClientUsageDataManagement: UsageDataManagement {
+    let socketPath: String
+    let setupConfig: HarnessTelemetrySetupConfig
+
+    var canClearAllData: Bool { true }
+
+    func clearAllData() async throws {
+        try await Task.detached(priority: .userInitiated) { [self] in
+            try clearKvasirData(
+                socketPath: socketPath,
+                config: kvasirHarnessTelemetrySetup(from: setupConfig)
+            )
+        }.value
+    }
+}
+
 private final class KvasirOverviewRefreshSubscriptionBox: @unchecked Sendable {
     private let lock = NSLock()
     private var subscription: KvasirOverviewRefreshSubscription?

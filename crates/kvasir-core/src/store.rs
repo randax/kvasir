@@ -569,6 +569,9 @@ impl UsageStore {
                 continue;
             };
             let record = &prepared.record;
+            if !pending_raw_body_import_exists(&transaction, record.event_key.as_str())? {
+                continue;
+            }
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
             let retention_basis_ms =
@@ -665,6 +668,28 @@ impl UsageStore {
                 ],
             )?;
         }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_all_data(&mut self) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute_batch(
+            "DELETE FROM raw_body_import_queue;
+             DELETE FROM canonical_raw_body_records;
+             DELETE FROM canonical_content_records;
+             DELETE FROM canonical_trace_spans;
+             DELETE FROM tool_call_counter_snapshots;
+             DELETE FROM tool_call_rollups;
+             DELETE FROM canonical_tool_calls;
+             DELETE FROM cost_counter_snapshots;
+             DELETE FROM cost_rollups;
+             DELETE FROM canonical_cost_usage;
+             DELETE FROM token_delta_events;
+             DELETE FROM cumulative_counter_snapshots;
+             DELETE FROM token_rollups;
+             DELETE FROM canonical_token_usage;",
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -4078,6 +4103,24 @@ fn supported_raw_body_event_exists(
         .map_err(StoreError::from)
 }
 
+fn pending_raw_body_import_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    event_key: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM raw_body_import_queue
+                WHERE event_key = ?1
+                    AND state = 'pending'
+            )",
+            params![event_key],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
 fn content_availability(
     harness: &HarnessName,
     items: &[ContentReplayItem],
@@ -5721,9 +5764,9 @@ mod tests {
     use crate::pricing::ModelTokenPrices;
     use crate::rpc::TimestampMillis;
     use crate::usage::{
-        ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsd, RepoIdentity, RepoName,
-        RepoPath, TokenCount, TokenUsageEventKey, TokenUsageSignal, ToolCallCount,
-        ToolCallEventKey,
+        ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsd, RawBodyFileReference,
+        RepoIdentity, RepoName, RepoPath, TokenCount, TokenUsageEventKey, TokenUsageSignal,
+        ToolCallCount, ToolCallEventKey,
     };
 
     #[test]
@@ -5918,6 +5961,159 @@ mod tests {
         let result = UsageStore::open(&database_path, &wrong_key);
 
         assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_all_data_preserves_schema_for_reingest() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store_key = test_store_key();
+        let query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        );
+        let cost_query = CostRollupQuery::new(query.start, query.end);
+        let tool_call_query = ToolCallRollupQuery::new(query.start, query.end);
+        let trace_query = TraceQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-12"),
+            prompt_id: PromptId::new("prompt-7"),
+        };
+        let content_query = ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-12"),
+            prompt_id: PromptId::new("prompt-7"),
+        };
+
+        {
+            let mut store = UsageStore::open(&database_path, &store_key)?;
+            store.ingest_usage(&UsageRecords {
+                token_usage: vec![usage_record(
+                    "gpt-5.4",
+                    TokenMeasure::Input,
+                    1_781_956_800_000,
+                    1_781_956_700_000,
+                    100,
+                )],
+                cost_usage: vec![CostUsageRecord::new_with_harness(
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_700_000),
+                    kvasir_repo("/not/persisted"),
+                    HarnessName::new("opencode"),
+                    ModelName::new("gpt-5.4"),
+                    cost_usd("0.02"),
+                )],
+                tool_calls: vec![ToolCallRecord::new(
+                    ToolCallEventKey::new("clear-test-tool"),
+                    TimestampMillis::new_for_test(1_781_956_802_000),
+                    kvasir_repo("/not/persisted"),
+                    HarnessName::new("opencode"),
+                    ToolName::new("Read"),
+                )],
+                trace_spans: vec![trace_span_record(
+                    "opencode",
+                    "session-12",
+                    "prompt-7",
+                    "trace-1",
+                    "span-1",
+                    1_781_956_800_000..1_781_956_801_000,
+                    TraceSpanKind::Interaction,
+                )],
+                content: vec![ContentRecord {
+                    event_key: ContentEventKey::new("clear-test-content"),
+                    occurred_at: TimestampMillis::new_for_test(1_781_956_800_500),
+                    session_id: SessionId::new("session-12"),
+                    prompt_id: PromptId::new("prompt-7"),
+                    repo: kvasir_repo("/not/persisted"),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::UserPrompt,
+                    content: ContentText::new("summarize this").unwrap(),
+                }],
+                raw_body_references: Vec::new(),
+            })?;
+
+            assert!(!store.token_rollups(query.clone())?.is_empty());
+            assert!(!store.cost_rollups(cost_query.clone())?.is_empty());
+            assert!(!store.tool_call_rollups(tool_call_query.clone())?.is_empty());
+            assert!(!store.traces(trace_query.clone())?.is_empty());
+            assert!(
+                !store
+                    .content_replay(content_query.clone())?
+                    .items
+                    .is_empty()
+            );
+
+            store.clear_all_data()?;
+
+            assert!(store.token_rollups(query.clone())?.is_empty());
+            assert!(store.cost_rollups(cost_query)?.is_empty());
+            assert!(store.tool_call_rollups(tool_call_query)?.is_empty());
+            assert!(store.traces(trace_query.clone())?.is_empty());
+            assert!(
+                store
+                    .content_replay(content_query.clone())?
+                    .items
+                    .is_empty()
+            );
+        }
+
+        let mut reopened = UsageStore::open(&database_path, &store_key)?;
+        reopened.ingest_token_usage(&[usage_record(
+            "gpt-5.4",
+            TokenMeasure::Input,
+            1_781_956_900_000,
+            1_781_956_700_000,
+            125,
+        )])?;
+
+        assert_eq!(reopened.token_rollups(query)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_all_data_blocks_stale_prepared_raw_body_imports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let raw_body_path = temp.path().join("raw-bodies");
+        std::fs::create_dir(&raw_body_path)?;
+        std::fs::write(raw_body_path.join("body.json"), b"{\"prompt\":\"stale\"}")?;
+        let raw_body_directory = VerifiedRawBodyDirectory::open(&raw_body_path)?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let content_query = ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: SessionId::new("session-12"),
+            prompt_id: PromptId::new("prompt-7"),
+        };
+
+        store.record_raw_body_references(&[RawBodyReferenceRecord {
+            event_key: ContentEventKey::new("clear-test-raw-body"),
+            occurred_at: TimestampMillis::new_for_test(1_781_956_800_500),
+            session_id: SessionId::new("session-12"),
+            prompt_id: PromptId::new("prompt-7"),
+            repo: kvasir_repo("/not/persisted"),
+            harness: HarnessName::new("claude_code"),
+            kind: ContentKind::RawApiRequest,
+            body_ref: RawBodyFileReference::new("body.json").unwrap(),
+        }])?;
+        let candidate = store
+            .raw_body_import_candidates(1)?
+            .pop()
+            .expect("raw body import should be queued");
+        let prepared = match prepare_raw_body_import_candidate(&raw_body_directory, candidate)? {
+            RawBodyImportPreparation::Prepared(prepared) => prepared,
+            RawBodyImportPreparation::Missing(_) | RawBodyImportPreparation::AlreadyCleaned(_) => {
+                panic!("raw body file should prepare for import")
+            }
+        };
+
+        store.clear_all_data()?;
+        let inserted_event_keys = store.commit_prepared_raw_body_imports(&[prepared])?;
+
+        assert!(inserted_event_keys.is_empty());
+        assert!(store.content_replay(content_query)?.items.is_empty());
 
         Ok(())
     }

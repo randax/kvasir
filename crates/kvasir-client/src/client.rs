@@ -13,10 +13,10 @@ use kvasir_core::rpc::{RpcRequest, RpcResponse, RpcStreamEvent};
 use crate::error::KvasirClientError;
 use crate::transport::{connect_with_retries, read_rpc_stream_event, send_rpc_request};
 use crate::types::{
-    KvasirContentQuery, KvasirContentReplay, KvasirCostRollup, KvasirOverviewRollup,
-    KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
-    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
-    KvasirUsageUpdateKind,
+    KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirCostRollup,
+    KvasirOverviewRollup, KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath,
+    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace,
+    KvasirTraceQuery, KvasirUsageUpdateKind,
 };
 
 #[derive(Debug, uniffi::Object)]
@@ -72,6 +72,20 @@ impl KvasirClient {
                 .into_iter()
                 .map(KvasirTokenRollup::try_from)
                 .collect::<Result<Vec<_>, _>>(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn clear_all_data(&self, bearer_token: KvasirBearerToken) -> Result<(), KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ClearAllData {
+                bearer_token: bearer_token.into_core(),
+            },
+        )?;
+        match response {
+            RpcResponse::ClearAllData => Ok(()),
             RpcResponse::Error { error } => Err(error.into()),
             _ => Err(KvasirClientError::WrongResponseType),
         }
