@@ -1,9 +1,19 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -26,7 +36,9 @@ use crate::usage::{
     TokenUsageRecord, TokenUsageSignal, ToolCallKind, ToolCallRecord, UsageRecords,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 18;
+const DEFAULT_CONTENT_RETENTION_MAX_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+const DEFAULT_CONTENT_RETENTION_MAX_BYTES: u64 = 20_000_000_000;
 const SUMMARY_PAGE_LIMIT: usize = 10;
 const REPO_BUCKET: &str = "repo";
 const NO_REPO_BUCKET: &str = "no_repo";
@@ -35,6 +47,8 @@ const NATIVE_COST_SOURCE: i64 = 1;
 const ESTIMATED_COST_SOURCE: i64 = 2;
 const MIXED_COST_SOURCE: i64 = 3;
 const MILLIS_PER_DAY: i64 = 86_400_000;
+const CONTENT_RETENTION_EVICTION_BATCH_SIZE: i64 = 512;
+const POST_COMMIT_VACUUM_TASK: &str = "post_commit_vacuum";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -60,16 +74,66 @@ pub enum StoreError {
     RawBodyPathChangedBeforeDelete,
     #[error("raw body source grew before deletion")]
     RawBodySourceGrewBeforeDelete,
+    #[error("raw body directory is not a real directory")]
+    RawBodyDirectoryInvalid,
+    #[error("raw body import is not supported on this platform")]
+    RawBodyImportUnsupportedPlatform,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid raw body file reference")]
 struct InvalidRawBodyFileReference;
 
+#[derive(Clone, Debug)]
+pub struct VerifiedRawBodyDirectory {
+    inner: Arc<VerifiedRawBodyDirectoryInner>,
+}
+
+#[derive(Debug)]
+struct VerifiedRawBodyDirectoryInner {
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: File,
+}
+
+impl VerifiedRawBodyDirectory {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(StoreError::RawBodyDirectoryInvalid);
+        }
+        #[cfg(unix)]
+        let directory = {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            options.open(path)?
+        };
+        Ok(Self {
+            inner: Arc::new(VerifiedRawBodyDirectoryInner {
+                path: path.canonicalize()?,
+                #[cfg(unix)]
+                directory,
+            }),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    #[cfg(unix)]
+    fn fd(&self) -> std::os::fd::RawFd {
+        self.inner.directory.as_raw_fd()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RawBodyImportCandidate {
     record: RawBodyReferenceRecord,
-    stored: bool,
+    body_preparation: RawBodyPreparation,
 }
 
 impl RawBodyImportCandidate {
@@ -82,8 +146,14 @@ impl RawBodyImportCandidate {
     }
 
     pub fn is_stored(&self) -> bool {
-        self.stored
+        self.body_preparation != RawBodyPreparation::Store
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawBodyPreparation {
+    Store,
+    CleanupOnly,
 }
 
 pub enum RawBodyImportPreparation {
@@ -94,7 +164,7 @@ pub enum RawBodyImportPreparation {
 
 pub struct RawBodyPreparedImport {
     record: RawBodyReferenceRecord,
-    compressed_body: Option<Vec<u8>>,
+    compressed_body: Option<Zeroizing<Vec<u8>>>,
     source: RawBodySource,
 }
 
@@ -129,6 +199,7 @@ pub enum RawBodyImportFailureKind {
     Missing,
     InvalidSource,
     UnsupportedStoredCompression,
+    UnsupportedPlatform,
     Io,
 }
 
@@ -138,6 +209,7 @@ impl RawBodyImportFailureKind {
             Self::Missing => "missing",
             Self::InvalidSource => "invalid_source",
             Self::UnsupportedStoredCompression => "unsupported_stored_compression",
+            Self::UnsupportedPlatform => "unsupported_platform",
             Self::Io => "io",
         }
     }
@@ -145,9 +217,64 @@ impl RawBodyImportFailureKind {
     fn quarantines(self) -> bool {
         matches!(
             self,
-            Self::InvalidSource | Self::UnsupportedStoredCompression
+            Self::InvalidSource | Self::UnsupportedStoredCompression | Self::UnsupportedPlatform
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRetentionPolicy {
+    max_age: Option<Duration>,
+    max_bytes: Option<u64>,
+}
+
+impl ContentRetentionPolicy {
+    pub fn new(max_age: Option<Duration>, max_bytes: Option<u64>) -> Self {
+        Self { max_age, max_bytes }
+    }
+
+    pub fn keep_forever() -> Self {
+        Self::new(None, None)
+    }
+
+    pub fn max_age(&self) -> Option<Duration> {
+        self.max_age
+    }
+
+    pub fn max_bytes(&self) -> Option<u64> {
+        self.max_bytes
+    }
+
+    pub fn with_max_age(mut self, max_age: Option<Duration>) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    pub fn keeps_forever(&self) -> bool {
+        self.max_age.is_none() && self.max_bytes.is_none()
+    }
+}
+
+impl Default for ContentRetentionPolicy {
+    fn default() -> Self {
+        Self::new(
+            Some(DEFAULT_CONTENT_RETENTION_MAX_AGE),
+            Some(DEFAULT_CONTENT_RETENTION_MAX_BYTES),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentRetentionReport {
+    pub inline_blobs_evicted: u64,
+    pub raw_body_blobs_evicted: u64,
+    pub bytes_evicted: u64,
+    pub bytes_retained: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,6 +349,7 @@ impl UsageStore {
     pub fn open(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         apply_database_key(&connection, key)?;
+        enable_secure_delete(&connection)?;
         let mut store = Self {
             connection,
             price_table: PriceTable::bundled_defaults(),
@@ -237,6 +365,7 @@ impl UsageStore {
     ) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         apply_database_key(&connection, key)?;
+        enable_secure_delete(&connection)?;
         let mut store = Self {
             connection,
             price_table,
@@ -349,12 +478,30 @@ impl UsageStore {
                     SELECT 1
                     FROM canonical_raw_body_records stored
                     WHERE stored.event_key = pending.event_key
-                        AND stored.compression = 'zstd'
-                ) AS stored
+                ) AS cleanup_only
              FROM raw_body_import_queue pending
              WHERE pending.state = 'pending'
                 AND pending.content_kind IN ('raw_api_request', 'raw_api_response')
                 AND length(trim(pending.body_ref)) > 0
+                AND NOT (
+                    EXISTS(
+                        SELECT 1
+                        FROM canonical_raw_body_records stored
+                        WHERE stored.event_key = pending.event_key
+                    )
+                    AND EXISTS(
+                        SELECT 1
+                        FROM raw_body_import_queue sibling
+                        WHERE sibling.state = 'pending'
+                            AND sibling.event_key != pending.event_key
+                            AND sibling.body_ref = pending.body_ref
+                            AND NOT EXISTS(
+                                SELECT 1
+                                FROM canonical_raw_body_records sibling_stored
+                                WHERE sibling_stored.event_key = sibling.event_key
+                            )
+                    )
+                )
              ORDER BY
                 pending.last_attempt_ms IS NOT NULL,
                 pending.last_attempt_ms,
@@ -387,7 +534,11 @@ impl UsageStore {
                         },
                     )?,
                 },
-                stored: row.get::<_, bool>(10)?,
+                body_preparation: if row.get::<_, bool>(10)? {
+                    RawBodyPreparation::CleanupOnly
+                } else {
+                    RawBodyPreparation::Store
+                },
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -398,15 +549,21 @@ impl UsageStore {
         &mut self,
         prepared_imports: &[RawBodyPreparedImport],
     ) -> Result<Vec<String>, StoreError> {
-        let mut inserted_event_keys = Vec::new();
-        if prepared_imports
-            .iter()
-            .all(|prepared| !prepared.stores_body())
-        {
-            return Ok(inserted_event_keys);
-        }
+        self.commit_prepared_raw_body_imports_with_retention(
+            prepared_imports,
+            &ContentRetentionPolicy::keep_forever(),
+            TimestampMillis::from_millis(current_unix_millis()),
+        )
+    }
 
+    pub fn commit_prepared_raw_body_imports_with_retention(
+        &mut self,
+        prepared_imports: &[RawBodyPreparedImport],
+        policy: &ContentRetentionPolicy,
+        compacted_at: TimestampMillis,
+    ) -> Result<Vec<String>, StoreError> {
         let transaction = self.connection.transaction()?;
+        let mut inserted_event_keys = Vec::new();
         for prepared in prepared_imports {
             let Some(compressed_body) = prepared.compressed_body.as_ref() else {
                 continue;
@@ -417,6 +574,8 @@ impl UsageStore {
             }
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
+            let retention_basis_ms =
+                retention_basis_millis(record.occurred_at.value(), compacted_at.value());
             transaction.execute(
                 "INSERT OR IGNORE INTO canonical_raw_body_records (
                     event_key,
@@ -429,22 +588,10 @@ impl UsageStore {
                     repo_path,
                     harness,
                     content_kind,
+                    retention_basis_ms,
                     compression,
                     compressed_body
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'zstd', ?11)
-                ON CONFLICT(event_key) DO UPDATE SET
-                    occurred_at_ms = excluded.occurred_at_ms,
-                    session_id = excluded.session_id,
-                    prompt_id = excluded.prompt_id,
-                    day = excluded.day,
-                    repo_bucket = excluded.repo_bucket,
-                    repo_name = excluded.repo_name,
-                    repo_path = excluded.repo_path,
-                    harness = excluded.harness,
-                    content_kind = excluded.content_kind,
-                    compression = excluded.compression,
-                    compressed_body = excluded.compressed_body
-                WHERE canonical_raw_body_records.compression != 'zstd'",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'zstd', ?12)",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -456,12 +603,18 @@ impl UsageStore {
                     stored_repo.path,
                     record.harness.as_str(),
                     record.kind.storage_name(),
-                    compressed_body,
+                    retention_basis_ms,
+                    compressed_body.as_slice(),
                 ],
             )?;
             if transaction.changes() > 0 {
                 inserted_event_keys.push(record.event_key.as_str().to_owned());
             }
+        }
+        let retention_report =
+            compact_content_retention_in_transaction(&transaction, policy, compacted_at)?;
+        if retention_report.bytes_evicted > 0 {
+            request_post_commit_vacuum_in_transaction(&transaction, compacted_at.value())?;
         }
         transaction.commit()?;
         Ok(inserted_event_keys)
@@ -539,6 +692,24 @@ impl UsageStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn compact_content_retention(
+        &mut self,
+        policy: &ContentRetentionPolicy,
+        compacted_at: TimestampMillis,
+    ) -> Result<ContentRetentionReport, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let report = compact_content_retention_in_transaction(&transaction, policy, compacted_at)?;
+        if report.bytes_evicted > 0 {
+            request_post_commit_vacuum_in_transaction(&transaction, compacted_at.value())?;
+        }
+        transaction.commit()?;
+        Ok(report)
+    }
+
+    pub fn run_pending_maintenance(&mut self) {
+        attempt_pending_vacuum(&self.connection);
     }
 
     pub fn token_rollups(&self, query: RollupQuery) -> Result<Vec<TokenRollup>, StoreError> {
@@ -1941,6 +2112,7 @@ impl UsageStore {
                 content
              FROM canonical_content_records
              WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
+                AND content IS NOT NULL
              ORDER BY occurred_at_ms, id",
         )?;
         let items = statement
@@ -1980,6 +2152,7 @@ impl UsageStore {
              FROM canonical_raw_body_records
              WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
                 AND compression = 'zstd'
+                AND compressed_body IS NOT NULL
              ORDER BY occurred_at_ms, id",
         )?;
         for item in statement.query_map(
@@ -2018,6 +2191,14 @@ impl UsageStore {
                     SELECT 1
                     FROM canonical_trace_spans
                     WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
+                    UNION ALL
+                    SELECT 1
+                    FROM canonical_content_records
+                    WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
+                    UNION ALL
+                    SELECT 1
+                    FROM canonical_raw_body_records
+                    WHERE harness = ?1 AND session_id = ?2 AND prompt_id = ?3
                 )",
                 params![harness.as_str(), session_id.as_str(), prompt_id.as_str()],
                 |row| row.get(0),
@@ -2025,7 +2206,7 @@ impl UsageStore {
             .map_err(StoreError::from)
     }
 
-    fn migrate(&mut self) -> Result<(), StoreError> {
+    fn migrate(&mut self) -> Result<bool, StoreError> {
         let schema_version = self
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
@@ -2110,6 +2291,12 @@ impl UsageStore {
         }
         if schema_version < 16 {
             migrate_v15_to_v16(&transaction)?;
+        }
+        if schema_version < 17 {
+            migrate_v16_to_v17(&transaction)?;
+        }
+        if schema_version < 18 {
+            migrate_v17_to_v18(&transaction)?;
         }
 
         transaction.execute_batch(
@@ -2268,7 +2455,9 @@ impl UsageStore {
                 repo_path TEXT NOT NULL,
                 harness TEXT NOT NULL,
                 content_kind TEXT NOT NULL,
-                content TEXT NOT NULL
+                retention_basis_ms INTEGER NOT NULL,
+                content TEXT,
+                purged_at_ms INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS canonical_raw_body_records (
@@ -2283,8 +2472,10 @@ impl UsageStore {
                 repo_path TEXT NOT NULL,
                 harness TEXT NOT NULL,
                 content_kind TEXT NOT NULL,
+                retention_basis_ms INTEGER NOT NULL,
                 compression TEXT NOT NULL,
-                compressed_body BLOB NOT NULL
+                compressed_body BLOB,
+                purged_at_ms INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS raw_body_import_queue (
@@ -2303,6 +2494,13 @@ impl UsageStore {
                 attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
                 last_attempt_ms INTEGER,
                 last_failure_kind TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS store_maintenance_tasks (
+                task TEXT NOT NULL PRIMARY KEY,
+                requested_at_ms INTEGER NOT NULL,
+                last_attempt_ms INTEGER,
+                last_error TEXT
             );",
         )?;
         transaction.execute(
@@ -2318,6 +2516,18 @@ impl UsageStore {
         transaction.execute(
             "CREATE INDEX IF NOT EXISTS canonical_raw_body_records_session_prompt
              ON canonical_raw_body_records (session_id, prompt_id, occurred_at_ms, id)",
+            [],
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_content_records_retention_basis
+             ON canonical_content_records (retention_basis_ms, id)
+             WHERE content IS NOT NULL",
+            [],
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS canonical_raw_body_records_retention_basis
+             ON canonical_raw_body_records (retention_basis_ms, id)
+             WHERE compressed_body IS NOT NULL",
             [],
         )?;
         transaction.execute(
@@ -2339,9 +2549,12 @@ impl UsageStore {
             [],
         )?;
         migrate_v5_to_v6(&transaction)?;
+        if schema_version > 0 && schema_version < CURRENT_SCHEMA_VERSION {
+            request_post_commit_vacuum_in_transaction(&transaction, current_unix_millis())?;
+        }
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
-        Ok(())
+        Ok(schema_version < CURRENT_SCHEMA_VERSION)
     }
 
     fn ingest_token_usage_in_transaction(
@@ -2824,6 +3037,8 @@ impl UsageStore {
         for record in records {
             let day = record.occurred_at.day().as_date().to_string();
             let stored_repo = StoredRepo::from_bucket(&record.repo);
+            let retention_basis_ms =
+                retention_basis_millis(record.occurred_at.value(), current_unix_millis());
             transaction.execute(
                 "INSERT INTO canonical_content_records (
                     event_key,
@@ -2836,8 +3051,9 @@ impl UsageStore {
                     repo_path,
                     harness,
                     content_kind,
+                    retention_basis_ms,
                     content
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(event_key) DO UPDATE SET
                     occurred_at_ms = excluded.occurred_at_ms,
                     session_id = excluded.session_id,
@@ -2848,7 +3064,12 @@ impl UsageStore {
                     repo_path = excluded.repo_path,
                     harness = excluded.harness,
                     content_kind = excluded.content_kind,
-                    content = excluded.content",
+                    retention_basis_ms = canonical_content_records.retention_basis_ms,
+                    content = CASE
+                        WHEN canonical_content_records.purged_at_ms IS NULL THEN excluded.content
+                        ELSE canonical_content_records.content
+                    END,
+                    purged_at_ms = canonical_content_records.purged_at_ms",
                 params![
                     record.event_key.as_str(),
                     record.occurred_at.value(),
@@ -2860,6 +3081,7 @@ impl UsageStore {
                     stored_repo.path,
                     record.harness.as_str(),
                     record.kind.storage_name(),
+                    retention_basis_ms,
                     record.content.as_str(),
                 ],
             )?;
@@ -3873,6 +4095,7 @@ fn supported_raw_body_event_exists(
                 FROM canonical_raw_body_records
                 WHERE event_key = ?1
                     AND compression = 'zstd'
+                    AND compressed_body IS NOT NULL
             )",
             params![event_key],
             |row| row.get(0),
@@ -3962,10 +4185,7 @@ fn inline_content_kinds() -> &'static [ContentKind] {
     ]
 }
 
-fn raw_body_path(
-    raw_body_directory: &Path,
-    record: &RawBodyReferenceRecord,
-) -> Result<PathBuf, StoreError> {
+fn raw_body_file_name(record: &RawBodyReferenceRecord) -> Result<OsString, StoreError> {
     let relative_path = Path::new(record.body_ref.as_str());
     let mut components = relative_path.components();
     let Some(Component::Normal(file_name)) = components.next() else {
@@ -3974,18 +4194,17 @@ fn raw_body_path(
     if relative_path.is_absolute() || components.next().is_some() {
         return Err(StoreError::RawBodyPathEscapesDirectory);
     }
-    Ok(raw_body_directory.join(file_name))
+    Ok(file_name.to_os_string())
 }
 
 pub fn prepare_raw_body_import_candidate(
-    raw_body_directory: &Path,
+    raw_body_directory: &VerifiedRawBodyDirectory,
     candidate: RawBodyImportCandidate,
 ) -> Result<RawBodyImportPreparation, StoreError> {
-    let raw_body_path = raw_body_path(raw_body_directory, &candidate.record)?;
-    let mut source = match open_raw_body_source(raw_body_path) {
+    let mut source = match open_raw_body_source(raw_body_directory, &candidate.record) {
         Ok(source) => source,
         Err(StoreError::RawBodyIo(error)) if error.kind() == ErrorKind::NotFound => {
-            return if candidate.stored {
+            return if candidate.body_preparation == RawBodyPreparation::CleanupOnly {
                 Ok(RawBodyImportPreparation::AlreadyCleaned(candidate))
             } else {
                 Ok(RawBodyImportPreparation::Missing(candidate))
@@ -3994,7 +4213,7 @@ pub fn prepare_raw_body_import_candidate(
         Err(error) => return Err(error),
     };
 
-    if candidate.stored {
+    if candidate.body_preparation == RawBodyPreparation::CleanupOnly {
         return Ok(RawBodyImportPreparation::Prepared(RawBodyPreparedImport {
             record: candidate.record,
             compressed_body: None,
@@ -4002,9 +4221,9 @@ pub fn prepare_raw_body_import_candidate(
         }));
     }
 
-    let body = source.read_all()?;
+    let body = Zeroizing::new(source.read_all()?);
     source.len = body.len() as u64;
-    let compressed_body = zstd::stream::encode_all(body.as_slice(), 0)?;
+    let compressed_body = Zeroizing::new(zstd::stream::encode_all(body.as_slice(), 0)?);
     Ok(RawBodyImportPreparation::Prepared(RawBodyPreparedImport {
         record: candidate.record,
         compressed_body: Some(compressed_body),
@@ -4038,14 +4257,55 @@ pub fn cleanup_prepared_raw_body_imports(
     }
 }
 
+pub fn cleanup_invalid_raw_body_candidate(
+    raw_body_directory: &VerifiedRawBodyDirectory,
+    candidate: &RawBodyImportCandidate,
+) -> Result<(), StoreError> {
+    let file_name = raw_body_file_name(&candidate.record)?;
+    #[cfg(not(unix))]
+    {
+        let _ = (raw_body_directory, file_name);
+        return Err(StoreError::RawBodyImportUnsupportedPlatform);
+    }
+    #[cfg(unix)]
+    {
+        let stat = match raw_body_entry_stat(raw_body_directory, &file_name) {
+            Ok(stat) => stat,
+            Err(StoreError::RawBodyIo(error)) if error.kind() == ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if raw_body_stat_is_symlink(&stat)
+            || (raw_body_stat_is_regular_file(&stat) && stat.st_nlink != 1)
+        {
+            unlink_raw_body_entry(raw_body_directory, &file_name)?;
+            return Ok(());
+        }
+        if !raw_body_stat_is_regular_file(&stat) {
+            return Err(StoreError::RawBodyNotRegularFile);
+        }
+    }
+    #[cfg(unix)]
+    {
+        let source = open_raw_body_source(raw_body_directory, &candidate.record)?;
+        overwrite_and_remove_imported_file(source)
+    }
+}
+
 struct RawBodySource {
-    path: PathBuf,
     file: File,
     len: u64,
+    #[cfg(unix)]
+    directory: VerifiedRawBodyDirectory,
+    #[cfg(unix)]
+    file_name: OsString,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl RawBodySource {
@@ -4057,33 +4317,47 @@ impl RawBodySource {
     }
 }
 
-fn open_raw_body_source(path: PathBuf) -> Result<RawBodySource, StoreError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-
-    let file = options.open(&path)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() {
-        return Err(StoreError::RawBodyNotRegularFile);
+fn open_raw_body_source(
+    directory: &VerifiedRawBodyDirectory,
+    record: &RawBodyReferenceRecord,
+) -> Result<RawBodySource, StoreError> {
+    let file_name = raw_body_file_name(record)?;
+    #[cfg(not(unix))]
+    {
+        let _ = (directory, file_name);
+        return Err(StoreError::RawBodyImportUnsupportedPlatform);
     }
     #[cfg(unix)]
-    if metadata.nlink() != 1 {
-        return Err(StoreError::RawBodyNotRegularFile);
-    }
+    {
+        let c_file_name = raw_body_file_name_cstring(&file_name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.fd(),
+                c_file_name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(StoreError::RawBodyIo(std::io::Error::last_os_error()));
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+            return Err(StoreError::RawBodyNotRegularFile);
+        }
 
-    Ok(RawBodySource {
-        path,
-        len: metadata.len(),
-        #[cfg(unix)]
-        dev: metadata.dev(),
-        #[cfg(unix)]
-        ino: metadata.ino(),
-        file,
-    })
+        Ok(RawBodySource {
+            len: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            file,
+            directory: directory.clone(),
+            file_name,
+        })
+    }
 }
 
+#[cfg(unix)]
 fn overwrite_and_remove_imported_file(mut source: RawBodySource) -> Result<(), StoreError> {
     source.file.seek(SeekFrom::Start(0))?;
     let overwrite_len = source.file.metadata()?.len().max(source.len);
@@ -4101,24 +4375,79 @@ fn overwrite_and_remove_imported_file(mut source: RawBodySource) -> Result<(), S
     if !raw_body_path_still_points_to_source(&source)? {
         return Err(StoreError::RawBodyPathChangedBeforeDelete);
     }
-    drop(source.file);
-    std::fs::remove_file(&source.path)?;
+    #[cfg(unix)]
+    {
+        unlink_raw_body_entry(&source.directory, &source.file_name)?;
+        drop(source.file);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn raw_body_file_name_cstring(file_name: &std::ffi::OsStr) -> Result<CString, StoreError> {
+    CString::new(file_name.as_bytes()).map_err(|_| StoreError::RawBodyPathEscapesDirectory)
+}
+
+#[cfg(unix)]
+fn raw_body_entry_stat(
+    directory: &VerifiedRawBodyDirectory,
+    file_name: &std::ffi::OsStr,
+) -> Result<libc::stat, StoreError> {
+    let c_file_name = raw_body_file_name_cstring(file_name)?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.fd(),
+            c_file_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(StoreError::RawBodyIo(std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(unix)]
+fn raw_body_stat_is_regular_file(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
+#[cfg(unix)]
+fn raw_body_stat_is_symlink(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFLNK
+}
+
+#[cfg(unix)]
+fn unlink_raw_body_entry(
+    directory: &VerifiedRawBodyDirectory,
+    file_name: &std::ffi::OsStr,
+) -> Result<(), StoreError> {
+    let c_file_name = raw_body_file_name_cstring(file_name)?;
+    let result = unsafe { libc::unlinkat(directory.fd(), c_file_name.as_ptr(), 0) };
+    if result < 0 {
+        return Err(StoreError::RawBodyIo(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 
 #[cfg(unix)]
 fn raw_body_path_still_points_to_source(source: &RawBodySource) -> Result<bool, StoreError> {
-    let metadata = std::fs::symlink_metadata(&source.path)?;
-    Ok(metadata.file_type().is_file()
-        && metadata.dev() == source.dev
-        && metadata.ino() == source.ino)
+    let stat = raw_body_entry_stat(&source.directory, &source.file_name)?;
+    Ok(raw_body_stat_is_regular_file(&stat)
+        && stat.st_dev as u64 == source.dev
+        && stat.st_ino == source.ino)
 }
 
 #[cfg(not(unix))]
-fn raw_body_path_still_points_to_source(source: &RawBodySource) -> Result<bool, StoreError> {
-    Ok(std::fs::symlink_metadata(&source.path)?
-        .file_type()
-        .is_file())
+fn overwrite_and_remove_imported_file(_source: RawBodySource) -> Result<(), StoreError> {
+    Err(StoreError::RawBodyImportUnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+fn raw_body_path_still_points_to_source(_source: &RawBodySource) -> Result<bool, StoreError> {
+    Err(StoreError::RawBodyImportUnsupportedPlatform)
 }
 
 fn store_error_is_not_found(error: &StoreError) -> bool {
@@ -4130,6 +4459,10 @@ fn current_unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+fn retention_basis_millis(occurred_at_ms: i64, trusted_now_ms: i64) -> i64 {
+    occurred_at_ms.min(trusted_now_ms)
 }
 
 fn trace_duration_measures(spans: &[TraceSpan]) -> TraceDurationMeasures {
@@ -4406,6 +4739,168 @@ fn migrate_v15_to_v16(transaction: &rusqlite::Transaction<'_>) -> Result<(), Sto
     Ok(())
 }
 
+fn migrate_v16_to_v17(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if table_exists(transaction, "canonical_content_records")?
+        && !table_column_exists(transaction, "canonical_content_records", "purged_at_ms")?
+    {
+        transaction.execute_batch(
+            "DROP INDEX IF EXISTS canonical_content_records_session_prompt;
+             CREATE TABLE canonical_content_records_v17 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                content TEXT,
+                purged_at_ms INTEGER
+             );
+             INSERT OR IGNORE INTO canonical_content_records_v17 (
+                id,
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                content,
+                purged_at_ms
+             )
+             SELECT
+                id,
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                content,
+                NULL
+             FROM canonical_content_records
+             ORDER BY id;
+             DROP TABLE canonical_content_records;
+             ALTER TABLE canonical_content_records_v17 RENAME TO canonical_content_records;",
+        )?;
+    }
+
+    if table_exists(transaction, "canonical_raw_body_records")?
+        && !table_column_exists(transaction, "canonical_raw_body_records", "purged_at_ms")?
+    {
+        transaction.execute_batch(
+            "DROP INDEX IF EXISTS canonical_raw_body_records_session_prompt;
+             CREATE TABLE canonical_raw_body_records_v17 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                compression TEXT NOT NULL,
+                compressed_body BLOB,
+                purged_at_ms INTEGER
+             );
+             INSERT OR IGNORE INTO canonical_raw_body_records_v17 (
+                id,
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                compression,
+                compressed_body,
+                purged_at_ms
+             )
+             SELECT
+                id,
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                compression,
+                compressed_body,
+                NULL
+             FROM canonical_raw_body_records
+             ORDER BY id;
+             DROP TABLE canonical_raw_body_records;
+             ALTER TABLE canonical_raw_body_records_v17 RENAME TO canonical_raw_body_records;",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_v17_to_v18(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let migration_basis_now = current_unix_millis();
+    if table_exists(transaction, "canonical_content_records")?
+        && !table_column_exists(
+            transaction,
+            "canonical_content_records",
+            "retention_basis_ms",
+        )?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE canonical_content_records
+             ADD COLUMN retention_basis_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        transaction.execute(
+            "UPDATE canonical_content_records
+             SET retention_basis_ms = min(occurred_at_ms, ?1)
+             WHERE retention_basis_ms = 0",
+            params![migration_basis_now],
+        )?;
+    }
+
+    if table_exists(transaction, "canonical_raw_body_records")?
+        && !table_column_exists(
+            transaction,
+            "canonical_raw_body_records",
+            "retention_basis_ms",
+        )?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE canonical_raw_body_records
+             ADD COLUMN retention_basis_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        transaction.execute(
+            "UPDATE canonical_raw_body_records
+             SET retention_basis_ms = min(occurred_at_ms, ?1)
+             WHERE retention_basis_ms = 0",
+            params![migration_basis_now],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn backfill_trace_link_columns(
     transaction: &rusqlite::Transaction<'_>,
     table: &str,
@@ -4503,6 +4998,73 @@ fn apply_database_key(connection: &Connection, key: &StoreKey) -> Result<(), Sto
     let sql = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", raw_key.as_str()));
     connection.execute_batch(&sql)?;
     Ok(())
+}
+
+fn enable_secure_delete(connection: &Connection) -> Result<(), StoreError> {
+    connection.pragma_update(None, "secure_delete", "ON")?;
+    Ok(())
+}
+
+fn request_post_commit_vacuum_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    requested_at_ms: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO store_maintenance_tasks (
+            task,
+            requested_at_ms,
+            last_attempt_ms,
+            last_error
+        ) VALUES (?1, ?2, NULL, NULL)
+        ON CONFLICT(task) DO UPDATE SET
+            requested_at_ms = excluded.requested_at_ms,
+            last_error = NULL",
+        params![POST_COMMIT_VACUUM_TASK, requested_at_ms],
+    )?;
+    Ok(())
+}
+
+fn attempt_pending_vacuum(connection: &Connection) {
+    let has_pending = match connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM store_maintenance_tasks WHERE task = ?1
+        )",
+        params![POST_COMMIT_VACUUM_TASK],
+        |row| row.get::<_, bool>(0),
+    ) {
+        Ok(has_pending) => has_pending,
+        Err(error) => {
+            eprintln!("post-commit VACUUM pending check failed: {error:?}");
+            return;
+        }
+    };
+    if !has_pending {
+        return;
+    }
+
+    match connection.execute_batch("VACUUM;") {
+        Ok(()) => {
+            if let Err(error) = connection.execute(
+                "DELETE FROM store_maintenance_tasks WHERE task = ?1",
+                params![POST_COMMIT_VACUUM_TASK],
+            ) {
+                eprintln!("post-commit VACUUM task cleanup failed: {error:?}");
+            }
+        }
+        Err(error) => {
+            let attempted_at_ms = current_unix_millis();
+            let last_error = format!("{error:?}");
+            if let Err(update_error) = connection.execute(
+                "UPDATE store_maintenance_tasks
+                 SET last_attempt_ms = ?2, last_error = ?3
+                 WHERE task = ?1",
+                params![POST_COMMIT_VACUUM_TASK, attempted_at_ms, last_error],
+            ) {
+                eprintln!("post-commit VACUUM failure recording failed: {update_error:?}");
+            }
+            eprintln!("post-commit VACUUM failed: {error:?}");
+        }
+    }
 }
 
 fn nibble_to_hex(nibble: u8) -> char {
@@ -4780,6 +5342,239 @@ struct SummaryOrderKey {
     route_key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RetainedContentBlobTable {
+    Inline,
+    RawBody,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetainedContentBlob {
+    table: RetainedContentBlobTable,
+    id: i64,
+    bytes: u64,
+}
+
+impl ContentRetentionReport {
+    fn record_eviction(&mut self, blob: &RetainedContentBlob) {
+        match blob.table {
+            RetainedContentBlobTable::Inline => {
+                self.inline_blobs_evicted = self.inline_blobs_evicted.saturating_add(1);
+            }
+            RetainedContentBlobTable::RawBody => {
+                self.raw_body_blobs_evicted = self.raw_body_blobs_evicted.saturating_add(1);
+            }
+        }
+        self.bytes_evicted = self.bytes_evicted.saturating_add(blob.bytes);
+    }
+}
+
+fn compact_content_retention_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    policy: &ContentRetentionPolicy,
+    compacted_at: TimestampMillis,
+) -> Result<ContentRetentionReport, StoreError> {
+    if policy.keeps_forever() {
+        return Ok(ContentRetentionReport::default());
+    }
+
+    let mut retained_bytes = retained_content_bytes(transaction)?;
+    let mut report = ContentRetentionReport::default();
+
+    if let Some(max_age) = policy.max_age() {
+        let cutoff = compacted_at
+            .value()
+            .saturating_sub(duration_millis(max_age));
+        loop {
+            let blobs = retained_content_age_eviction_candidates(
+                transaction,
+                cutoff,
+                CONTENT_RETENTION_EVICTION_BATCH_SIZE,
+            )?;
+            if blobs.is_empty() {
+                break;
+            }
+            for blob in blobs {
+                purge_content_blob(transaction, blob, compacted_at)?;
+                retained_bytes = retained_bytes.saturating_sub(blob.bytes);
+                report.record_eviction(&blob);
+            }
+        }
+    }
+
+    if let Some(max_bytes) = policy.max_bytes() {
+        while retained_bytes > max_bytes {
+            let blobs =
+                retained_content_oldest_blobs(transaction, CONTENT_RETENTION_EVICTION_BATCH_SIZE)?;
+            if blobs.is_empty() {
+                break;
+            }
+            for blob in blobs {
+                if retained_bytes <= max_bytes {
+                    break;
+                }
+                purge_content_blob(transaction, blob, compacted_at)?;
+                retained_bytes = retained_bytes.saturating_sub(blob.bytes);
+                report.record_eviction(&blob);
+            }
+        }
+    }
+
+    report.bytes_retained = retained_bytes;
+    Ok(report)
+}
+
+fn retained_content_bytes(transaction: &rusqlite::Transaction<'_>) -> Result<u64, StoreError> {
+    let inline_bytes = retained_content_table_bytes(
+        transaction,
+        "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0)
+         FROM canonical_content_records
+         WHERE content IS NOT NULL",
+    )?;
+    let raw_body_bytes = retained_content_table_bytes(
+        transaction,
+        "SELECT COALESCE(SUM(length(compressed_body)), 0)
+         FROM canonical_raw_body_records
+         WHERE compressed_body IS NOT NULL",
+    )?;
+    Ok(inline_bytes.saturating_add(raw_body_bytes))
+}
+
+fn retained_content_table_bytes(
+    transaction: &rusqlite::Transaction<'_>,
+    sql: &str,
+) -> Result<u64, StoreError> {
+    let bytes: i64 = transaction.query_row(sql, [], |row| row.get(0))?;
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
+fn retained_content_age_eviction_candidates(
+    transaction: &rusqlite::Transaction<'_>,
+    cutoff_ms: i64,
+    limit: i64,
+) -> Result<Vec<RetainedContentBlob>, StoreError> {
+    retained_content_blob_candidates(
+        transaction,
+        "SELECT table_tag, id, bytes
+         FROM (
+            SELECT
+                0 AS table_tag,
+                id,
+                retention_basis_ms,
+                length(CAST(content AS BLOB)) AS bytes
+            FROM canonical_content_records
+            WHERE content IS NOT NULL AND retention_basis_ms < ?1
+            UNION ALL
+            SELECT
+                1 AS table_tag,
+                id,
+                retention_basis_ms,
+                length(compressed_body) AS bytes
+            FROM canonical_raw_body_records
+            WHERE compressed_body IS NOT NULL AND retention_basis_ms < ?1
+         )
+         ORDER BY retention_basis_ms, table_tag, id
+         LIMIT ?2",
+        params![cutoff_ms, limit],
+    )
+}
+
+fn retained_content_oldest_blobs(
+    transaction: &rusqlite::Transaction<'_>,
+    limit: i64,
+) -> Result<Vec<RetainedContentBlob>, StoreError> {
+    retained_content_blob_candidates(
+        transaction,
+        "SELECT table_tag, id, bytes
+         FROM (
+            SELECT
+                0 AS table_tag,
+                id,
+                retention_basis_ms,
+                length(CAST(content AS BLOB)) AS bytes
+            FROM canonical_content_records
+            WHERE content IS NOT NULL
+            UNION ALL
+            SELECT
+                1 AS table_tag,
+                id,
+                retention_basis_ms,
+                length(compressed_body) AS bytes
+            FROM canonical_raw_body_records
+            WHERE compressed_body IS NOT NULL
+         )
+         ORDER BY retention_basis_ms, table_tag, id
+         LIMIT ?1",
+        params![limit],
+    )
+}
+
+fn retained_content_blob_candidates<P>(
+    transaction: &rusqlite::Transaction<'_>,
+    sql: &str,
+    params: P,
+) -> Result<Vec<RetainedContentBlob>, StoreError>
+where
+    P: rusqlite::Params,
+{
+    let mut statement = transaction.prepare(sql)?;
+    let rows = statement.query_map(params, retained_content_blob_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
+fn retained_content_blob_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RetainedContentBlob> {
+    let table_tag: i64 = row.get(0)?;
+    let table = match table_tag {
+        0 => RetainedContentBlobTable::Inline,
+        1 => RetainedContentBlobTable::RawBody,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                "retained content table tag must be 0 or 1".into(),
+            ));
+        }
+    };
+    Ok(RetainedContentBlob {
+        table,
+        id: row.get(1)?,
+        bytes: unsigned_token_column(row, 2)?,
+    })
+}
+
+fn purge_content_blob(
+    transaction: &rusqlite::Transaction<'_>,
+    blob: RetainedContentBlob,
+    compacted_at: TimestampMillis,
+) -> Result<(), StoreError> {
+    match blob.table {
+        RetainedContentBlobTable::Inline => {
+            transaction.execute(
+                "UPDATE canonical_content_records
+                 SET content = NULL, purged_at_ms = ?2
+                 WHERE id = ?1 AND content IS NOT NULL",
+                params![blob.id, compacted_at.value()],
+            )?;
+        }
+        RetainedContentBlobTable::RawBody => {
+            transaction.execute(
+                "UPDATE canonical_raw_body_records
+                 SET compressed_body = NULL, purged_at_ms = ?2
+                 WHERE id = ?1 AND compressed_body IS NOT NULL",
+                params![blob.id, compacted_at.value()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn duration_millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn summary_order(left: SummaryOrderKey, right: SummaryOrderKey) -> std::cmp::Ordering {
     right
         .cost_usd_nanos
@@ -5008,6 +5803,118 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_store_enables_secure_delete_on_open() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        let secure_delete: i64 = store
+            .connection
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+
+        assert_eq!(secure_delete, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn store_creates_retention_basis_indexes() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let index_count: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'index'
+                AND name IN (
+                    'canonical_content_records_retention_basis',
+                    'canonical_raw_body_records_retention_basis'
+                )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(index_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_post_commit_vacuum_records_failure_and_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        store.connection.execute(
+            "INSERT INTO store_maintenance_tasks (
+                task,
+                requested_at_ms
+            ) VALUES (?1, ?2)",
+            params![POST_COMMIT_VACUUM_TASK, 1_i64],
+        )?;
+
+        store.connection.execute_batch("BEGIN IMMEDIATE;")?;
+        attempt_pending_vacuum(&store.connection);
+        store.connection.execute_batch("COMMIT;")?;
+
+        let failed_error: Option<String> = store.connection.query_row(
+            "SELECT last_error
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert!(failed_error.is_some_and(|error| !error.is_empty()));
+
+        attempt_pending_vacuum(&store.connection);
+        let pending_count: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_store_leaves_pending_vacuum_for_explicit_maintenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        {
+            let store = open_test_store(&database_path)?;
+            store.connection.execute(
+                "INSERT INTO store_maintenance_tasks (
+                    task,
+                    requested_at_ms
+                ) VALUES (?1, ?2)
+                ON CONFLICT(task) DO UPDATE SET requested_at_ms = excluded.requested_at_ms",
+                params![POST_COMMIT_VACUUM_TASK, 1_i64],
+            )?;
+        }
+
+        let mut reopened = open_test_store(&database_path)?;
+        let pending_after_open: i64 = reopened.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_after_open, 1);
+
+        reopened.run_pending_maintenance();
+        let pending_after_maintenance: i64 = reopened.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_after_maintenance, 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn encrypted_store_cannot_be_read_without_the_key() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let database_path = temp.path().join("usage.sqlite3");
@@ -5170,12 +6077,10 @@ mod tests {
     fn clear_all_data_blocks_stale_prepared_raw_body_imports()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let raw_body_directory = temp.path().join("raw-bodies");
-        std::fs::create_dir(&raw_body_directory)?;
-        std::fs::write(
-            raw_body_directory.join("body.json"),
-            b"{\"prompt\":\"stale\"}",
-        )?;
+        let raw_body_path = temp.path().join("raw-bodies");
+        std::fs::create_dir(&raw_body_path)?;
+        std::fs::write(raw_body_path.join("body.json"), b"{\"prompt\":\"stale\"}")?;
+        let raw_body_directory = VerifiedRawBodyDirectory::open(&raw_body_path)?;
         let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
         let content_query = ContentQuery {
             harness: HarnessName::new("claude_code"),
@@ -6401,6 +7306,471 @@ mod tests {
     }
 
     #[test]
+    fn compact_content_retention_purges_blobs_but_preserves_usage_rollups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+        let occurred_at = TimestampMillis::new_for_test(1_781_956_800_000);
+        let compacted_at = TimestampMillis::new_for_test(1_782_129_600_000);
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: vec![usage_record_for_repo(
+                repo.clone(),
+                "gpt-4.1",
+                TokenMeasure::Input,
+                occurred_at.value(),
+                occurred_at.value(),
+                120,
+            )],
+            cost_usage: Vec::new(),
+            tool_calls: vec![tool_call_record_for_repo(
+                repo.clone(),
+                "opencode",
+                "Read",
+                occurred_at.value(),
+            )],
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("content-event-retention"),
+                occurred_at,
+                session_id: SessionId::new("session-retention"),
+                prompt_id: PromptId::new("prompt-retention"),
+                repo: repo.clone(),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("old captured assistant text").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+
+        let replay_before = store.content_replay(ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-retention"),
+            prompt_id: PromptId::new("prompt-retention"),
+        })?;
+        assert_eq!(replay_before.items.len(), 1);
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::new(Some(Duration::from_secs(24 * 60 * 60)), None),
+            compacted_at,
+        )?;
+
+        assert_eq!(report.inline_blobs_evicted, 1);
+        assert_eq!(report.raw_body_blobs_evicted, 0);
+        assert_eq!(report.bytes_retained, 0);
+
+        let replay_after = store.content_replay(ContentQuery {
+            harness: HarnessName::new("opencode"),
+            session_id: SessionId::new("session-retention"),
+            prompt_id: PromptId::new("prompt-retention"),
+        })?;
+        assert!(replay_after.items.is_empty());
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("content-event-retention"),
+                occurred_at,
+                session_id: SessionId::new("session-retention"),
+                prompt_id: PromptId::new("prompt-retention"),
+                repo: repo.clone(),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("old captured assistant text").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+        assert!(
+            store
+                .content_replay(ContentQuery {
+                    harness: HarnessName::new("opencode"),
+                    session_id: SessionId::new("session-retention"),
+                    prompt_id: PromptId::new("prompt-retention"),
+                })?
+                .items
+                .is_empty()
+        );
+
+        let rollup_query = RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        )
+        .with_repo(repo.clone())
+        .with_model(ModelName::new("gpt-4.1"));
+        assert_eq!(
+            store.token_rollups(rollup_query)?,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: repo.clone(),
+                model: ModelName::new("gpt-4.1"),
+                input_tokens: 120,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        let cost_rollups = store.cost_rollups(
+            CostRollupQuery::new(
+                TimestampMillis::new_for_test(1_781_956_000_000),
+                TimestampMillis::new_for_test(1_781_970_000_000),
+            )
+            .with_repo(repo.clone())
+            .with_model(ModelName::new("gpt-4.1")),
+        )?;
+        assert_eq!(cost_rollups.len(), 1);
+        assert_eq!(
+            cost_rollups[0].cost_usd,
+            CostUsd::from_nanos(240_000).unwrap()
+        );
+        assert_eq!(
+            store.tool_call_rollups(
+                ToolCallRollupQuery::new(
+                    TimestampMillis::new_for_test(1_781_956_000_000),
+                    TimestampMillis::new_for_test(1_781_970_000_000),
+                )
+                .with_repo(repo.clone())
+            )?,
+            vec![ToolCallRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo,
+                harness: HarnessName::new("opencode"),
+                tool_name: ToolName::new("Read"),
+                call_count: 1,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact_content_retention_ages_future_dated_blobs_from_ingest_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let ingest_finished_at = current_unix_millis();
+        let compacted_at = TimestampMillis::new_for_test(
+            ingest_finished_at.saturating_add(i64::from(2 * 24 * 60 * 60 * 1000)),
+        );
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("future-dated-content"),
+                occurred_at: TimestampMillis::new_for_test(4_102_444_800_000),
+                session_id: SessionId::new("session-future"),
+                prompt_id: PromptId::new("prompt-future"),
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("future stamped content").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::new(Some(Duration::from_secs(24 * 60 * 60)), None),
+            compacted_at,
+        )?;
+
+        assert_eq!(report.inline_blobs_evicted, 1);
+        assert!(
+            store
+                .content_replay(ContentQuery {
+                    harness: HarnessName::new("opencode"),
+                    session_id: SessionId::new("session-future"),
+                    prompt_id: PromptId::new("prompt-future"),
+                })?
+                .items
+                .is_empty()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact_content_retention_evicts_oldest_blobs_until_size_budget_is_met()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let repo = kvasir_repo("/repos/kvasir");
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![
+                ContentRecord {
+                    event_key: ContentEventKey::new("old-inline"),
+                    occurred_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                    session_id: SessionId::new("session-size"),
+                    prompt_id: PromptId::new("old-inline-prompt"),
+                    repo: repo.clone(),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new("123456789").unwrap(),
+                },
+                ContentRecord {
+                    event_key: ContentEventKey::new("new-inline"),
+                    occurred_at: TimestampMillis::new_for_test(1_781_956_802_000),
+                    session_id: SessionId::new("session-size"),
+                    prompt_id: PromptId::new("new-inline-prompt"),
+                    repo: repo.clone(),
+                    harness: HarnessName::new("opencode"),
+                    kind: ContentKind::AssistantMessage,
+                    content: ContentText::new("1234").unwrap(),
+                },
+            ],
+            raw_body_references: Vec::new(),
+        })?;
+        store.connection.execute(
+            "INSERT INTO canonical_raw_body_records (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                retention_basis_ms,
+                compression,
+                compressed_body
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "middle-raw",
+                1_781_956_801_000_i64,
+                "session-size",
+                "middle-raw-prompt",
+                "2026-06-20",
+                REPO_BUCKET,
+                "kvasir",
+                "/repos/kvasir",
+                "claude_code",
+                "raw_api_request",
+                1_781_956_801_000_i64,
+                "zstd",
+                vec![1_u8, 2, 3, 4, 5, 6],
+            ],
+        )?;
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::new(None, Some(5)),
+            TimestampMillis::new_for_test(1_781_956_900_000),
+        )?;
+
+        assert_eq!(report.inline_blobs_evicted, 1);
+        assert_eq!(report.raw_body_blobs_evicted, 1);
+        assert_eq!(report.bytes_evicted, 15);
+        assert_eq!(report.bytes_retained, 4);
+        let inline_rows = store
+            .connection
+            .prepare(
+                "SELECT event_key, content IS NULL
+                 FROM canonical_content_records
+                 ORDER BY occurred_at_ms",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            inline_rows,
+            vec![
+                ("old-inline".to_owned(), true),
+                ("new-inline".to_owned(), false)
+            ]
+        );
+        let raw_body_was_purged: bool = store.connection.query_row(
+            "SELECT compressed_body IS NULL FROM canonical_raw_body_records WHERE event_key = 'middle-raw'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(raw_body_was_purged);
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact_content_retention_requeries_size_candidates_across_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let base_ms = 1_781_956_800_000_i64;
+        for index in 0..1_025 {
+            let event_key = format!("batch-inline-{index:04}");
+            let prompt_id = format!("batch-prompt-{index:04}");
+            store.connection.execute(
+                "INSERT INTO canonical_content_records (
+                    event_key,
+                    occurred_at_ms,
+                    session_id,
+                    prompt_id,
+                    day,
+                    repo_bucket,
+                    repo_name,
+                    repo_path,
+                    harness,
+                    content_kind,
+                    retention_basis_ms,
+                    content
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    event_key,
+                    base_ms + i64::from(index),
+                    "batch-session",
+                    prompt_id,
+                    "2026-06-20",
+                    REPO_BUCKET,
+                    "kvasir",
+                    "/repos/kvasir",
+                    "opencode",
+                    "assistant_message",
+                    base_ms + i64::from(index),
+                    "x",
+                ],
+            )?;
+        }
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::new(None, Some(10)),
+            TimestampMillis::new_for_test(base_ms + 2_000),
+        )?;
+
+        assert_eq!(report.inline_blobs_evicted, 1_015);
+        assert_eq!(report.raw_body_blobs_evicted, 0);
+        assert_eq!(report.bytes_evicted, 1_015);
+        assert_eq!(report.bytes_retained, 10);
+        let retained_count: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM canonical_content_records
+             WHERE content IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained_count, 10);
+        let oldest_retained_basis_ms: i64 = store.connection.query_row(
+            "SELECT MIN(retention_basis_ms)
+             FROM canonical_content_records
+             WHERE content IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(oldest_retained_basis_ms, base_ms + 1_015);
+
+        Ok(())
+    }
+
+    #[test]
+    fn retention_eviction_queues_vacuum_until_explicit_maintenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let occurred_at = TimestampMillis::new_for_test(1_781_956_800_000);
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("content-event-vacuum-queued"),
+                occurred_at,
+                session_id: SessionId::new("session-vacuum-queued"),
+                prompt_id: PromptId::new("prompt-vacuum-queued"),
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("queued vacuum content").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::new(Some(Duration::from_secs(24 * 60 * 60)), None),
+            TimestampMillis::new_for_test(1_782_129_600_000),
+        )?;
+
+        assert_eq!(report.bytes_evicted, "queued vacuum content".len() as u64);
+        let pending_after_eviction: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_after_eviction, 1);
+
+        store.run_pending_maintenance();
+        let pending_after_maintenance: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_after_maintenance, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact_content_retention_keep_forever_retains_blobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: vec![ContentRecord {
+                event_key: ContentEventKey::new("content-event-keep-forever"),
+                occurred_at: TimestampMillis::new_for_test(1_781_956_800_000),
+                session_id: SessionId::new("session-keep-forever"),
+                prompt_id: PromptId::new("prompt-keep-forever"),
+                repo: kvasir_repo("/repos/kvasir"),
+                harness: HarnessName::new("opencode"),
+                kind: ContentKind::AssistantMessage,
+                content: ContentText::new("retained assistant text").unwrap(),
+            }],
+            raw_body_references: Vec::new(),
+        })?;
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::keep_forever(),
+            TimestampMillis::new_for_test(1_900_000_000_000),
+        )?;
+
+        assert_eq!(report.inline_blobs_evicted, 0);
+        assert_eq!(report.raw_body_blobs_evicted, 0);
+        assert_eq!(report.bytes_evicted, 0);
+        assert_eq!(report.bytes_retained, 0);
+        assert_eq!(
+            store
+                .content_replay(ContentQuery {
+                    harness: HarnessName::new("opencode"),
+                    session_id: SessionId::new("session-keep-forever"),
+                    prompt_id: PromptId::new("prompt-keep-forever"),
+                })?
+                .items
+                .len(),
+            1
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn session_and_prompt_summaries_rank_opencode_trace_attributed_totals()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -6721,9 +8091,10 @@ mod tests {
                 repo_path,
                 harness,
                 content_kind,
+                retention_basis_ms,
                 compression,
                 compressed_body
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 "unsupported-compression",
                 1_781_956_800_000_i64,
@@ -6735,6 +8106,7 @@ mod tests {
                 "/repos/kvasir",
                 "claude_code",
                 "raw_api_request",
+                1_781_956_800_000_i64,
                 "gzip",
                 vec![0_u8],
             ],
@@ -6748,6 +8120,269 @@ mod tests {
 
         assert_eq!(replay.items.len(), 1);
         assert_eq!(replay.items[0].content.as_str(), "visible prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn raw_body_import_candidates_defer_cleanup_when_body_ref_is_reused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        store.connection.execute_batch(
+            "INSERT INTO raw_body_import_queue (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                body_ref
+            ) VALUES
+            (
+                'old-reused-body',
+                1781956800000,
+                'session-old',
+                'prompt-old',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'claude_code',
+                'raw_api_request',
+                'reused.json'
+            ),
+            (
+                'new-reused-body',
+                1781956801000,
+                'session-new',
+                'prompt-new',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'claude_code',
+                'raw_api_request',
+                'reused.json'
+            );
+
+            INSERT INTO canonical_raw_body_records (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                retention_basis_ms,
+                compression,
+                compressed_body
+            ) VALUES (
+                'old-reused-body',
+                1781956800000,
+                'session-old',
+                'prompt-old',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'claude_code',
+                'raw_api_request',
+                1781956800000,
+                'zstd',
+                x'00'
+            );",
+        )?;
+
+        let candidates = store.raw_body_import_candidates(1)?;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].event_key(), "new-reused-body");
+        assert!(!candidates[0].is_stored());
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_raw_body_import_uses_current_time_for_retention_basis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let raw_body_path = temp.path().join("raw-bodies");
+        std::fs::create_dir(&raw_body_path)?;
+        std::fs::write(
+            raw_body_path.join("future-body.json"),
+            br#"{"future":true}"#,
+        )?;
+        let raw_body_directory = VerifiedRawBodyDirectory::open(&raw_body_path)?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let future_occurred_at = TimestampMillis::new_for_test(4_000_000_000_000);
+        store.record_raw_body_references(&[RawBodyReferenceRecord {
+            event_key: ContentEventKey::new("future-public-raw-body"),
+            occurred_at: future_occurred_at,
+            session_id: SessionId::new("session-public-raw-body"),
+            prompt_id: PromptId::new("prompt-public-raw-body"),
+            repo: kvasir_repo("/repos/kvasir"),
+            harness: HarnessName::new("claude_code"),
+            kind: ContentKind::RawApiRequest,
+            body_ref: crate::usage::RawBodyFileReference::new("future-body.json").unwrap(),
+        }])?;
+
+        let mut candidates = store.raw_body_import_candidates(1)?;
+        assert_eq!(candidates.len(), 1);
+        let prepared =
+            match prepare_raw_body_import_candidate(&raw_body_directory, candidates.remove(0))? {
+                RawBodyImportPreparation::Prepared(prepared) => prepared,
+                RawBodyImportPreparation::Missing(_)
+                | RawBodyImportPreparation::AlreadyCleaned(_) => {
+                    panic!("future raw body should be prepared")
+                }
+            };
+        assert!(prepared.stores_body());
+        let prepared_imports = vec![prepared];
+
+        let inserted_event_keys = store.commit_prepared_raw_body_imports(&prepared_imports)?;
+
+        assert_eq!(
+            inserted_event_keys,
+            vec!["future-public-raw-body".to_owned()]
+        );
+        let retention_basis_ms: i64 = store.connection.query_row(
+            "SELECT retention_basis_ms
+             FROM canonical_raw_body_records
+             WHERE event_key = 'future-public-raw-body'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(retention_basis_ms > 1_600_000_000_000);
+        assert!(retention_basis_ms < future_occurred_at.value());
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purged_legacy_compression_raw_body_import_cleans_without_rehydrating()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let raw_body_path = temp.path().join("raw-bodies");
+        std::fs::create_dir(&raw_body_path)?;
+        std::fs::write(
+            raw_body_path.join("legacy-body.json"),
+            br#"{"messages":[{"role":"user","content":"purged secret"}]}"#,
+        )?;
+        let raw_body_directory = VerifiedRawBodyDirectory::open(&raw_body_path)?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        store.connection.execute_batch(
+            "INSERT INTO raw_body_import_queue (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                body_ref
+            ) VALUES (
+                'legacy-purged-body',
+                1781956800000,
+                'session-legacy-purged',
+                'prompt-legacy-purged',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'claude_code',
+                'raw_api_request',
+                'legacy-body.json'
+            );
+
+            INSERT INTO canonical_raw_body_records (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                retention_basis_ms,
+                compression,
+                compressed_body,
+                purged_at_ms
+            ) VALUES (
+                'legacy-purged-body',
+                1781956800000,
+                'session-legacy-purged',
+                'prompt-legacy-purged',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'claude_code',
+                'raw_api_request',
+                1781956800000,
+                'gzip',
+                NULL,
+                1782129600000
+            );",
+        )?;
+
+        let mut candidates = store.raw_body_import_candidates(10)?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].event_key(), "legacy-purged-body");
+        assert!(candidates[0].is_stored());
+        let prepared =
+            match prepare_raw_body_import_candidate(&raw_body_directory, candidates.remove(0))? {
+                RawBodyImportPreparation::Prepared(prepared) => prepared,
+                RawBodyImportPreparation::Missing(_)
+                | RawBodyImportPreparation::AlreadyCleaned(_) => {
+                    panic!("purged legacy body file should be opened for cleanup")
+                }
+            };
+        assert!(!prepared.stores_body());
+        let prepared_imports = vec![prepared];
+
+        let inserted_event_keys = store.commit_prepared_raw_body_imports_with_retention(
+            &prepared_imports,
+            &ContentRetentionPolicy::keep_forever(),
+            TimestampMillis::new_for_test(1_782_129_600_000),
+        )?;
+        assert!(inserted_event_keys.is_empty());
+        let cleanup_report = cleanup_prepared_raw_body_imports(prepared_imports);
+        assert_eq!(
+            cleanup_report.completed_event_keys,
+            vec!["legacy-purged-body".to_owned()]
+        );
+        assert!(cleanup_report.cleanup_errors.is_empty());
+
+        let row_state: (String, bool, bool) = store.connection.query_row(
+            "SELECT compression, compressed_body IS NULL, purged_at_ms IS NOT NULL
+             FROM canonical_raw_body_records
+             WHERE event_key = 'legacy-purged-body'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(row_state, ("gzip".to_owned(), true, true));
+        assert!(!raw_body_path.join("legacy-body.json").exists());
+        let replay = store.content_replay(ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: SessionId::new("session-legacy-purged"),
+            prompt_id: PromptId::new("prompt-legacy-purged"),
+        })?;
+        assert!(replay.items.is_empty());
+
         Ok(())
     }
 
@@ -9673,6 +11308,163 @@ occurred_at_nanos=1781956803000000000
                     row.get(0)
                 })?;
         assert_eq!(tool_call_row_count_after_reingest, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_v16_schema_preserves_content_blobs_and_adds_purge_tombstones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let compressed_body = zstd::stream::encode_all(
+            r#"{"messages":[{"role":"user","content":"legacy raw body"}]}"#.as_bytes(),
+            0,
+        )?;
+        let connection = open_raw_test_connection(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE canonical_content_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+
+            CREATE TABLE canonical_raw_body_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                repo_bucket TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                compression TEXT NOT NULL,
+                compressed_body BLOB NOT NULL
+            );
+
+            INSERT INTO canonical_content_records (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                content
+            ) VALUES (
+                'legacy-inline-content',
+                1781956800000,
+                'session-v16',
+                'prompt-v16',
+                '2026-06-20',
+                'repo',
+                'kvasir',
+                '/repos/kvasir',
+                'claude_code',
+                'assistant_message',
+                'legacy inline content'
+            );
+
+            PRAGMA user_version = 16;",
+        )?;
+        connection.execute(
+            "INSERT INTO canonical_raw_body_records (
+                event_key,
+                occurred_at_ms,
+                session_id,
+                prompt_id,
+                day,
+                repo_bucket,
+                repo_name,
+                repo_path,
+                harness,
+                content_kind,
+                compression,
+                compressed_body
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                "legacy-raw-content",
+                1_781_956_800_001_i64,
+                "session-v16",
+                "prompt-v16",
+                "2026-06-20",
+                REPO_BUCKET,
+                "kvasir",
+                "/repos/kvasir",
+                "claude_code",
+                "raw_api_request",
+                "zstd",
+                compressed_body,
+            ],
+        )?;
+        drop(connection);
+
+        let mut store = open_test_store(&database_path)?;
+        let query = ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: crate::rpc::SessionId::new("session-v16"),
+            prompt_id: crate::rpc::PromptId::new("prompt-v16"),
+        };
+        let replay = store.content_replay(query.clone())?;
+        assert_eq!(replay.items.len(), 2);
+        assert_eq!(replay.items[0].content.as_str(), "legacy inline content");
+        assert_eq!(
+            replay.items[1].content.as_str(),
+            r#"{"messages":[{"role":"user","content":"legacy raw body"}]}"#
+        );
+        let migrated_content_basis: i64 = store.connection.query_row(
+            "SELECT retention_basis_ms FROM canonical_content_records",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(migrated_content_basis, 1_781_956_800_000);
+        let migrated_raw_body_basis: i64 = store.connection.query_row(
+            "SELECT retention_basis_ms FROM canonical_raw_body_records",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(migrated_raw_body_basis, 1_781_956_800_001);
+
+        let report = store.compact_content_retention(
+            &ContentRetentionPolicy::new(Some(Duration::from_secs(24 * 60 * 60)), None),
+            TimestampMillis::new_for_test(1_782_129_600_000),
+        )?;
+        assert_eq!(report.inline_blobs_evicted, 1);
+        assert_eq!(report.raw_body_blobs_evicted, 1);
+        assert!(store.content_replay(query)?.items.is_empty());
+        drop(store);
+
+        let connection = open_raw_test_connection(&database_path)?;
+        let content_state: (bool, bool) = connection.query_row(
+            "SELECT content IS NULL, purged_at_ms IS NOT NULL FROM canonical_content_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(content_state, (true, true));
+        let raw_body_state: (bool, bool) = connection.query_row(
+            "SELECT compressed_body IS NULL, purged_at_ms IS NOT NULL FROM canonical_raw_body_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(raw_body_state, (true, true));
+        let user_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(user_version, CURRENT_SCHEMA_VERSION);
 
         Ok(())
     }

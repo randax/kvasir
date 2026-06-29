@@ -19,10 +19,11 @@ pub use setup::{
     SetupSecretSource, prepare_setup_config, resolve_setup_config,
 };
 pub use store::{
-    RawBodyCleanupError, RawBodyCleanupReport, RawBodyImportCandidate, RawBodyImportFailure,
-    RawBodyImportFailureKind, RawBodyImportPreparation, RawBodyPreparedImport, StoreError,
-    StoreKey, StoreKeyError, UsageStore, cleanup_prepared_raw_body_imports,
-    prepare_raw_body_import_candidate,
+    ContentRetentionPolicy, ContentRetentionReport, RawBodyCleanupError, RawBodyCleanupReport,
+    RawBodyImportCandidate, RawBodyImportFailure, RawBodyImportFailureKind,
+    RawBodyImportPreparation, RawBodyPreparedImport, StoreError, StoreKey, StoreKeyError,
+    UsageStore, VerifiedRawBodyDirectory, cleanup_invalid_raw_body_candidate,
+    cleanup_prepared_raw_body_imports, prepare_raw_body_import_candidate,
 };
 pub use usage::{
     ContentEventKey, ContentKind, ContentRecord, ContentText, CostUsageRecord, CostUsd,
