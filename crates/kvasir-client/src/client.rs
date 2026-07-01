@@ -8,15 +8,21 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use kvasir_core::explorer::{
+    usage_rollup_explorer_panel_snapshot, usage_rollup_explorer_query_for_panel,
+};
 use kvasir_core::rpc::{RpcRequest, RpcResponse, RpcStreamEvent};
 
 use crate::error::KvasirClientError;
 use crate::transport::{connect_with_retries, read_rpc_stream_event, send_rpc_request};
 use crate::types::{
     KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirCostRollup,
-    KvasirOverviewRollup, KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath,
-    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace,
-    KvasirTraceQuery, KvasirUsageUpdateKind,
+    KvasirExplorerCatalog, KvasirExplorerQuery, KvasirExplorerResult, KvasirExplorerSavedPanel,
+    KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun, KvasirOverviewRollup,
+    KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
+    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
+    KvasirUsageRollupExplorerPanelRequest, KvasirUsageRollupExplorerPanelSnapshot,
+    KvasirUsageUpdateKind,
 };
 
 #[derive(Debug, uniffi::Object)]
@@ -89,6 +95,117 @@ impl KvasirClient {
             RpcResponse::Error { error } => Err(error.into()),
             _ => Err(KvasirClientError::WrongResponseType),
         }
+    }
+
+    pub fn explorer_catalog(&self) -> Result<KvasirExplorerCatalog, KvasirClientError> {
+        let response = send_rpc_request(&self.socket_path, RpcRequest::ExplorerCatalog)?;
+        match response {
+            RpcResponse::ExplorerCatalog { catalog } => Ok(catalog.into()),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn explorer_saved_panel(
+        &self,
+        panel: KvasirExplorerSavedPanel,
+    ) -> Result<KvasirExplorerSavedPanelDefinition, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerSavedPanel {
+                panel: panel.into(),
+            },
+        )?;
+        match response {
+            RpcResponse::ExplorerSavedPanel { panel } => Ok(panel.into()),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn run_explorer_query(
+        &self,
+        query: KvasirExplorerQuery,
+    ) -> Result<KvasirExplorerResult, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerQuery {
+                query: query.try_into()?,
+            },
+        )?;
+        match response {
+            RpcResponse::ExplorerQuery { result } => result.try_into(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn run_explorer_saved_panel(
+        &self,
+        run: KvasirExplorerSavedPanelRun,
+    ) -> Result<KvasirExplorerResult, KvasirClientError> {
+        let response = send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerSavedPanelRun {
+                run: run.try_into()?,
+            },
+        )?;
+        match response {
+            RpcResponse::ExplorerSavedPanelRun { result } => result.try_into(),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(KvasirClientError::WrongResponseType),
+        }
+    }
+
+    pub fn usage_rollup_explorer_panel(
+        &self,
+        request: KvasirUsageRollupExplorerPanelRequest,
+    ) -> Result<KvasirUsageRollupExplorerPanelSnapshot, KvasirClientError> {
+        let catalog = match send_rpc_request(&self.socket_path, RpcRequest::ExplorerCatalog)? {
+            RpcResponse::ExplorerCatalog { catalog } => catalog,
+            RpcResponse::Error { error } => return Err(error.into()),
+            _ => return Err(KvasirClientError::WrongResponseType),
+        };
+        let panel = match request.saved_panel {
+            Some(panel) => panel.try_into()?,
+            None => {
+                match send_rpc_request(
+                    &self.socket_path,
+                    RpcRequest::ExplorerSavedPanel {
+                        panel: KvasirExplorerSavedPanel::UsageRollupsOverview.into(),
+                    },
+                )? {
+                    RpcResponse::ExplorerSavedPanel { panel } => panel,
+                    RpcResponse::Error { error } => return Err(error.into()),
+                    _ => return Err(KvasirClientError::WrongResponseType),
+                }
+            }
+        };
+        let filters = request
+            .filters
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (panel, query) = usage_rollup_explorer_query_for_panel(
+            &catalog,
+            panel,
+            request.time_range.into(),
+            filters,
+        )
+        .map_err(|errors| KvasirClientError::ExplorerValidation {
+            errors: errors.errors.into_iter().map(Into::into).collect(),
+        })?;
+        let result = match send_rpc_request(
+            &self.socket_path,
+            RpcRequest::ExplorerQuery {
+                query: query.clone(),
+            },
+        )? {
+            RpcResponse::ExplorerQuery { result } => result,
+            RpcResponse::Error { error } => return Err(error.into()),
+            _ => return Err(KvasirClientError::WrongResponseType),
+        };
+        usage_rollup_explorer_panel_snapshot(panel, query, result).try_into()
     }
 
     pub fn overview_rollups(

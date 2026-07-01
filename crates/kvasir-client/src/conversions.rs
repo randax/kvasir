@@ -1,4 +1,22 @@
 use chrono::Datelike;
+use kvasir_core::explorer::{
+    ExplorerCatalog as CoreExplorerCatalog, ExplorerDataset as CoreExplorerDataset,
+    ExplorerDatasetCatalog as CoreExplorerDatasetCatalog,
+    ExplorerDimension as CoreExplorerDimension, ExplorerFilter as CoreExplorerFilter,
+    ExplorerGroupValue as CoreExplorerGroupValue, ExplorerMeasure as CoreExplorerMeasure,
+    ExplorerQuery as CoreExplorerQuery, ExplorerQueryResult as CoreExplorerQueryResult,
+    ExplorerResultRow as CoreExplorerResultRow, ExplorerSavedPanel as CoreExplorerSavedPanel,
+    ExplorerSavedPanelDefinition as CoreExplorerSavedPanelDefinition,
+    ExplorerSavedPanelRun as CoreExplorerSavedPanelRun, ExplorerTableCell as CoreExplorerTableCell,
+    ExplorerTableColumn as CoreExplorerTableColumn,
+    ExplorerTablePresentation as CoreExplorerTablePresentation,
+    ExplorerTableRowPresentation as CoreExplorerTableRowPresentation,
+    ExplorerTimeRange as CoreExplorerTimeRange,
+    ExplorerValidationError as CoreExplorerValidationError,
+    ExplorerVisualization as CoreExplorerVisualization,
+    UsageRollupExplorerMeasures as CoreUsageRollupExplorerMeasures,
+    UsageRollupExplorerPanelSnapshot as CoreUsageRollupExplorerPanelSnapshot,
+};
 use kvasir_core::rpc::{
     ContentAvailability as CoreContentAvailability,
     ContentKindAvailability as CoreContentKindAvailability, ContentQuery,
@@ -18,12 +36,19 @@ use crate::types::{
     KvasirAttributionStatus, KvasirContentAvailability, KvasirContentKind,
     KvasirContentKindAvailability, KvasirContentQuery, KvasirContentReplay,
     KvasirContentReplayItem, KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource,
-    KvasirCostUsd, KvasirOverviewHarnessSummary, KvasirOverviewPromptRoute,
+    KvasirCostUsd, KvasirExplorerCatalog, KvasirExplorerDataset, KvasirExplorerDatasetCatalog,
+    KvasirExplorerDimension, KvasirExplorerFilter, KvasirExplorerGroupValue, KvasirExplorerMeasure,
+    KvasirExplorerQuery, KvasirExplorerResult, KvasirExplorerResultRow, KvasirExplorerSavedPanel,
+    KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun, KvasirExplorerTableCell,
+    KvasirExplorerTableColumn, KvasirExplorerTablePresentation, KvasirExplorerTableRowPresentation,
+    KvasirExplorerTimeRange, KvasirExplorerValidationError, KvasirExplorerVisualization,
+    KvasirHarnessName, KvasirModelName, KvasirOverviewHarnessSummary, KvasirOverviewPromptRoute,
     KvasirOverviewPromptSummary, KvasirOverviewRollup, KvasirOverviewSessionRoute,
     KvasirOverviewSessionSummary, KvasirOverviewTotals, KvasirRepoBucket, KvasirRepoBucketKind,
     KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery, KvasirTimestampMillis,
     KvasirTokenRollup, KvasirToolCallRollup, KvasirTrace, KvasirTraceDurationMeasures,
-    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind,
+    KvasirTraceQuery, KvasirTraceSpan, KvasirTraceSpanKind, KvasirUsageRollupExplorerMeasures,
+    KvasirUsageRollupExplorerPanelSnapshot,
 };
 
 impl TryFrom<KvasirRollupQuery> for RollupQuery {
@@ -119,6 +144,270 @@ impl TryFrom<KvasirRollupQuery> for ToolCallRollupQuery {
     }
 }
 
+impl TryFrom<KvasirExplorerQuery> for CoreExplorerQuery {
+    type Error = KvasirClientError;
+
+    fn try_from(query: KvasirExplorerQuery) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dataset: query.dataset.into(),
+            time_range: query.time_range.into(),
+            measures: query
+                .measures
+                .into_iter()
+                .map(CoreExplorerMeasure::from)
+                .collect(),
+            group_by: query
+                .group_by
+                .into_iter()
+                .map(CoreExplorerDimension::from)
+                .collect(),
+            filters: query
+                .filters
+                .into_iter()
+                .map(CoreExplorerFilter::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            visualization: query.visualization.into(),
+            limit: u32::try_from(query.limit).map_err(|_| KvasirClientError::InvalidQuery)?,
+        })
+    }
+}
+
+impl TryFrom<KvasirExplorerSavedPanelRun> for CoreExplorerSavedPanelRun {
+    type Error = KvasirClientError;
+
+    fn try_from(run: KvasirExplorerSavedPanelRun) -> Result<Self, Self::Error> {
+        Ok(Self {
+            panel: run.panel.into(),
+            time_range: run.time_range.into(),
+            filters: run
+                .filters
+                .into_iter()
+                .map(CoreExplorerFilter::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<KvasirExplorerSavedPanelDefinition> for CoreExplorerSavedPanelDefinition {
+    type Error = KvasirClientError;
+
+    fn try_from(panel: KvasirExplorerSavedPanelDefinition) -> Result<Self, Self::Error> {
+        Ok(Self {
+            panel: panel.panel.into(),
+            dataset: panel.dataset.into(),
+            measures: panel.measures.into_iter().map(Into::into).collect(),
+            group_by: panel.group_by.into_iter().map(Into::into).collect(),
+            filters: panel
+                .filters
+                .into_iter()
+                .map(CoreExplorerFilter::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            visualization: panel.visualization.into(),
+            limit: u32::try_from(panel.limit).map_err(|_| KvasirClientError::InvalidQuery)?,
+        })
+    }
+}
+
+impl From<KvasirExplorerTimeRange> for CoreExplorerTimeRange {
+    fn from(range: KvasirExplorerTimeRange) -> Self {
+        Self {
+            start: TimestampMillis::from_millis(range.start.value),
+            end: TimestampMillis::from_millis(range.end.value),
+        }
+    }
+}
+
+impl From<CoreExplorerTimeRange> for KvasirExplorerTimeRange {
+    fn from(range: CoreExplorerTimeRange) -> Self {
+        Self {
+            start: KvasirTimestampMillis {
+                value: range.start.value(),
+            },
+            end: KvasirTimestampMillis {
+                value: range.end.value(),
+            },
+        }
+    }
+}
+
+impl From<CoreExplorerQuery> for KvasirExplorerQuery {
+    fn from(query: CoreExplorerQuery) -> Self {
+        Self {
+            dataset: query.dataset.into(),
+            time_range: query.time_range.into(),
+            measures: query.measures.into_iter().map(Into::into).collect(),
+            group_by: query.group_by.into_iter().map(Into::into).collect(),
+            filters: query.filters.into_iter().map(Into::into).collect(),
+            visualization: query.visualization.into(),
+            limit: u64::from(query.limit),
+        }
+    }
+}
+
+impl From<KvasirExplorerDataset> for CoreExplorerDataset {
+    fn from(dataset: KvasirExplorerDataset) -> Self {
+        match dataset {
+            KvasirExplorerDataset::UsageRollups => Self::UsageRollups,
+        }
+    }
+}
+
+impl From<CoreExplorerDataset> for KvasirExplorerDataset {
+    fn from(dataset: CoreExplorerDataset) -> Self {
+        match dataset {
+            CoreExplorerDataset::UsageRollups => Self::UsageRollups,
+        }
+    }
+}
+
+impl From<KvasirExplorerSavedPanel> for CoreExplorerSavedPanel {
+    fn from(panel: KvasirExplorerSavedPanel) -> Self {
+        match panel {
+            KvasirExplorerSavedPanel::UsageRollupsOverview => Self::UsageRollupsOverview,
+        }
+    }
+}
+
+impl From<CoreExplorerSavedPanel> for KvasirExplorerSavedPanel {
+    fn from(panel: CoreExplorerSavedPanel) -> Self {
+        match panel {
+            CoreExplorerSavedPanel::UsageRollupsOverview => Self::UsageRollupsOverview,
+        }
+    }
+}
+
+impl From<KvasirExplorerMeasure> for CoreExplorerMeasure {
+    fn from(measure: KvasirExplorerMeasure) -> Self {
+        match measure {
+            KvasirExplorerMeasure::TotalTokens => Self::TotalTokens,
+            KvasirExplorerMeasure::CostUsd => Self::CostUsd,
+        }
+    }
+}
+
+impl From<CoreExplorerMeasure> for KvasirExplorerMeasure {
+    fn from(measure: CoreExplorerMeasure) -> Self {
+        match measure {
+            CoreExplorerMeasure::TotalTokens => Self::TotalTokens,
+            CoreExplorerMeasure::CostUsd => Self::CostUsd,
+        }
+    }
+}
+
+impl From<KvasirExplorerDimension> for CoreExplorerDimension {
+    fn from(dimension: KvasirExplorerDimension) -> Self {
+        match dimension {
+            KvasirExplorerDimension::Day => Self::Day,
+            KvasirExplorerDimension::Repo => Self::Repo,
+            KvasirExplorerDimension::Model => Self::Model,
+            KvasirExplorerDimension::Harness => Self::Harness,
+        }
+    }
+}
+
+impl From<CoreExplorerDimension> for KvasirExplorerDimension {
+    fn from(dimension: CoreExplorerDimension) -> Self {
+        match dimension {
+            CoreExplorerDimension::Day => Self::Day,
+            CoreExplorerDimension::Repo => Self::Repo,
+            CoreExplorerDimension::Model => Self::Model,
+            CoreExplorerDimension::Harness => Self::Harness,
+        }
+    }
+}
+
+impl From<KvasirExplorerVisualization> for CoreExplorerVisualization {
+    fn from(visualization: KvasirExplorerVisualization) -> Self {
+        match visualization {
+            KvasirExplorerVisualization::Table => Self::Table,
+            KvasirExplorerVisualization::LineChart => Self::LineChart,
+        }
+    }
+}
+
+impl From<CoreExplorerVisualization> for KvasirExplorerVisualization {
+    fn from(visualization: CoreExplorerVisualization) -> Self {
+        match visualization {
+            CoreExplorerVisualization::Table => Self::Table,
+            CoreExplorerVisualization::LineChart => Self::LineChart,
+        }
+    }
+}
+
+impl From<CoreExplorerValidationError> for KvasirExplorerValidationError {
+    fn from(error: CoreExplorerValidationError) -> Self {
+        match error {
+            CoreExplorerValidationError::EmptyMeasureSelection => Self::EmptyMeasureSelection,
+            CoreExplorerValidationError::UnsupportedDataset { dataset } => {
+                Self::UnsupportedDataset {
+                    dataset: dataset.into(),
+                }
+            }
+            CoreExplorerValidationError::UnsupportedSavedPanel { panel } => {
+                Self::UnsupportedSavedPanel {
+                    panel: panel.into(),
+                }
+            }
+            CoreExplorerValidationError::UnsupportedMeasure { measure } => {
+                Self::UnsupportedMeasure {
+                    measure: measure.into(),
+                }
+            }
+            CoreExplorerValidationError::UnsupportedDimension { dimension } => {
+                Self::UnsupportedDimension {
+                    dimension: dimension.into(),
+                }
+            }
+            CoreExplorerValidationError::UnsupportedFilter { dimension } => {
+                Self::UnsupportedFilter {
+                    dimension: dimension.into(),
+                }
+            }
+            CoreExplorerValidationError::UnsupportedVisualization { visualization } => {
+                Self::UnsupportedVisualization {
+                    visualization: visualization.into(),
+                }
+            }
+            CoreExplorerValidationError::InvalidLimit { requested, max } => Self::InvalidLimit {
+                requested: u64::from(requested),
+                max: u64::from(max),
+            },
+            CoreExplorerValidationError::InvalidTimeRange => Self::InvalidTimeRange,
+            CoreExplorerValidationError::TooManyGroups { requested, max } => {
+                Self::TooManyGroups { requested, max }
+            }
+        }
+    }
+}
+
+impl TryFrom<KvasirExplorerFilter> for CoreExplorerFilter {
+    type Error = KvasirClientError;
+
+    fn try_from(filter: KvasirExplorerFilter) -> Result<Self, Self::Error> {
+        match filter {
+            KvasirExplorerFilter::Repo { value } => Ok(Self::Repo(value.try_into()?)),
+            KvasirExplorerFilter::Model { value } => Ok(Self::Model(value.into_core())),
+            KvasirExplorerFilter::Harness { value } => Ok(Self::Harness(value.into_core())),
+        }
+    }
+}
+
+impl From<CoreExplorerFilter> for KvasirExplorerFilter {
+    fn from(filter: CoreExplorerFilter) -> Self {
+        match filter {
+            CoreExplorerFilter::Repo(value) => Self::Repo {
+                value: value.into(),
+            },
+            CoreExplorerFilter::Model(value) => Self::Model {
+                value: KvasirModelName::from_core(value),
+            },
+            CoreExplorerFilter::Harness(value) => Self::Harness {
+                value: KvasirHarnessName::from_core(value),
+            },
+        }
+    }
+}
+
 impl From<KvasirTraceQuery> for TraceQuery {
     fn from(query: KvasirTraceQuery) -> Self {
         Self {
@@ -211,6 +500,213 @@ impl TryFrom<CoreToolCallRollup> for KvasirToolCallRollup {
             tool_name: crate::types::KvasirToolName::from_core(rollup.tool_name),
             call_count: rollup.call_count,
         })
+    }
+}
+
+impl From<CoreExplorerCatalog> for KvasirExplorerCatalog {
+    fn from(catalog: CoreExplorerCatalog) -> Self {
+        Self {
+            datasets: catalog
+                .datasets
+                .into_iter()
+                .map(KvasirExplorerDatasetCatalog::from)
+                .collect(),
+            saved_panels: catalog
+                .saved_panels
+                .into_iter()
+                .map(KvasirExplorerSavedPanelDefinition::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<CoreExplorerSavedPanelDefinition> for KvasirExplorerSavedPanelDefinition {
+    fn from(panel: CoreExplorerSavedPanelDefinition) -> Self {
+        Self {
+            panel: panel.panel.into(),
+            dataset: panel.dataset.into(),
+            measures: panel.measures.into_iter().map(Into::into).collect(),
+            group_by: panel.group_by.into_iter().map(Into::into).collect(),
+            filters: panel.filters.into_iter().map(Into::into).collect(),
+            visualization: panel.visualization.into(),
+            limit: u64::from(panel.limit),
+        }
+    }
+}
+
+impl From<CoreExplorerDatasetCatalog> for KvasirExplorerDatasetCatalog {
+    fn from(dataset: CoreExplorerDatasetCatalog) -> Self {
+        Self {
+            dataset: dataset.dataset.into(),
+            measures: dataset.measures.into_iter().map(Into::into).collect(),
+            dimensions: dataset.dimensions.into_iter().map(Into::into).collect(),
+            filters: dataset.filters.into_iter().map(Into::into).collect(),
+            visualizations: dataset.visualizations.into_iter().map(Into::into).collect(),
+            default_measures: dataset
+                .default_measures
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            default_group_by: dataset
+                .default_group_by
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            default_visualization: dataset.default_visualization.into(),
+            default_limit: u64::from(dataset.default_limit),
+            max_limit: u64::from(dataset.max_limit),
+            max_grouping_depth: dataset.max_grouping_depth,
+        }
+    }
+}
+
+impl TryFrom<CoreExplorerQueryResult> for KvasirExplorerResult {
+    type Error = KvasirClientError;
+
+    fn try_from(result: CoreExplorerQueryResult) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dataset: result.dataset.into(),
+            visualization: result.visualization.into(),
+            rows: result
+                .rows
+                .into_iter()
+                .map(KvasirExplorerResultRow::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<CoreExplorerResultRow> for KvasirExplorerResultRow {
+    type Error = KvasirClientError;
+
+    fn try_from(row: CoreExplorerResultRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            group: row
+                .group
+                .into_iter()
+                .map(KvasirExplorerGroupValue::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            measures: row.measures.into(),
+        })
+    }
+}
+
+impl TryFrom<CoreExplorerGroupValue> for KvasirExplorerGroupValue {
+    type Error = KvasirClientError;
+
+    fn try_from(value: CoreExplorerGroupValue) -> Result<Self, Self::Error> {
+        match value {
+            CoreExplorerGroupValue::Day(day) => Ok(Self::Day {
+                value: rollup_day_from_core(day)?,
+            }),
+            CoreExplorerGroupValue::Repo(repo) => Ok(Self::Repo { value: repo.into() }),
+            CoreExplorerGroupValue::Model(model) => Ok(Self::Model {
+                value: crate::types::KvasirModelName::from_core(model),
+            }),
+            CoreExplorerGroupValue::Harness(harness) => Ok(Self::Harness {
+                value: crate::types::KvasirHarnessName::from_core(harness),
+            }),
+        }
+    }
+}
+
+impl From<CoreUsageRollupExplorerMeasures> for KvasirUsageRollupExplorerMeasures {
+    fn from(measures: CoreUsageRollupExplorerMeasures) -> Self {
+        Self {
+            total_tokens: measures.total_tokens,
+            cost_usd: measures.cost_usd.map(|cost| KvasirCostUsd {
+                nanos: cost.as_nanos(),
+            }),
+            cost_source: measures.cost_source.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<CoreUsageRollupExplorerPanelSnapshot> for KvasirUsageRollupExplorerPanelSnapshot {
+    type Error = KvasirClientError;
+
+    fn try_from(snapshot: CoreUsageRollupExplorerPanelSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            panel: snapshot.panel.into(),
+            query: snapshot.query.into(),
+            result: snapshot.result.try_into()?,
+            table: snapshot.table.try_into()?,
+        })
+    }
+}
+
+impl TryFrom<CoreExplorerTablePresentation> for KvasirExplorerTablePresentation {
+    type Error = KvasirClientError;
+
+    fn try_from(table: CoreExplorerTablePresentation) -> Result<Self, Self::Error> {
+        Ok(Self {
+            columns: table.columns.into_iter().map(Into::into).collect(),
+            rows: table
+                .rows
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<CoreExplorerTableRowPresentation> for KvasirExplorerTableRowPresentation {
+    type Error = KvasirClientError;
+
+    fn try_from(row: CoreExplorerTableRowPresentation) -> Result<Self, Self::Error> {
+        Ok(Self {
+            cells: row
+                .cells
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl From<CoreExplorerTableColumn> for KvasirExplorerTableColumn {
+    fn from(column: CoreExplorerTableColumn) -> Self {
+        match column {
+            CoreExplorerTableColumn::Dimension { dimension } => Self::Dimension {
+                dimension: dimension.into(),
+            },
+            CoreExplorerTableColumn::TotalTokens => Self::TotalTokens,
+            CoreExplorerTableColumn::CostUsd => Self::CostUsd,
+            CoreExplorerTableColumn::CostSource => Self::CostSource,
+        }
+    }
+}
+
+impl TryFrom<CoreExplorerTableCell> for KvasirExplorerTableCell {
+    type Error = KvasirClientError;
+
+    fn try_from(cell: CoreExplorerTableCell) -> Result<Self, Self::Error> {
+        match cell {
+            CoreExplorerTableCell::Day { value } => Ok(Self::Day {
+                value: rollup_day_from_core(value)?,
+            }),
+            CoreExplorerTableCell::Repo { value } => Ok(Self::Repo {
+                value: value.into(),
+            }),
+            CoreExplorerTableCell::Model { value } => Ok(Self::Model {
+                value: KvasirModelName::from_core(value),
+            }),
+            CoreExplorerTableCell::Harness { value } => Ok(Self::Harness {
+                value: KvasirHarnessName::from_core(value),
+            }),
+            CoreExplorerTableCell::TotalTokens { value } => Ok(Self::TotalTokens { value }),
+            CoreExplorerTableCell::EmptyTotalTokens => Ok(Self::EmptyTotalTokens),
+            CoreExplorerTableCell::CostUsd { value } => Ok(Self::CostUsd {
+                value: KvasirCostUsd {
+                    nanos: value.as_nanos(),
+                },
+            }),
+            CoreExplorerTableCell::EmptyCostUsd => Ok(Self::EmptyCostUsd),
+            CoreExplorerTableCell::CostSource { value } => Ok(Self::CostSource {
+                value: value.into(),
+            }),
+            CoreExplorerTableCell::EmptyCostSource => Ok(Self::EmptyCostSource),
+        }
     }
 }
 
@@ -499,6 +995,9 @@ impl From<RpcError> for KvasirClientError {
     fn from(error: RpcError) -> Self {
         match error {
             RpcError::ResponseTooLarge => Self::RpcResponseTooLarge,
+            RpcError::ExplorerValidation { errors } => Self::ExplorerValidation {
+                errors: errors.into_iter().map(Into::into).collect(),
+            },
             RpcError::InvalidRequest | RpcError::Internal | RpcError::Unauthorized => {
                 Self::DaemonError
             }

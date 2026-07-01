@@ -13,21 +13,36 @@ use kvasir_client::{
     KvasirBearerToken, KvasirClient, KvasirClientError, KvasirContentAvailability,
     KvasirContentKind, KvasirContentKindAvailability, KvasirContentReplay, KvasirContentReplayItem,
     KvasirContentText, KvasirContentUnavailableReason, KvasirCostRollup, KvasirCostSource,
-    KvasirCostUsd, KvasirHarnessName, KvasirModelName, KvasirOverviewHarnessSummary,
-    KvasirOverviewModelSummary, KvasirOverviewRefreshSubscription, KvasirOverviewRepoSummary,
-    KvasirOverviewRollup, KvasirOverviewSeriesPoint, KvasirOverviewSessionRoute,
-    KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId, KvasirRepoBucket,
-    KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay, KvasirRollupQuery,
-    KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName, KvasirTimestampMillis,
-    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirToolName,
-    KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
-    KvasirTraceSpanKind, KvasirUsageUpdateKind,
+    KvasirCostUsd, KvasirExplorerDataset, KvasirExplorerDatasetCatalog, KvasirExplorerDimension,
+    KvasirExplorerFilter, KvasirExplorerGroupValue, KvasirExplorerMeasure, KvasirExplorerQuery,
+    KvasirExplorerSavedPanel, KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun,
+    KvasirExplorerTableCell, KvasirExplorerTableColumn, KvasirExplorerTimeRange,
+    KvasirExplorerValidationError, KvasirExplorerVisualization, KvasirHarnessName, KvasirModelName,
+    KvasirOverviewHarnessSummary, KvasirOverviewModelSummary, KvasirOverviewRefreshSubscription,
+    KvasirOverviewRepoSummary, KvasirOverviewRollup, KvasirOverviewSeriesPoint,
+    KvasirOverviewSessionRoute, KvasirOverviewSnapshot, KvasirOverviewTotals, KvasirPromptId,
+    KvasirRepoBucket, KvasirRepoBucketKind, KvasirRepoName, KvasirRepoPath, KvasirRollupDay,
+    KvasirRollupQuery, KvasirSessionId, KvasirSocketPath, KvasirSpanId, KvasirSpanName,
+    KvasirTimestampMillis, KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup,
+    KvasirToolName, KvasirTraceDurationMeasures, KvasirTraceId, KvasirTraceQuery, KvasirTraceSpan,
+    KvasirTraceSpanKind, KvasirUsageRollupExplorerPanelRequest, KvasirUsageUpdateKind,
+};
+use kvasir_core::explorer::{
+    ExplorerCatalog as CoreExplorerCatalog, ExplorerDataset, ExplorerDatasetCatalog,
+    ExplorerDimension, ExplorerMeasure, ExplorerQuery, ExplorerQueryResult, ExplorerResultRow,
+    ExplorerSavedPanel as CoreExplorerSavedPanel,
+    ExplorerSavedPanelDefinition as CoreExplorerSavedPanelDefinition, ExplorerTimeRange,
+    ExplorerValidationError, ExplorerVisualization,
+    UsageRollupExplorerMeasures as CoreUsageRollupExplorerMeasures,
 };
 use kvasir_core::rpc::{
     BearerToken, ContentQuery, HarnessName as CoreHarnessName, PromptId as CorePromptId,
     RpcRequest, RpcResponse, RpcStreamEvent, SessionId as CoreSessionId, UsageUpdateKind,
 };
-use kvasir_core::{ContentRetentionPolicy, PriceTable};
+use kvasir_core::{
+    ContentRetentionPolicy, PriceTable, RepoBucket, RepoIdentity, RepoName as CoreRepoName,
+    RepoPath as CoreRepoPath,
+};
 use kvasird::{
     ContentRetentionSchedule, DaemonConfig, StoreKeySource, start_with_store_key_source,
 };
@@ -122,6 +137,671 @@ async fn client_queries_token_rollups_through_daemon_socket() -> anyhow::Result<
                 cache_tokens: 50,
             },
         ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_runs_usage_rollup_explorer_query_through_daemon_socket() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let query = KvasirExplorerQuery {
+        dataset: KvasirExplorerDataset::UsageRollups,
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        measures: vec![
+            KvasirExplorerMeasure::TotalTokens,
+            KvasirExplorerMeasure::CostUsd,
+        ],
+        group_by: vec![
+            KvasirExplorerDimension::Day,
+            KvasirExplorerDimension::Repo,
+            KvasirExplorerDimension::Model,
+        ],
+        filters: Vec::new(),
+        visualization: KvasirExplorerVisualization::Table,
+        limit: 10,
+    };
+    let saved_panel_run = KvasirExplorerSavedPanelRun {
+        panel: KvasirExplorerSavedPanel::UsageRollupsOverview,
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        filters: Vec::new(),
+    };
+    let panel_request = KvasirUsageRollupExplorerPanelRequest {
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        filters: Vec::new(),
+        saved_panel: None,
+    };
+    let (catalog, saved_panel, result, saved_panel_result, panel_snapshot) =
+        tokio::task::spawn_blocking(move || {
+            let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+            Ok::<_, KvasirClientError>((
+                client.explorer_catalog()?,
+                client.explorer_saved_panel(KvasirExplorerSavedPanel::UsageRollupsOverview)?,
+                client.run_explorer_query(query)?,
+                client.run_explorer_saved_panel(saved_panel_run)?,
+                client.usage_rollup_explorer_panel(panel_request)?,
+            ))
+        })
+        .await??;
+
+    assert_eq!(
+        catalog.datasets,
+        vec![KvasirExplorerDatasetCatalog {
+            dataset: KvasirExplorerDataset::UsageRollups,
+            measures: vec![
+                KvasirExplorerMeasure::TotalTokens,
+                KvasirExplorerMeasure::CostUsd,
+            ],
+            dimensions: vec![
+                KvasirExplorerDimension::Day,
+                KvasirExplorerDimension::Repo,
+                KvasirExplorerDimension::Model,
+            ],
+            filters: vec![
+                KvasirExplorerDimension::Repo,
+                KvasirExplorerDimension::Model,
+                KvasirExplorerDimension::Harness,
+            ],
+            visualizations: vec![KvasirExplorerVisualization::Table],
+            default_measures: vec![
+                KvasirExplorerMeasure::TotalTokens,
+                KvasirExplorerMeasure::CostUsd,
+            ],
+            default_group_by: vec![
+                KvasirExplorerDimension::Day,
+                KvasirExplorerDimension::Repo,
+                KvasirExplorerDimension::Model,
+            ],
+            default_visualization: KvasirExplorerVisualization::Table,
+            default_limit: 50,
+            max_limit: 500,
+            max_grouping_depth: 3,
+        }]
+    );
+    assert_eq!(
+        catalog.saved_panels,
+        vec![KvasirExplorerSavedPanelDefinition {
+            panel: KvasirExplorerSavedPanel::UsageRollupsOverview,
+            dataset: KvasirExplorerDataset::UsageRollups,
+            measures: vec![
+                KvasirExplorerMeasure::TotalTokens,
+                KvasirExplorerMeasure::CostUsd,
+            ],
+            group_by: vec![
+                KvasirExplorerDimension::Day,
+                KvasirExplorerDimension::Repo,
+                KvasirExplorerDimension::Model,
+            ],
+            filters: Vec::new(),
+            visualization: KvasirExplorerVisualization::Table,
+            limit: 50,
+        }]
+    );
+    assert_eq!(saved_panel, catalog.saved_panels[0]);
+
+    assert_eq!(result.dataset, KvasirExplorerDataset::UsageRollups);
+    assert_eq!(result.visualization, KvasirExplorerVisualization::Table);
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(
+        result.rows[0].group,
+        vec![
+            KvasirExplorerGroupValue::Day {
+                value: KvasirRollupDay {
+                    year: 2026,
+                    month: 6,
+                    day: 20,
+                },
+            },
+            KvasirExplorerGroupValue::Repo {
+                value: kvasir_repo(),
+            },
+            KvasirExplorerGroupValue::Model {
+                value: model("claude-opus-4-20250514"),
+            },
+        ]
+    );
+    assert_eq!(result.rows[0].measures.total_tokens, Some(1_700));
+    assert_eq!(
+        result.rows[0].measures.cost_usd,
+        Some(KvasirCostUsd { nanos: 54_150_000 })
+    );
+    assert_eq!(
+        result.rows[0].measures.cost_source,
+        Some(KvasirCostSource::Estimated)
+    );
+
+    assert_eq!(result.rows[1].measures.total_tokens, Some(450));
+    assert_eq!(
+        result.rows[1].measures.cost_usd,
+        Some(KvasirCostUsd { nanos: 2_709_000 })
+    );
+    assert_eq!(result.rows[2].measures.total_tokens, Some(2_850));
+    assert_eq!(
+        result.rows[2].measures.cost_usd,
+        Some(KvasirCostUsd { nanos: 18_015_000 })
+    );
+    assert_eq!(saved_panel_result, result);
+    assert_eq!(panel_snapshot.panel, saved_panel);
+    assert_eq!(
+        panel_snapshot.query,
+        KvasirExplorerQuery {
+            dataset: KvasirExplorerDataset::UsageRollups,
+            time_range: KvasirExplorerTimeRange {
+                start: timestamp(2026, 6, 19),
+                end: timestamp(2026, 6, 22),
+            },
+            measures: vec![
+                KvasirExplorerMeasure::TotalTokens,
+                KvasirExplorerMeasure::CostUsd,
+            ],
+            group_by: vec![
+                KvasirExplorerDimension::Day,
+                KvasirExplorerDimension::Repo,
+                KvasirExplorerDimension::Model,
+            ],
+            filters: Vec::new(),
+            visualization: KvasirExplorerVisualization::Table,
+            limit: 50,
+        }
+    );
+    assert_eq!(panel_snapshot.result, result);
+    assert_eq!(
+        panel_snapshot.table.columns,
+        vec![
+            KvasirExplorerTableColumn::Dimension {
+                dimension: KvasirExplorerDimension::Day,
+            },
+            KvasirExplorerTableColumn::Dimension {
+                dimension: KvasirExplorerDimension::Repo,
+            },
+            KvasirExplorerTableColumn::Dimension {
+                dimension: KvasirExplorerDimension::Model,
+            },
+            KvasirExplorerTableColumn::TotalTokens,
+            KvasirExplorerTableColumn::CostUsd,
+            KvasirExplorerTableColumn::CostSource,
+        ]
+    );
+    assert_eq!(
+        panel_snapshot.table.rows[0].cells,
+        vec![
+            KvasirExplorerTableCell::Day {
+                value: KvasirRollupDay {
+                    year: 2026,
+                    month: 6,
+                    day: 20,
+                },
+            },
+            KvasirExplorerTableCell::Repo {
+                value: kvasir_repo(),
+            },
+            KvasirExplorerTableCell::Model {
+                value: model("claude-opus-4-20250514"),
+            },
+            KvasirExplorerTableCell::TotalTokens { value: 1_700 },
+            KvasirExplorerTableCell::CostUsd {
+                value: KvasirCostUsd { nanos: 54_150_000 },
+            },
+            KvasirExplorerTableCell::CostSource {
+                value: KvasirCostSource::Estimated,
+            },
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_rollup_explorer_panel_uses_supplied_saved_panel_and_runtime_filters()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/metrics", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(include_str!(
+            "../../kvasird/tests/fixtures/claude_token_usage_otlp.json"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let saved_panel = KvasirExplorerSavedPanelDefinition {
+        panel: KvasirExplorerSavedPanel::UsageRollupsOverview,
+        dataset: KvasirExplorerDataset::UsageRollups,
+        measures: vec![
+            KvasirExplorerMeasure::CostUsd,
+            KvasirExplorerMeasure::TotalTokens,
+        ],
+        group_by: vec![KvasirExplorerDimension::Day, KvasirExplorerDimension::Repo],
+        filters: vec![KvasirExplorerFilter::Model {
+            value: model("stale-model"),
+        }],
+        visualization: KvasirExplorerVisualization::Table,
+        limit: 25,
+    };
+    let filters = vec![KvasirExplorerFilter::Repo {
+        value: kvasir_repo(),
+    }];
+    let request = KvasirUsageRollupExplorerPanelRequest {
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        filters: filters.clone(),
+        saved_panel: Some(saved_panel),
+    };
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.usage_rollup_explorer_panel(request)
+    })
+    .await??;
+
+    assert_eq!(snapshot.panel.filters, filters);
+    assert_eq!(snapshot.query.filters, filters);
+    assert_eq!(
+        snapshot.query.measures,
+        vec![
+            KvasirExplorerMeasure::CostUsd,
+            KvasirExplorerMeasure::TotalTokens,
+        ]
+    );
+    assert_eq!(
+        snapshot.table.columns,
+        vec![
+            KvasirExplorerTableColumn::Dimension {
+                dimension: KvasirExplorerDimension::Day,
+            },
+            KvasirExplorerTableColumn::Dimension {
+                dimension: KvasirExplorerDimension::Repo,
+            },
+            KvasirExplorerTableColumn::CostUsd,
+            KvasirExplorerTableColumn::CostSource,
+            KvasirExplorerTableColumn::TotalTokens,
+        ]
+    );
+    assert_eq!(
+        snapshot.table.rows[0].cells,
+        vec![
+            KvasirExplorerTableCell::Day {
+                value: KvasirRollupDay {
+                    year: 2026,
+                    month: 6,
+                    day: 20,
+                },
+            },
+            KvasirExplorerTableCell::Repo {
+                value: kvasir_repo(),
+            },
+            KvasirExplorerTableCell::CostUsd {
+                value: KvasirCostUsd { nanos: 56_859_000 },
+            },
+            KvasirExplorerTableCell::CostSource {
+                value: KvasirCostSource::Estimated,
+            },
+            KvasirExplorerTableCell::TotalTokens { value: 2_150 },
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_rollup_explorer_panel_preserves_typed_panel_validation_errors() -> anyhow::Result<()>
+{
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    let request = KvasirUsageRollupExplorerPanelRequest {
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        filters: Vec::new(),
+        saved_panel: Some(KvasirExplorerSavedPanelDefinition {
+            panel: KvasirExplorerSavedPanel::UsageRollupsOverview,
+            dataset: KvasirExplorerDataset::UsageRollups,
+            measures: vec![KvasirExplorerMeasure::TotalTokens],
+            group_by: vec![KvasirExplorerDimension::Day],
+            filters: Vec::new(),
+            visualization: KvasirExplorerVisualization::LineChart,
+            limit: 0,
+        }),
+    };
+    let error = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        Ok::<_, KvasirClientError>(
+            client
+                .usage_rollup_explorer_panel(request)
+                .expect_err("invalid saved panel should fail validation"),
+        )
+    })
+    .await??;
+
+    assert_eq!(
+        error,
+        KvasirClientError::ExplorerValidation {
+            errors: vec![
+                KvasirExplorerValidationError::UnsupportedVisualization {
+                    visualization: KvasirExplorerVisualization::LineChart,
+                },
+                KvasirExplorerValidationError::InvalidLimit {
+                    requested: 0,
+                    max: 500,
+                },
+            ],
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_rollup_explorer_panel_preserves_catalog_validation_errors_from_rpc_catalog()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let missing_socket_path = temp.path().join("missing-catalog.sock");
+    let missing_server = start_scripted_rpc_server(
+        missing_socket_path.clone(),
+        vec![RpcResponse::ExplorerCatalog {
+            catalog: CoreExplorerCatalog {
+                datasets: Vec::new(),
+                saved_panels: Vec::new(),
+            },
+        }],
+    )?;
+    let missing_error = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(missing_socket_path))?;
+        Ok::<_, KvasirClientError>(
+            client
+                .usage_rollup_explorer_panel(valid_panel_request())
+                .expect_err("missing catalog entries should fail validation"),
+        )
+    })
+    .await??;
+    missing_server.join().expect("scripted server panicked")?;
+    assert_eq!(
+        missing_error,
+        KvasirClientError::ExplorerValidation {
+            errors: vec![
+                KvasirExplorerValidationError::UnsupportedSavedPanel {
+                    panel: KvasirExplorerSavedPanel::UsageRollupsOverview,
+                },
+                KvasirExplorerValidationError::UnsupportedDataset {
+                    dataset: KvasirExplorerDataset::UsageRollups,
+                },
+            ],
+        }
+    );
+
+    let no_measure_socket_path = temp.path().join("no-measure-catalog.sock");
+    let no_measure_server = start_scripted_rpc_server(
+        no_measure_socket_path.clone(),
+        vec![RpcResponse::ExplorerCatalog {
+            catalog: CoreExplorerCatalog {
+                datasets: vec![core_usage_rollup_catalog_with_measures(Vec::new())],
+                saved_panels: vec![core_usage_rollup_saved_panel()],
+            },
+        }],
+    )?;
+    let no_measure_error = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(no_measure_socket_path))?;
+        Ok::<_, KvasirClientError>(
+            client
+                .usage_rollup_explorer_panel(valid_panel_request())
+                .expect_err("unsupported catalog measures should fail validation"),
+        )
+    })
+    .await??;
+    no_measure_server
+        .join()
+        .expect("scripted server panicked")?;
+    assert_eq!(
+        no_measure_error,
+        KvasirClientError::ExplorerValidation {
+            errors: vec![
+                KvasirExplorerValidationError::UnsupportedMeasure {
+                    measure: KvasirExplorerMeasure::TotalTokens,
+                },
+                KvasirExplorerValidationError::UnsupportedMeasure {
+                    measure: KvasirExplorerMeasure::CostUsd,
+                },
+            ],
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_rollup_explorer_panel_preserves_empty_typed_table_cells_from_rpc_result()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("empty-cells.sock");
+    let day = kvasir_core::rpc::RollupDay::parse("2026-06-20")?;
+    let repo = core_repo();
+    let server = start_scripted_rpc_server(
+        rpc_socket_path.clone(),
+        vec![
+            RpcResponse::ExplorerCatalog {
+                catalog: CoreExplorerCatalog {
+                    datasets: vec![core_usage_rollup_catalog_with_measures(vec![
+                        ExplorerMeasure::TotalTokens,
+                        ExplorerMeasure::CostUsd,
+                    ])],
+                    saved_panels: vec![core_usage_rollup_saved_panel()],
+                },
+            },
+            RpcResponse::ExplorerQuery {
+                result: ExplorerQueryResult {
+                    dataset: ExplorerDataset::UsageRollups,
+                    visualization: ExplorerVisualization::Table,
+                    rows: vec![ExplorerResultRow {
+                        group: vec![
+                            kvasir_core::explorer::ExplorerGroupValue::Day(day),
+                            kvasir_core::explorer::ExplorerGroupValue::Repo(repo),
+                        ],
+                        measures: CoreUsageRollupExplorerMeasures {
+                            total_tokens: None,
+                            cost_usd: None,
+                            cost_source: None,
+                        },
+                    }],
+                },
+            },
+        ],
+    )?;
+
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        client.usage_rollup_explorer_panel(valid_panel_request())
+    })
+    .await??;
+    server.join().expect("scripted server panicked")?;
+
+    assert_eq!(
+        snapshot.table.rows[0].cells,
+        vec![
+            KvasirExplorerTableCell::Day {
+                value: KvasirRollupDay {
+                    year: 2026,
+                    month: 6,
+                    day: 20,
+                },
+            },
+            KvasirExplorerTableCell::Repo {
+                value: kvasir_repo(),
+            },
+            KvasirExplorerTableCell::EmptyTotalTokens,
+            KvasirExplorerTableCell::EmptyCostUsd,
+            KvasirExplorerTableCell::EmptyCostSource,
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_returns_typed_validation_errors_for_unsupported_explorer_query()
+-> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    let request = serde_json::to_string(&RpcRequest::ExplorerQuery {
+        query: ExplorerQuery {
+            dataset: ExplorerDataset::UsageRollups,
+            time_range: ExplorerTimeRange {
+                start: kvasir_core::rpc::TimestampMillis::from_millis(timestamp(2026, 6, 19).value),
+                end: kvasir_core::rpc::TimestampMillis::from_millis(timestamp(2026, 6, 22).value),
+            },
+            measures: vec![ExplorerMeasure::TotalTokens],
+            group_by: vec![ExplorerDimension::Harness],
+            filters: Vec::new(),
+            visualization: ExplorerVisualization::Table,
+            limit: 10,
+        },
+    })?;
+
+    let response =
+        tokio::task::spawn_blocking(move || raw_rpc_request(&rpc_socket_path, &request)).await??;
+
+    assert_eq!(
+        response,
+        RpcResponse::Error {
+            error: kvasir_core::rpc::RpcError::ExplorerValidation {
+                errors: vec![ExplorerValidationError::UnsupportedDimension {
+                    dimension: ExplorerDimension::Harness,
+                }],
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_preserves_typed_explorer_validation_errors() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_with_store_key_source(
+        DaemonConfig {
+            otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            rpc_socket_path: rpc_socket_path.clone(),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::new("test-token"),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::keep_forever(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        },
+        StoreKeySource::static_key_for_test([11; 32]),
+    )
+    .await?;
+
+    let query = KvasirExplorerQuery {
+        dataset: KvasirExplorerDataset::UsageRollups,
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        measures: vec![KvasirExplorerMeasure::TotalTokens],
+        group_by: vec![KvasirExplorerDimension::Harness],
+        filters: Vec::new(),
+        visualization: KvasirExplorerVisualization::Table,
+        limit: 10,
+    };
+    let error = tokio::task::spawn_blocking(move || {
+        let client = KvasirClient::connect(socket_path(rpc_socket_path))?;
+        Ok::<_, KvasirClientError>(
+            client
+                .run_explorer_query(query)
+                .expect_err("unsupported grouping should fail validation"),
+        )
+    })
+    .await??;
+
+    assert_eq!(
+        error,
+        KvasirClientError::ExplorerValidation {
+            errors: vec![KvasirExplorerValidationError::UnsupportedDimension {
+                dimension: KvasirExplorerDimension::Harness,
+            }],
+        }
     );
 
     Ok(())
@@ -2847,6 +3527,91 @@ fn kvasir_repo() -> KvasirRepoBucket {
         name: Some(KvasirRepoName::try_from("kvasir".to_owned()).unwrap()),
         path: Some(KvasirRepoPath::try_from("/Users/oyr/projects/kvasir".to_owned()).unwrap()),
     }
+}
+
+fn core_repo() -> RepoBucket {
+    RepoBucket::repo(RepoIdentity::new(
+        CoreRepoName::new("kvasir"),
+        CoreRepoPath::new("/Users/oyr/projects/kvasir"),
+    ))
+}
+
+fn valid_panel_request() -> KvasirUsageRollupExplorerPanelRequest {
+    KvasirUsageRollupExplorerPanelRequest {
+        time_range: KvasirExplorerTimeRange {
+            start: timestamp(2026, 6, 19),
+            end: timestamp(2026, 6, 22),
+        },
+        filters: Vec::new(),
+        saved_panel: Some(KvasirExplorerSavedPanelDefinition {
+            panel: KvasirExplorerSavedPanel::UsageRollupsOverview,
+            dataset: KvasirExplorerDataset::UsageRollups,
+            measures: vec![
+                KvasirExplorerMeasure::TotalTokens,
+                KvasirExplorerMeasure::CostUsd,
+            ],
+            group_by: vec![KvasirExplorerDimension::Day, KvasirExplorerDimension::Repo],
+            filters: Vec::new(),
+            visualization: KvasirExplorerVisualization::Table,
+            limit: 50,
+        }),
+    }
+}
+
+fn core_usage_rollup_saved_panel() -> CoreExplorerSavedPanelDefinition {
+    CoreExplorerSavedPanelDefinition {
+        panel: CoreExplorerSavedPanel::UsageRollupsOverview,
+        dataset: ExplorerDataset::UsageRollups,
+        measures: vec![ExplorerMeasure::TotalTokens, ExplorerMeasure::CostUsd],
+        group_by: vec![ExplorerDimension::Day, ExplorerDimension::Repo],
+        filters: Vec::new(),
+        visualization: ExplorerVisualization::Table,
+        limit: 50,
+    }
+}
+
+fn core_usage_rollup_catalog_with_measures(
+    measures: Vec<ExplorerMeasure>,
+) -> ExplorerDatasetCatalog {
+    ExplorerDatasetCatalog {
+        dataset: ExplorerDataset::UsageRollups,
+        measures,
+        dimensions: vec![
+            ExplorerDimension::Day,
+            ExplorerDimension::Repo,
+            ExplorerDimension::Model,
+        ],
+        filters: vec![
+            ExplorerDimension::Repo,
+            ExplorerDimension::Model,
+            ExplorerDimension::Harness,
+        ],
+        visualizations: vec![ExplorerVisualization::Table],
+        default_measures: Vec::new(),
+        default_group_by: Vec::new(),
+        default_visualization: ExplorerVisualization::Table,
+        default_limit: 50,
+        max_limit: 500,
+        max_grouping_depth: 3,
+    }
+}
+
+fn start_scripted_rpc_server(
+    socket_path: std::path::PathBuf,
+    responses: Vec<RpcResponse>,
+) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _addr) = listener.accept()?;
+            let mut request = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut request)?;
+            let mut payload = serde_json::to_vec(&response)?;
+            payload.push(b'\n');
+            stream.write_all(&payload)?;
+        }
+        Ok(())
+    }))
 }
 
 fn socket_path(path: std::path::PathBuf) -> KvasirSocketPath {

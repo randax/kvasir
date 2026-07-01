@@ -94,6 +94,11 @@ struct OverviewScreen: View {
                         costDisplay: costPresentation.total,
                         showsToolCalls: snapshot.selectedModel == nil
                     )
+                    if let usageRollupExplorerPanel = model.usageRollupExplorerPanel {
+                        usageRollupExplorerDashboard(usageRollupExplorerPanel.table)
+                    } else if let usageRollupExplorerErrorMessage = model.usageRollupExplorerErrorMessage {
+                        warningBanner(usageRollupExplorerErrorMessage)
+                    }
                     repoDashboard(snapshot.repoBreakdown, showsToolCalls: snapshot.selectedModel == nil)
                     modelDashboard(snapshot.modelBreakdown)
                     harnessDashboard(
@@ -208,6 +213,62 @@ struct OverviewScreen: View {
             )
             if showsToolCalls {
                 TotalTile(title: "Tool calls", value: totals.toolCalls.formatted(), systemImage: "hammer")
+            }
+        }
+    }
+
+    private func usageRollupExplorerDashboard(_ table: ExplorerTablePresentation) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Text("Usage rollups")
+                    .font(.headline)
+                Spacer()
+            }
+
+            if table.rows.isEmpty {
+                Text("No usage rollups")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+                    )
+            } else {
+                ScrollView(.horizontal) {
+                    Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                        GridRow {
+                            ForEach(Array(table.columns.enumerated()), id: \.offset) { _, column in
+                                Text(column.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .frame(minWidth: 96, alignment: .leading)
+                            }
+                        }
+
+                        ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
+                            GridRow {
+                                ForEach(Array(row.cells.enumerated()), id: \.offset) { _, cell in
+                                    Text(cell.displayText)
+                                        .font(.callout.monospacedDigit())
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                        .frame(minWidth: 96, alignment: .leading)
+                                }
+                            }
+                        }
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(12)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color(nsColor: .separatorColor).opacity(0.35))
+                )
             }
         }
     }
@@ -1409,6 +1470,75 @@ private extension OverviewRollupDay {
     var shortLabel: String {
         "\(month)/\(day)"
     }
+
+    var tableLabel: String {
+        String(format: "%04d-%02d-%02d", year, month, day)
+    }
+}
+
+private extension ExplorerTableColumn {
+    var title: String {
+        switch self {
+        case .dimension(let dimension):
+            return dimension.title
+        case .totalTokens:
+            return "Tokens"
+        case .costUsd:
+            return "Cost"
+        case .costSource:
+            return "Source"
+        }
+    }
+}
+
+private extension ExplorerDimension {
+    var title: String {
+        switch self {
+        case .day:
+            return "Day"
+        case .repo:
+            return "Repo"
+        case .model:
+            return "Model"
+        case .harness:
+            return "Harness"
+        }
+    }
+}
+
+private extension ExplorerTableCell {
+    var displayText: String {
+        switch self {
+        case .day(let day):
+            return day.tableLabel
+        case .repo(let repo):
+            return repo.displayName
+        case .model(let model):
+            return model.displayName()
+        case .harness(let harness):
+            return harness.displayName()
+        case .totalTokens(let value):
+            return groupedDecimal(value)
+        case .emptyTotalTokens, .emptyCostUsd, .emptyCostSource:
+            return ""
+        case .costUsd(let nanos):
+            return String(format: "$%.3f", Double(nanos) / 1_000_000_000)
+        case .costSource(let source):
+            return source.estimateLabel ?? ""
+        }
+    }
+}
+
+private func groupedDecimal(_ value: UInt64) -> String {
+    let digits = Array(String(value).reversed())
+    var grouped: [Character] = []
+    for (index, digit) in digits.enumerated() {
+        if index > 0, index.isMultiple(of: 3) {
+            grouped.append(",")
+        }
+        grouped.append(digit)
+    }
+    return String(grouped.reversed())
 }
 
 private extension OverviewRepoBucket {

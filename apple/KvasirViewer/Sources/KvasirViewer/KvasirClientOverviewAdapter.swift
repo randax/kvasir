@@ -3,7 +3,7 @@ import Foundation
 import kvasir_client
 import KvasirViewerCore
 
-struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource {
+struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource, UsageRollupExplorerClient {
     let socketPath: String
     let setupConfig: HarnessTelemetrySetupConfig
 
@@ -12,6 +12,25 @@ struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource {
             let client = try KvasirClient.connect(socketPath: socketPath)
             return try overviewSnapshotFromKvasir(
                 client.overviewSnapshot(query: kvasirRollupQuery(from: query))
+            )
+        }.value
+    }
+
+    func loadUsageRollupExplorerPanel(
+        range: OverviewTimeRange,
+        filters: [ExplorerFilter],
+        savedPanel: ExplorerSavedPanelDefinition?
+    ) async throws -> UsageRollupExplorerPanelSnapshot {
+        try await Task.detached(priority: .userInitiated) { [self] in
+            let client = try KvasirClient.connect(socketPath: socketPath)
+            return usageRollupExplorerPanelSnapshotFromKvasir(
+                try client.usageRollupExplorerPanel(
+                    request: try kvasirUsageRollupExplorerPanelRequest(
+                        range: range,
+                        filters: filters,
+                        savedPanel: savedPanel
+                    )
+                )
             )
         }.value
     }
@@ -117,6 +136,49 @@ func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
 
 func overviewSnapshotFromKvasir(_ snapshot: KvasirOverviewSnapshot) -> OverviewSnapshot {
     snapshot.overviewSnapshot
+}
+
+func usageRollupExplorerPanelSnapshotFromKvasir(
+    _ snapshot: KvasirUsageRollupExplorerPanelSnapshot
+) -> UsageRollupExplorerPanelSnapshot {
+    snapshot.usageRollupExplorerPanelSnapshot
+}
+
+func kvasirUsageRollupExplorerPanelRequest(
+    range: OverviewTimeRange,
+    filters: [ExplorerFilter],
+    savedPanel: ExplorerSavedPanelDefinition?
+) throws -> KvasirUsageRollupExplorerPanelRequest {
+    KvasirUsageRollupExplorerPanelRequest(
+        timeRange: KvasirExplorerTimeRange(
+            start: try kvasirTimestampMillis(from: range.start),
+            end: try kvasirTimestampMillis(from: range.end)
+        ),
+        filters: filters.map(\.kvasirExplorerFilter),
+        savedPanel: savedPanel?.kvasirExplorerSavedPanelDefinition
+    )
+}
+
+func kvasirTimestampMillis(from date: Date) throws -> KvasirTimestampMillis {
+    let millis = date.timeIntervalSince1970 * 1_000
+    guard millis.isFinite,
+          millis >= Double(Int64.min),
+          millis <= Double(Int64.max)
+    else {
+        throw KvasirClientOverviewAdapterConversionError.invalidTimestamp
+    }
+    return KvasirTimestampMillis(value: Int64(millis))
+}
+
+enum KvasirClientOverviewAdapterConversionError: LocalizedError {
+    case invalidTimestamp
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidTimestamp:
+            return "Usage rollups explorer timestamp is invalid"
+        }
+    }
 }
 
 func traceInspectorSnapshotFromKvasir(
@@ -232,6 +294,299 @@ private extension KvasirOverviewPromptRoute {
             session: session.overviewSessionRoute,
             promptID: OverviewPromptID(promptId)
         )
+    }
+}
+
+private extension KvasirExplorerSavedPanelDefinition {
+    var explorerSavedPanelDefinition: ExplorerSavedPanelDefinition {
+        ExplorerSavedPanelDefinition(
+            panel: panel.explorerSavedPanel,
+            dataset: dataset.explorerDataset,
+            measures: measures.map(\.explorerMeasure),
+            groupBy: groupBy.map(\.explorerDimension),
+            filters: filters.map(\.explorerFilter),
+            visualization: visualization.explorerVisualization,
+            limit: limit
+        )
+    }
+}
+
+private extension ExplorerSavedPanelDefinition {
+    var kvasirExplorerSavedPanelDefinition: KvasirExplorerSavedPanelDefinition {
+        KvasirExplorerSavedPanelDefinition(
+            panel: panel.kvasirExplorerSavedPanel,
+            dataset: dataset.kvasirExplorerDataset,
+            measures: measures.map(\.kvasirExplorerMeasure),
+            groupBy: groupBy.map(\.kvasirExplorerDimension),
+            filters: filters.map(\.kvasirExplorerFilter),
+            visualization: visualization.kvasirExplorerVisualization,
+            limit: limit
+        )
+    }
+}
+
+private extension KvasirUsageRollupExplorerPanelSnapshot {
+    var usageRollupExplorerPanelSnapshot: UsageRollupExplorerPanelSnapshot {
+        UsageRollupExplorerPanelSnapshot(
+            panel: panel.explorerSavedPanelDefinition,
+            query: query.explorerQuery,
+            result: result.explorerResult,
+            table: table.explorerTablePresentation
+        )
+    }
+}
+
+private extension KvasirExplorerQuery {
+    var explorerQuery: ExplorerQuery {
+        ExplorerQuery(
+            dataset: dataset.explorerDataset,
+            timeRange: ExplorerTimeRange(
+                start: Date(timeIntervalSince1970: TimeInterval(timeRange.start.value) / 1_000),
+                end: Date(timeIntervalSince1970: TimeInterval(timeRange.end.value) / 1_000)
+            ),
+            measures: measures.map(\.explorerMeasure),
+            groupBy: groupBy.map(\.explorerDimension),
+            filters: filters.map(\.explorerFilter),
+            visualization: visualization.explorerVisualization,
+            limit: limit
+        )
+    }
+}
+
+private extension KvasirExplorerResult {
+    var explorerResult: ExplorerResult {
+        ExplorerResult(
+            dataset: dataset.explorerDataset,
+            visualization: visualization.explorerVisualization,
+            rows: rows.map(\.explorerResultRow)
+        )
+    }
+}
+
+private extension KvasirExplorerResultRow {
+    var explorerResultRow: ExplorerResultRow {
+        ExplorerResultRow(
+            group: group.map(\.explorerGroupValue),
+            measures: measures.usageRollupExplorerMeasures
+        )
+    }
+}
+
+private extension KvasirUsageRollupExplorerMeasures {
+    var usageRollupExplorerMeasures: UsageRollupExplorerMeasures {
+        UsageRollupExplorerMeasures(
+            totalTokens: totalTokens,
+            costUsdNanos: costUsd?.nanos,
+            costSource: costSource?.overviewCostSource
+        )
+    }
+}
+
+private extension KvasirExplorerTablePresentation {
+    var explorerTablePresentation: ExplorerTablePresentation {
+        ExplorerTablePresentation(
+            columns: columns.map(\.explorerTableColumn),
+            rows: rows.map(\.explorerTableRowPresentation)
+        )
+    }
+}
+
+private extension KvasirExplorerTableRowPresentation {
+    var explorerTableRowPresentation: ExplorerTableRowPresentation {
+        ExplorerTableRowPresentation(cells: cells.map(\.explorerTableCell))
+    }
+}
+
+private extension KvasirExplorerTableColumn {
+    var explorerTableColumn: ExplorerTableColumn {
+        switch self {
+        case .dimension(let dimension):
+            return .dimension(dimension.explorerDimension)
+        case .totalTokens:
+            return .totalTokens
+        case .costUsd:
+            return .costUsd
+        case .costSource:
+            return .costSource
+        }
+    }
+}
+
+private extension KvasirExplorerTableCell {
+    var explorerTableCell: ExplorerTableCell {
+        switch self {
+        case .day(let value):
+            return .day(value.overviewDay)
+        case .repo(let value):
+            return .repo(value.overviewRepo)
+        case .model(let value):
+            return .model(OverviewModelName(value))
+        case .harness(let value):
+            return .harness(OverviewHarnessName(value))
+        case .totalTokens(let value):
+            return .totalTokens(value)
+        case .emptyTotalTokens:
+            return .emptyTotalTokens
+        case .costUsd(let value):
+            return .costUsd(value.nanos)
+        case .emptyCostUsd:
+            return .emptyCostUsd
+        case .costSource(let value):
+            return .costSource(value.overviewCostSource)
+        case .emptyCostSource:
+            return .emptyCostSource
+        }
+    }
+}
+
+private extension KvasirExplorerFilter {
+    var explorerFilter: ExplorerFilter {
+        switch self {
+        case .repo(let value):
+            return .repo(value.overviewRepo)
+        case .model(let value):
+            return .model(OverviewModelName(value))
+        case .harness(let value):
+            return .harness(OverviewHarnessName(value))
+        }
+    }
+}
+
+private extension KvasirExplorerGroupValue {
+    var explorerGroupValue: ExplorerGroupValue {
+        switch self {
+        case .day(let value):
+            return .day(value.overviewDay)
+        case .repo(let value):
+            return .repo(value.overviewRepo)
+        case .model(let value):
+            return .model(OverviewModelName(value))
+        case .harness(let value):
+            return .harness(OverviewHarnessName(value))
+        }
+    }
+}
+
+private extension KvasirExplorerSavedPanel {
+    var explorerSavedPanel: ExplorerSavedPanel {
+        switch self {
+        case .usageRollupsOverview:
+            return .usageRollupsOverview
+        }
+    }
+}
+
+private extension ExplorerSavedPanel {
+    var kvasirExplorerSavedPanel: KvasirExplorerSavedPanel {
+        switch self {
+        case .usageRollupsOverview:
+            return .usageRollupsOverview
+        }
+    }
+}
+
+private extension KvasirExplorerDataset {
+    var explorerDataset: ExplorerDataset {
+        switch self {
+        case .usageRollups:
+            return .usageRollups
+        }
+    }
+}
+
+private extension ExplorerDataset {
+    var kvasirExplorerDataset: KvasirExplorerDataset {
+        switch self {
+        case .usageRollups:
+            return .usageRollups
+        }
+    }
+}
+
+private extension KvasirExplorerMeasure {
+    var explorerMeasure: ExplorerMeasure {
+        switch self {
+        case .totalTokens:
+            return .totalTokens
+        case .costUsd:
+            return .costUsd
+        }
+    }
+}
+
+private extension ExplorerMeasure {
+    var kvasirExplorerMeasure: KvasirExplorerMeasure {
+        switch self {
+        case .totalTokens:
+            return .totalTokens
+        case .costUsd:
+            return .costUsd
+        }
+    }
+}
+
+private extension KvasirExplorerDimension {
+    var explorerDimension: ExplorerDimension {
+        switch self {
+        case .day:
+            return .day
+        case .repo:
+            return .repo
+        case .model:
+            return .model
+        case .harness:
+            return .harness
+        }
+    }
+}
+
+private extension ExplorerDimension {
+    var kvasirExplorerDimension: KvasirExplorerDimension {
+        switch self {
+        case .day:
+            return .day
+        case .repo:
+            return .repo
+        case .model:
+            return .model
+        case .harness:
+            return .harness
+        }
+    }
+}
+
+private extension KvasirExplorerVisualization {
+    var explorerVisualization: ExplorerVisualization {
+        switch self {
+        case .table:
+            return .table
+        case .lineChart:
+            return .lineChart
+        }
+    }
+}
+
+private extension ExplorerVisualization {
+    var kvasirExplorerVisualization: KvasirExplorerVisualization {
+        switch self {
+        case .table:
+            return .table
+        case .lineChart:
+            return .lineChart
+        }
+    }
+}
+
+private extension ExplorerFilter {
+    var kvasirExplorerFilter: KvasirExplorerFilter {
+        switch self {
+        case .repo(let value):
+            return .repo(value: value.kvasirRepoBucket ?? KvasirRepoBucket(kind: .noRepo, name: nil, path: nil))
+        case .model(let value):
+            return .model(value: value.displayName())
+        case .harness(let value):
+            return .harness(value: value.displayName())
+        }
     }
 }
 

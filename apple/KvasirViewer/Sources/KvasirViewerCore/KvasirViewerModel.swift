@@ -68,9 +68,12 @@ public enum OverviewRangePreset: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var overviewSnapshot: OverviewSnapshot?
+    @Published public private(set) var usageRollupExplorerPanel: UsageRollupExplorerPanelSnapshot?
+    @Published public private(set) var usageRollupExplorerSavedPanel: ExplorerSavedPanelDefinition?
     @Published public private(set) var traceInspectorSnapshot: TraceInspectorSnapshot?
     @Published public private(set) var launchAgentOutcome: LaunchAgentRegistrationOutcome?
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var usageRollupExplorerErrorMessage: String?
     @Published public private(set) var traceInspectorErrorMessage: String?
     @Published public private(set) var setupWarningMessage: String?
     @Published public private(set) var selectedRepo: OverviewRepoBucket?
@@ -89,6 +92,7 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     private let dashboard: OverviewDashboard
+    private let usageRollupExplorer: UsageRollupExplorer?
     private let traceInspector: TraceInspector?
     private let usageDataManagement: any UsageDataManagement
     private let telemetrySetup: any HarnessTelemetrySetup
@@ -103,6 +107,7 @@ public final class KvasirViewerModel: ObservableObject {
 
     public init(
         dashboard: OverviewDashboard,
+        usageRollupExplorer: UsageRollupExplorer? = nil,
         traceInspector: TraceInspector? = nil,
         usageDataManagement: any UsageDataManagement = UnavailableUsageDataManagement(),
         telemetrySetup: any HarnessTelemetrySetup = NoOpHarnessTelemetrySetup(),
@@ -114,6 +119,7 @@ public final class KvasirViewerModel: ObservableObject {
         calendar: Calendar = .kvasirRollupUTC
     ) {
         self.dashboard = dashboard
+        self.usageRollupExplorer = usageRollupExplorer
         self.traceInspector = traceInspector
         self.usageDataManagement = usageDataManagement
         self.telemetrySetup = telemetrySetup
@@ -232,6 +238,9 @@ public final class KvasirViewerModel: ObservableObject {
         selectedSession = nil
         selectedPrompt = nil
         overviewSnapshot = nil
+        usageRollupExplorerPanel = nil
+        usageRollupExplorerSavedPanel = nil
+        usageRollupExplorerErrorMessage = nil
         clearTraceInspector()
         do {
             try await refreshOverview(repo: nil, model: nil, harness: nil, session: nil, prompt: nil)
@@ -269,9 +278,10 @@ public final class KvasirViewerModel: ObservableObject {
     ) async throws {
         overviewLoadID += 1
         let loadID = overviewLoadID
+        let range = selectedRangePreset.range(containing: now(), calendar: calendar)
         do {
             let snapshot = try await dashboard.load(
-                range: selectedRangePreset.range(containing: now(), calendar: calendar),
+                range: range,
                 repo: repo,
                 model: model,
                 harness: harness,
@@ -285,12 +295,67 @@ public final class KvasirViewerModel: ObservableObject {
             overviewSnapshot = snapshot
             errorMessage = nil
             startLiveOverviewUpdatesIfNeeded()
+            await refreshUsageRollupExplorer(
+                range: range,
+                filters: usageRollupExplorerFilters(repo: repo, model: model, harness: harness),
+                loadID: loadID
+            )
         } catch {
             guard loadID == overviewLoadID else {
                 return
             }
             throw error
         }
+    }
+
+    private func refreshUsageRollupExplorer(
+        range: OverviewTimeRange,
+        filters: [ExplorerFilter],
+        loadID: UInt64
+    ) async {
+        guard let usageRollupExplorer else {
+            usageRollupExplorerPanel = nil
+            usageRollupExplorerSavedPanel = nil
+            usageRollupExplorerErrorMessage = nil
+            return
+        }
+        do {
+            let snapshot = try await usageRollupExplorer.load(
+                range: range,
+                filters: filters,
+                savedPanel: usageRollupExplorerSavedPanel
+            )
+            guard loadID == overviewLoadID else {
+                return
+            }
+            usageRollupExplorerSavedPanel = snapshot.panel
+            usageRollupExplorerPanel = snapshot
+            usageRollupExplorerErrorMessage = nil
+        } catch {
+            guard loadID == overviewLoadID else {
+                return
+            }
+            usageRollupExplorerPanel = nil
+            usageRollupExplorerErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func usageRollupExplorerFilters(
+        repo: OverviewRepoBucket?,
+        model: OverviewModelName?,
+        harness: OverviewHarnessName?
+    ) -> [ExplorerFilter] {
+        var filters: [ExplorerFilter] = []
+        if let repo {
+            filters.append(.repo(repo))
+        }
+        if let model {
+            filters.append(.model(model))
+        }
+        if let harness {
+            filters.append(.harness(harness))
+        }
+        return filters
     }
 
     public func record(error: any Error) {
