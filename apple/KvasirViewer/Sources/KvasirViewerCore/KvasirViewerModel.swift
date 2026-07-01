@@ -69,7 +69,7 @@ public enum OverviewRangePreset: String, CaseIterable, Identifiable, Sendable {
 public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var overviewSnapshot: OverviewSnapshot?
     @Published public private(set) var usageRollupExplorerPanel: UsageRollupExplorerPanelSnapshot?
-    @Published public private(set) var usageRollupExplorerSavedPanel: UsageRollupExplorerPanelState?
+    @Published public private(set) var usageRollupExplorerSavedPanel: ExplorerSavedPanelDefinition?
     @Published public private(set) var traceInspectorSnapshot: TraceInspectorSnapshot?
     @Published public private(set) var launchAgentOutcome: LaunchAgentRegistrationOutcome?
     @Published public private(set) var errorMessage: String?
@@ -320,18 +320,11 @@ public final class KvasirViewerModel: ObservableObject {
             return
         }
         do {
-            let snapshot: UsageRollupExplorerPanelSnapshot
-            if let savedPanel = usageRollupExplorerSavedPanel {
-                snapshot = try await usageRollupExplorer.load(
-                    panel: savedPanel.applying(filters: filters),
-                    range: range
-                )
-            } else {
-                snapshot = try await usageRollupExplorer.loadDefaultPanel(
-                    range: range,
-                    filters: filters
-                )
-            }
+            let snapshot = try await usageRollupExplorer.load(
+                range: range,
+                filters: filters,
+                savedPanel: usageRollupExplorerSavedPanel
+            )
             guard loadID == overviewLoadID else {
                 return
             }

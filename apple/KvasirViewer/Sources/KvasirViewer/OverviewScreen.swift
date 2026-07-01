@@ -241,7 +241,7 @@ struct OverviewScreen: View {
                     Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
                         GridRow {
                             ForEach(Array(table.columns.enumerated()), id: \.offset) { _, column in
-                                Text(column)
+                                Text(column.title)
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                     .frame(minWidth: 96, alignment: .leading)
@@ -251,7 +251,7 @@ struct OverviewScreen: View {
                         ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
                             GridRow {
                                 ForEach(Array(row.cells.enumerated()), id: \.offset) { _, cell in
-                                    Text(cell)
+                                    Text(cell.displayText)
                                         .font(.callout.monospacedDigit())
                                         .lineLimit(1)
                                         .truncationMode(.middle)
@@ -1470,6 +1470,75 @@ private extension OverviewRollupDay {
     var shortLabel: String {
         "\(month)/\(day)"
     }
+
+    var tableLabel: String {
+        String(format: "%04d-%02d-%02d", year, month, day)
+    }
+}
+
+private extension ExplorerTableColumn {
+    var title: String {
+        switch self {
+        case .dimension(let dimension):
+            return dimension.title
+        case .totalTokens:
+            return "Tokens"
+        case .costUsd:
+            return "Cost"
+        case .costSource:
+            return "Source"
+        }
+    }
+}
+
+private extension ExplorerDimension {
+    var title: String {
+        switch self {
+        case .day:
+            return "Day"
+        case .repo:
+            return "Repo"
+        case .model:
+            return "Model"
+        case .harness:
+            return "Harness"
+        }
+    }
+}
+
+private extension ExplorerTableCell {
+    var displayText: String {
+        switch self {
+        case .day(let day):
+            return day.tableLabel
+        case .repo(let repo):
+            return repo.displayName
+        case .model(let model):
+            return model.displayName()
+        case .harness(let harness):
+            return harness.displayName()
+        case .totalTokens(let value):
+            return groupedDecimal(value)
+        case .emptyTotalTokens, .emptyCostUsd, .emptyCostSource:
+            return ""
+        case .costUsd(let nanos):
+            return String(format: "$%.3f", Double(nanos) / 1_000_000_000)
+        case .costSource(let source):
+            return source.estimateLabel ?? ""
+        }
+    }
+}
+
+private func groupedDecimal(_ value: UInt64) -> String {
+    let digits = Array(String(value).reversed())
+    var grouped: [Character] = []
+    for (index, digit) in digits.enumerated() {
+        if index > 0, index.isMultiple(of: 3) {
+            grouped.append(",")
+        }
+        grouped.append(digit)
+    }
+    return String(grouped.reversed())
 }
 
 private extension OverviewRepoBucket {

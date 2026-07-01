@@ -16,36 +16,21 @@ struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource, Usa
         }.value
     }
 
-    func loadExplorerCatalog() async throws -> ExplorerCatalog {
+    func loadUsageRollupExplorerPanel(
+        range: OverviewTimeRange,
+        filters: [ExplorerFilter],
+        savedPanel: ExplorerSavedPanelDefinition?
+    ) async throws -> UsageRollupExplorerPanelSnapshot {
         try await Task.detached(priority: .userInitiated) { [self] in
             let client = try KvasirClient.connect(socketPath: socketPath)
-            return explorerCatalogFromKvasir(try client.explorerCatalog())
-        }.value
-    }
-
-    func loadExplorerSavedPanel(_ panel: ExplorerSavedPanel) async throws -> ExplorerSavedPanelDefinition {
-        try await Task.detached(priority: .userInitiated) { [self] in
-            let client = try KvasirClient.connect(socketPath: socketPath)
-            return explorerSavedPanelFromKvasir(
-                try client.explorerSavedPanel(panel: panel.kvasirExplorerSavedPanel)
-            )
-        }.value
-    }
-
-    func runExplorerQuery(_ query: ExplorerQuery) async throws -> ExplorerResult {
-        try await Task.detached(priority: .userInitiated) { [self] in
-            let client = try KvasirClient.connect(socketPath: socketPath)
-            return explorerResultFromKvasir(
-                try client.runExplorerQuery(query: kvasirExplorerQuery(from: query))
-            )
-        }.value
-    }
-
-    func runExplorerSavedPanel(_ run: ExplorerSavedPanelRun) async throws -> ExplorerResult {
-        try await Task.detached(priority: .userInitiated) { [self] in
-            let client = try KvasirClient.connect(socketPath: socketPath)
-            return explorerResultFromKvasir(
-                try client.runExplorerSavedPanel(run: kvasirExplorerSavedPanelRun(from: run))
+            return usageRollupExplorerPanelSnapshotFromKvasir(
+                try client.usageRollupExplorerPanel(
+                    request: try kvasirUsageRollupExplorerPanelRequest(
+                        range: range,
+                        filters: filters,
+                        savedPanel: savedPanel
+                    )
+                )
             )
         }.value
     }
@@ -153,49 +138,47 @@ func overviewSnapshotFromKvasir(_ snapshot: KvasirOverviewSnapshot) -> OverviewS
     snapshot.overviewSnapshot
 }
 
-func explorerCatalogFromKvasir(_ catalog: KvasirExplorerCatalog) -> ExplorerCatalog {
-    ExplorerCatalog(
-        datasets: catalog.datasets.map(\.explorerDatasetCatalog),
-        savedPanels: catalog.savedPanels.map(\.explorerSavedPanelDefinition)
-    )
+func usageRollupExplorerPanelSnapshotFromKvasir(
+    _ snapshot: KvasirUsageRollupExplorerPanelSnapshot
+) -> UsageRollupExplorerPanelSnapshot {
+    snapshot.usageRollupExplorerPanelSnapshot
 }
 
-func explorerSavedPanelFromKvasir(_ panel: KvasirExplorerSavedPanelDefinition) -> ExplorerSavedPanelDefinition {
-    panel.explorerSavedPanelDefinition
-}
-
-func explorerResultFromKvasir(_ result: KvasirExplorerResult) -> ExplorerResult {
-    ExplorerResult(
-        dataset: result.dataset.explorerDataset,
-        visualization: result.visualization.explorerVisualization,
-        rows: result.rows.map(\.explorerResultRow)
-    )
-}
-
-func kvasirExplorerQuery(from query: ExplorerQuery) -> KvasirExplorerQuery {
-    KvasirExplorerQuery(
-        dataset: query.dataset.kvasirExplorerDataset,
+func kvasirUsageRollupExplorerPanelRequest(
+    range: OverviewTimeRange,
+    filters: [ExplorerFilter],
+    savedPanel: ExplorerSavedPanelDefinition?
+) throws -> KvasirUsageRollupExplorerPanelRequest {
+    KvasirUsageRollupExplorerPanelRequest(
         timeRange: KvasirExplorerTimeRange(
-            start: KvasirTimestampMillis(value: Int64(query.timeRange.start.timeIntervalSince1970 * 1_000)),
-            end: KvasirTimestampMillis(value: Int64(query.timeRange.end.timeIntervalSince1970 * 1_000))
+            start: try kvasirTimestampMillis(from: range.start),
+            end: try kvasirTimestampMillis(from: range.end)
         ),
-        measures: query.measures.map(\.kvasirExplorerMeasure),
-        groupBy: query.groupBy.map(\.kvasirExplorerDimension),
-        filters: query.filters.map(\.kvasirExplorerFilter),
-        visualization: query.visualization.kvasirExplorerVisualization,
-        limit: query.limit
+        filters: filters.map(\.kvasirExplorerFilter),
+        savedPanel: savedPanel?.kvasirExplorerSavedPanelDefinition
     )
 }
 
-func kvasirExplorerSavedPanelRun(from run: ExplorerSavedPanelRun) -> KvasirExplorerSavedPanelRun {
-    KvasirExplorerSavedPanelRun(
-        panel: run.panel.kvasirExplorerSavedPanel,
-        timeRange: KvasirExplorerTimeRange(
-            start: KvasirTimestampMillis(value: Int64(run.timeRange.start.timeIntervalSince1970 * 1_000)),
-            end: KvasirTimestampMillis(value: Int64(run.timeRange.end.timeIntervalSince1970 * 1_000))
-        ),
-        filters: run.filters.map(\.kvasirExplorerFilter)
-    )
+func kvasirTimestampMillis(from date: Date) throws -> KvasirTimestampMillis {
+    let millis = date.timeIntervalSince1970 * 1_000
+    guard millis.isFinite,
+          millis >= Double(Int64.min),
+          millis <= Double(Int64.max)
+    else {
+        throw KvasirClientOverviewAdapterConversionError.invalidTimestamp
+    }
+    return KvasirTimestampMillis(value: Int64(millis))
+}
+
+enum KvasirClientOverviewAdapterConversionError: LocalizedError {
+    case invalidTimestamp
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidTimestamp:
+            return "Usage rollups explorer timestamp is invalid"
+        }
+    }
 }
 
 func traceInspectorSnapshotFromKvasir(
@@ -314,24 +297,6 @@ private extension KvasirOverviewPromptRoute {
     }
 }
 
-private extension KvasirExplorerDatasetCatalog {
-    var explorerDatasetCatalog: ExplorerDatasetCatalog {
-        ExplorerDatasetCatalog(
-            dataset: dataset.explorerDataset,
-            measures: measures.map(\.explorerMeasure),
-            dimensions: dimensions.map(\.explorerDimension),
-            filters: filters.map(\.explorerDimension),
-            visualizations: visualizations.map(\.explorerVisualization),
-            defaultMeasures: defaultMeasures.map(\.explorerMeasure),
-            defaultGroupBy: defaultGroupBy.map(\.explorerDimension),
-            defaultVisualization: defaultVisualization.explorerVisualization,
-            defaultLimit: defaultLimit,
-            maxLimit: maxLimit,
-            maxGroupingDepth: maxGroupingDepth
-        )
-    }
-}
-
 private extension KvasirExplorerSavedPanelDefinition {
     var explorerSavedPanelDefinition: ExplorerSavedPanelDefinition {
         ExplorerSavedPanelDefinition(
@@ -342,6 +307,58 @@ private extension KvasirExplorerSavedPanelDefinition {
             filters: filters.map(\.explorerFilter),
             visualization: visualization.explorerVisualization,
             limit: limit
+        )
+    }
+}
+
+private extension ExplorerSavedPanelDefinition {
+    var kvasirExplorerSavedPanelDefinition: KvasirExplorerSavedPanelDefinition {
+        KvasirExplorerSavedPanelDefinition(
+            panel: panel.kvasirExplorerSavedPanel,
+            dataset: dataset.kvasirExplorerDataset,
+            measures: measures.map(\.kvasirExplorerMeasure),
+            groupBy: groupBy.map(\.kvasirExplorerDimension),
+            filters: filters.map(\.kvasirExplorerFilter),
+            visualization: visualization.kvasirExplorerVisualization,
+            limit: limit
+        )
+    }
+}
+
+private extension KvasirUsageRollupExplorerPanelSnapshot {
+    var usageRollupExplorerPanelSnapshot: UsageRollupExplorerPanelSnapshot {
+        UsageRollupExplorerPanelSnapshot(
+            panel: panel.explorerSavedPanelDefinition,
+            query: query.explorerQuery,
+            result: result.explorerResult,
+            table: table.explorerTablePresentation
+        )
+    }
+}
+
+private extension KvasirExplorerQuery {
+    var explorerQuery: ExplorerQuery {
+        ExplorerQuery(
+            dataset: dataset.explorerDataset,
+            timeRange: ExplorerTimeRange(
+                start: Date(timeIntervalSince1970: TimeInterval(timeRange.start.value) / 1_000),
+                end: Date(timeIntervalSince1970: TimeInterval(timeRange.end.value) / 1_000)
+            ),
+            measures: measures.map(\.explorerMeasure),
+            groupBy: groupBy.map(\.explorerDimension),
+            filters: filters.map(\.explorerFilter),
+            visualization: visualization.explorerVisualization,
+            limit: limit
+        )
+    }
+}
+
+private extension KvasirExplorerResult {
+    var explorerResult: ExplorerResult {
+        ExplorerResult(
+            dataset: dataset.explorerDataset,
+            visualization: visualization.explorerVisualization,
+            rows: rows.map(\.explorerResultRow)
         )
     }
 }
@@ -362,6 +379,63 @@ private extension KvasirUsageRollupExplorerMeasures {
             costUsdNanos: costUsd?.nanos,
             costSource: costSource?.overviewCostSource
         )
+    }
+}
+
+private extension KvasirExplorerTablePresentation {
+    var explorerTablePresentation: ExplorerTablePresentation {
+        ExplorerTablePresentation(
+            columns: columns.map(\.explorerTableColumn),
+            rows: rows.map(\.explorerTableRowPresentation)
+        )
+    }
+}
+
+private extension KvasirExplorerTableRowPresentation {
+    var explorerTableRowPresentation: ExplorerTableRowPresentation {
+        ExplorerTableRowPresentation(cells: cells.map(\.explorerTableCell))
+    }
+}
+
+private extension KvasirExplorerTableColumn {
+    var explorerTableColumn: ExplorerTableColumn {
+        switch self {
+        case .dimension(let dimension):
+            return .dimension(dimension.explorerDimension)
+        case .totalTokens:
+            return .totalTokens
+        case .costUsd:
+            return .costUsd
+        case .costSource:
+            return .costSource
+        }
+    }
+}
+
+private extension KvasirExplorerTableCell {
+    var explorerTableCell: ExplorerTableCell {
+        switch self {
+        case .day(let value):
+            return .day(value.overviewDay)
+        case .repo(let value):
+            return .repo(value.overviewRepo)
+        case .model(let value):
+            return .model(OverviewModelName(value))
+        case .harness(let value):
+            return .harness(OverviewHarnessName(value))
+        case .totalTokens(let value):
+            return .totalTokens(value)
+        case .emptyTotalTokens:
+            return .emptyTotalTokens
+        case .costUsd(let value):
+            return .costUsd(value.nanos)
+        case .emptyCostUsd:
+            return .emptyCostUsd
+        case .costSource(let value):
+            return .costSource(value.overviewCostSource)
+        case .emptyCostSource:
+            return .emptyCostSource
+        }
     }
 }
 

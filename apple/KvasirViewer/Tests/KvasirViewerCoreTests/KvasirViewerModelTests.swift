@@ -42,13 +42,14 @@ func viewerStartupLoadsUsageRollupExplorerPanelForDefaultRange() async throws {
     let now = Date(timeIntervalSince1970: 1_782_259_200)
     let overviewClient = RecordingStartupOverviewClient(snapshot: overviewSnapshot(totalTokens: 35))
     let range = OverviewRangePreset.lastSevenDays.range(containing: now, calendar: calendar)
-    let expectedQuery = usageRollupExplorerQuery(range: range)
-    let expectedPanel = usageRollupExplorerPanel()
-    let result = usageRollupExplorerResult()
+    let expectedPanel = usageRollupExplorerSavedPanel()
+    let snapshot = usageRollupExplorerSnapshot(
+        range: range,
+        panel: expectedPanel,
+        filters: []
+    )
     let explorerClient = RecordingModelUsageRollupExplorerClient(
-        catalog: usageRollupExplorerCatalog(),
-        savedPanel: usageRollupExplorerSavedPanel(),
-        result: result
+        snapshot: snapshot
     )
     let model = KvasirViewerModel(
         dashboard: OverviewDashboard(client: overviewClient),
@@ -60,14 +61,14 @@ func viewerStartupLoadsUsageRollupExplorerPanelForDefaultRange() async throws {
 
     try await model.start()
 
-    #expect(explorerClient.loadedPanels == [.usageRollupsOverview])
-    #expect(explorerClient.queries == [expectedQuery])
-    #expect(explorerClient.savedPanelRuns.isEmpty)
-    #expect(model.usageRollupExplorerPanel == UsageRollupExplorerPanelSnapshot(
-        panel: expectedPanel,
-        query: expectedQuery,
-        result: result
-    ))
+    #expect(explorerClient.requests == [
+        RecordedModelUsageRollupExplorerPanelRequest(
+            range: range,
+            filters: [],
+            savedPanel: nil
+        )
+    ])
+    #expect(model.usageRollupExplorerPanel == snapshot)
     #expect(model.usageRollupExplorerSavedPanel == expectedPanel)
     #expect(model.usageRollupExplorerErrorMessage == nil)
 }
@@ -1322,37 +1323,31 @@ private final class RecordingTraceInspectorClient: TraceInspectorClient, @unchec
 }
 
 private final class RecordingModelUsageRollupExplorerClient: UsageRollupExplorerClient, @unchecked Sendable {
-    private let catalog: ExplorerCatalog
-    private let savedPanel: ExplorerSavedPanelDefinition
-    private let result: ExplorerResult
-    private(set) var loadedPanels: [ExplorerSavedPanel] = []
-    private(set) var savedPanelRuns: [ExplorerSavedPanelRun] = []
-    private(set) var queries: [ExplorerQuery] = []
+    private let snapshot: UsageRollupExplorerPanelSnapshot
+    private(set) var requests: [RecordedModelUsageRollupExplorerPanelRequest] = []
 
-    init(catalog: ExplorerCatalog, savedPanel: ExplorerSavedPanelDefinition, result: ExplorerResult) {
-        self.catalog = catalog
-        self.savedPanel = savedPanel
-        self.result = result
+    init(snapshot: UsageRollupExplorerPanelSnapshot) {
+        self.snapshot = snapshot
     }
 
-    func loadExplorerCatalog() async throws -> ExplorerCatalog {
-        catalog
+    func loadUsageRollupExplorerPanel(
+        range: OverviewTimeRange,
+        filters: [ExplorerFilter],
+        savedPanel: ExplorerSavedPanelDefinition?
+    ) async throws -> UsageRollupExplorerPanelSnapshot {
+        requests.append(RecordedModelUsageRollupExplorerPanelRequest(
+            range: range,
+            filters: filters,
+            savedPanel: savedPanel
+        ))
+        return snapshot
     }
+}
 
-    func loadExplorerSavedPanel(_ panel: ExplorerSavedPanel) async throws -> ExplorerSavedPanelDefinition {
-        loadedPanels.append(panel)
-        return savedPanel
-    }
-
-    func runExplorerQuery(_ query: ExplorerQuery) async throws -> ExplorerResult {
-        queries.append(query)
-        return result
-    }
-
-    func runExplorerSavedPanel(_ run: ExplorerSavedPanelRun) async throws -> ExplorerResult {
-        savedPanelRuns.append(run)
-        return result
-    }
+private struct RecordedModelUsageRollupExplorerPanelRequest: Equatable {
+    var range: OverviewTimeRange
+    var filters: [ExplorerFilter]
+    var savedPanel: ExplorerSavedPanelDefinition?
 }
 
 private final class RecordingUsageDataManagement: UsageDataManagement, @unchecked Sendable {
@@ -1645,44 +1640,6 @@ private enum StartupEvent: Equatable {
     case registeredLaunchAgent
 }
 
-private func usageRollupExplorerCatalog() -> ExplorerCatalog {
-    ExplorerCatalog(
-        datasets: [
-            ExplorerDatasetCatalog(
-                dataset: .usageRollups,
-                measures: [.totalTokens, .costUsd],
-                dimensions: [.day, .repo, .model],
-                filters: [.repo, .model, .harness],
-                visualizations: [.table],
-                defaultMeasures: [.totalTokens, .costUsd],
-                defaultGroupBy: [.day, .repo, .model],
-                defaultVisualization: .table,
-                defaultLimit: 50,
-                maxLimit: 500,
-                maxGroupingDepth: 3
-            )
-        ],
-        savedPanels: [usageRollupExplorerSavedPanel()]
-    )
-}
-
-private func usageRollupExplorerQuery(range: OverviewTimeRange) -> ExplorerQuery {
-    usageRollupExplorerPanel().query(range: range)
-}
-
-private func usageRollupExplorerPanel() -> UsageRollupExplorerPanelState {
-    UsageRollupExplorerPanelState(
-        savedPanel: .usageRollupsOverview,
-        title: "Usage rollups",
-        dataset: .usageRollups,
-        measures: [.totalTokens, .costUsd],
-        groupBy: [.day, .repo, .model],
-        filters: [],
-        visualization: .table,
-        limit: 50
-    )
-}
-
 private func usageRollupExplorerSavedPanel() -> ExplorerSavedPanelDefinition {
     ExplorerSavedPanelDefinition(
         panel: .usageRollupsOverview,
@@ -1692,6 +1649,51 @@ private func usageRollupExplorerSavedPanel() -> ExplorerSavedPanelDefinition {
         filters: [],
         visualization: .table,
         limit: 50
+    )
+}
+
+private func usageRollupExplorerSnapshot(
+    range: OverviewTimeRange,
+    panel: ExplorerSavedPanelDefinition,
+    filters: [ExplorerFilter]
+) -> UsageRollupExplorerPanelSnapshot {
+    UsageRollupExplorerPanelSnapshot(
+        panel: panel,
+        query: ExplorerQuery(
+            dataset: .usageRollups,
+            timeRange: ExplorerTimeRange(start: range.start, end: range.end),
+            measures: panel.measures,
+            groupBy: panel.groupBy,
+            filters: filters,
+            visualization: panel.visualization,
+            limit: panel.limit
+        ),
+        result: usageRollupExplorerResult(),
+        table: ExplorerTablePresentation(
+            columns: [
+                .dimension(.day),
+                .dimension(.repo),
+                .dimension(.model),
+                .totalTokens,
+                .costUsd,
+                .costSource,
+            ],
+            rows: [
+                ExplorerTableRowPresentation(
+                    cells: [
+                        .day(OverviewRollupDay(year: 2026, month: 6, day: 20)),
+                        .repo(.repo(OverviewRepoIdentity(
+                            name: OverviewRepoName("kvasir"),
+                            path: OverviewRepoPath("/repos/kvasir")
+                        )!)),
+                        .model(OverviewModelName("claude-opus-4-20250514")),
+                        .totalTokens(1_700),
+                        .costUsd(54_150_000),
+                        .costSource(.estimated),
+                    ]
+                )
+            ]
+        )
     )
 }
 

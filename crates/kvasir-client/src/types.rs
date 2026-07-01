@@ -411,9 +411,66 @@ pub struct KvasirUsageRollupExplorerMeasures {
     pub cost_source: Option<KvasirCostSource>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirUsageRollupExplorerPanelRequest {
+    pub time_range: KvasirExplorerTimeRange,
+    pub filters: Vec<KvasirExplorerFilter>,
+    pub saved_panel: Option<KvasirExplorerSavedPanelDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirUsageRollupExplorerPanelSnapshot {
+    pub panel: KvasirExplorerSavedPanelDefinition,
+    pub query: KvasirExplorerQuery,
+    pub result: KvasirExplorerResult,
+    pub table: KvasirExplorerTablePresentation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerTablePresentation {
+    pub columns: Vec<KvasirExplorerTableColumn>,
+    pub rows: Vec<KvasirExplorerTableRowPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerTableRowPresentation {
+    pub cells: Vec<KvasirExplorerTableCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerTableColumn {
+    Dimension { dimension: KvasirExplorerDimension },
+    TotalTokens,
+    CostUsd,
+    CostSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerTableCell {
+    Day { value: KvasirRollupDay },
+    Repo { value: KvasirRepoBucket },
+    Model { value: KvasirModelName },
+    Harness { value: KvasirHarnessName },
+    TotalTokens { value: u64 },
+    EmptyTotalTokens,
+    CostUsd { value: KvasirCostUsd },
+    EmptyCostUsd,
+    CostSource { value: KvasirCostSource },
+    EmptyCostSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum KvasirExplorerValidationError {
     EmptyMeasureSelection,
+    UnsupportedDataset {
+        dataset: KvasirExplorerDataset,
+    },
+    UnsupportedSavedPanel {
+        panel: KvasirExplorerSavedPanel,
+    },
+    UnsupportedMeasure {
+        measure: KvasirExplorerMeasure,
+    },
     UnsupportedDimension {
         dimension: KvasirExplorerDimension,
     },

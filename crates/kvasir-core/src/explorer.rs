@@ -144,6 +144,49 @@ pub struct UsageRollupExplorerMeasures {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageRollupExplorerPanelSnapshot {
+    pub panel: ExplorerSavedPanelDefinition,
+    pub query: ExplorerQuery,
+    pub result: ExplorerQueryResult,
+    pub table: ExplorerTablePresentation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplorerTablePresentation {
+    pub columns: Vec<ExplorerTableColumn>,
+    pub rows: Vec<ExplorerTableRowPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplorerTableRowPresentation {
+    pub cells: Vec<ExplorerTableCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExplorerTableColumn {
+    Dimension { dimension: ExplorerDimension },
+    TotalTokens,
+    CostUsd,
+    CostSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExplorerTableCell {
+    Day { value: RollupDay },
+    Repo { value: RepoBucket },
+    Model { value: ModelName },
+    Harness { value: HarnessName },
+    TotalTokens { value: u64 },
+    EmptyTotalTokens,
+    CostUsd { value: CostUsd },
+    EmptyCostUsd,
+    CostSource { value: CostSource },
+    EmptyCostSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplorerValidationErrors {
     pub errors: Vec<ExplorerValidationError>,
 }
@@ -152,6 +195,15 @@ pub struct ExplorerValidationErrors {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExplorerValidationError {
     EmptyMeasureSelection,
+    UnsupportedDataset {
+        dataset: ExplorerDataset,
+    },
+    UnsupportedSavedPanel {
+        panel: ExplorerSavedPanel,
+    },
+    UnsupportedMeasure {
+        measure: ExplorerMeasure,
+    },
     UnsupportedDimension {
         dimension: ExplorerDimension,
     },
@@ -236,6 +288,69 @@ pub fn explorer_query_for_saved_panel(run: ExplorerSavedPanelRun) -> ExplorerQue
     }
 }
 
+pub fn usage_rollup_explorer_query_for_panel(
+    catalog: &ExplorerCatalog,
+    mut panel: ExplorerSavedPanelDefinition,
+    time_range: ExplorerTimeRange,
+    filters: Vec<ExplorerFilter>,
+) -> Result<(ExplorerSavedPanelDefinition, ExplorerQuery), ExplorerValidationErrors> {
+    panel.filters = filters;
+
+    let mut errors = Vec::new();
+    if !catalog
+        .saved_panels
+        .iter()
+        .any(|saved_panel| saved_panel.panel == panel.panel)
+    {
+        errors.push(ExplorerValidationError::UnsupportedSavedPanel { panel: panel.panel });
+    }
+
+    if let Some(dataset) = catalog
+        .datasets
+        .iter()
+        .find(|dataset| dataset.dataset == panel.dataset)
+    {
+        errors.extend(validate_panel_against_dataset(&panel, dataset));
+    } else {
+        errors.push(ExplorerValidationError::UnsupportedDataset {
+            dataset: panel.dataset,
+        });
+    }
+
+    if time_range.start >= time_range.end {
+        errors.push(ExplorerValidationError::InvalidTimeRange);
+    }
+
+    if !errors.is_empty() {
+        return Err(ExplorerValidationErrors { errors });
+    }
+
+    let query = ExplorerQuery {
+        dataset: panel.dataset,
+        time_range,
+        measures: panel.measures.clone(),
+        group_by: panel.group_by.clone(),
+        filters: panel.filters.clone(),
+        visualization: panel.visualization,
+        limit: panel.limit,
+    };
+    Ok((panel, query))
+}
+
+pub fn usage_rollup_explorer_panel_snapshot(
+    panel: ExplorerSavedPanelDefinition,
+    query: ExplorerQuery,
+    result: ExplorerQueryResult,
+) -> UsageRollupExplorerPanelSnapshot {
+    let table = explorer_table_presentation(&query, &result);
+    UsageRollupExplorerPanelSnapshot {
+        panel,
+        query,
+        result,
+        table,
+    }
+}
+
 pub fn validate_explorer_query(query: &ExplorerQuery) -> Result<(), ExplorerValidationErrors> {
     let mut errors = Vec::new();
 
@@ -287,6 +402,62 @@ pub fn validate_explorer_query(query: &ExplorerQuery) -> Result<(), ExplorerVali
     } else {
         Err(ExplorerValidationErrors { errors })
     }
+}
+
+fn validate_panel_against_dataset(
+    panel: &ExplorerSavedPanelDefinition,
+    dataset: &ExplorerDatasetCatalog,
+) -> Vec<ExplorerValidationError> {
+    let mut errors = Vec::new();
+
+    if panel.measures.is_empty() {
+        errors.push(ExplorerValidationError::EmptyMeasureSelection);
+    }
+    errors.extend(
+        panel
+            .measures
+            .iter()
+            .filter(|measure| !dataset.measures.contains(measure))
+            .map(|measure| ExplorerValidationError::UnsupportedMeasure { measure: *measure }),
+    );
+    errors.extend(
+        panel
+            .group_by
+            .iter()
+            .filter(|dimension| !dataset.dimensions.contains(dimension))
+            .map(|dimension| ExplorerValidationError::UnsupportedDimension {
+                dimension: *dimension,
+            }),
+    );
+    if panel.group_by.len() > usize::from(dataset.max_grouping_depth) {
+        errors.push(ExplorerValidationError::TooManyGroups {
+            requested: panel.group_by.len() as u8,
+            max: dataset.max_grouping_depth,
+        });
+    }
+    errors.extend(
+        panel
+            .filters
+            .iter()
+            .map(ExplorerFilter::dimension)
+            .filter(|dimension| !dataset.filters.contains(dimension))
+            .map(|dimension| ExplorerValidationError::UnsupportedFilter { dimension }),
+    );
+    if !dataset.visualizations.contains(&panel.visualization)
+        || panel.visualization != ExplorerVisualization::Table
+    {
+        errors.push(ExplorerValidationError::UnsupportedVisualization {
+            visualization: panel.visualization,
+        });
+    }
+    if panel.limit == 0 || panel.limit > dataset.max_limit {
+        errors.push(ExplorerValidationError::InvalidLimit {
+            requested: panel.limit,
+            max: dataset.max_limit,
+        });
+    }
+
+    errors
 }
 
 pub fn usage_rollup_token_query(query: &ExplorerQuery) -> RollupQuery {
@@ -356,10 +527,9 @@ pub fn usage_rollup_explorer_result(
                     .map(|cost| cost.as_nanos())
                     .unwrap_or(0);
                 let total_cost = existing_cost.saturating_add(rollup.cost_usd.as_nanos());
+                let clamped_cost = total_cost.min(i64::MAX as u64);
                 row.measures.cost_usd =
-                    Some(CostUsd::from_nanos(total_cost).unwrap_or_else(|| {
-                        CostUsd::from_nanos(u64::MAX).expect("u64::MAX fits cost storage")
-                    }));
+                    Some(CostUsd::from_nanos(clamped_cost).expect("clamped cost fits storage"));
                 row.measures.cost_source = Some(combined_cost_source(
                     row.measures.cost_source,
                     rollup.source,
@@ -441,5 +611,342 @@ fn combined_cost_source(current: Option<CostSource>, incoming: CostSource) -> Co
         None => incoming,
         Some(existing) if existing == incoming => existing,
         Some(_) => CostSource::Mixed,
+    }
+}
+
+fn explorer_table_presentation(
+    query: &ExplorerQuery,
+    result: &ExplorerQueryResult,
+) -> ExplorerTablePresentation {
+    ExplorerTablePresentation {
+        columns: query
+            .group_by
+            .iter()
+            .map(|dimension| ExplorerTableColumn::Dimension {
+                dimension: *dimension,
+            })
+            .chain(query.measures.iter().flat_map(measure_columns))
+            .collect(),
+        rows: result
+            .rows
+            .iter()
+            .map(|row| ExplorerTableRowPresentation {
+                cells: row_cells(row, &query.measures),
+            })
+            .collect(),
+    }
+}
+
+fn row_cells(
+    row: &ExplorerResultRow,
+    selected_measures: &[ExplorerMeasure],
+) -> Vec<ExplorerTableCell> {
+    row.group
+        .iter()
+        .map(group_cell)
+        .chain(
+            selected_measures
+                .iter()
+                .flat_map(|measure| measure_cells(*measure, &row.measures)),
+        )
+        .collect()
+}
+
+fn measure_columns(measure: &ExplorerMeasure) -> Vec<ExplorerTableColumn> {
+    match measure {
+        ExplorerMeasure::TotalTokens => vec![ExplorerTableColumn::TotalTokens],
+        ExplorerMeasure::CostUsd => vec![
+            ExplorerTableColumn::CostUsd,
+            ExplorerTableColumn::CostSource,
+        ],
+    }
+}
+
+fn measure_cells(
+    measure: ExplorerMeasure,
+    measures: &UsageRollupExplorerMeasures,
+) -> Vec<ExplorerTableCell> {
+    match measure {
+        ExplorerMeasure::TotalTokens => vec![
+            measures
+                .total_tokens
+                .map_or(ExplorerTableCell::EmptyTotalTokens, |value| {
+                    ExplorerTableCell::TotalTokens { value }
+                }),
+        ],
+        ExplorerMeasure::CostUsd => vec![
+            measures
+                .cost_usd
+                .map_or(ExplorerTableCell::EmptyCostUsd, |value| {
+                    ExplorerTableCell::CostUsd { value }
+                }),
+            measures
+                .cost_source
+                .map_or(ExplorerTableCell::EmptyCostSource, |value| {
+                    ExplorerTableCell::CostSource { value }
+                }),
+        ],
+    }
+}
+
+fn group_cell(value: &ExplorerGroupValue) -> ExplorerTableCell {
+    match value {
+        ExplorerGroupValue::Day(value) => ExplorerTableCell::Day { value: *value },
+        ExplorerGroupValue::Repo(value) => ExplorerTableCell::Repo {
+            value: value.clone(),
+        },
+        ExplorerGroupValue::Model(value) => ExplorerTableCell::Model {
+            value: value.clone(),
+        },
+        ExplorerGroupValue::Harness(value) => ExplorerTableCell::Harness {
+            value: value.clone(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rpc::{CostRollup, CostSource, ModelName, RollupDay, TimestampMillis};
+    use crate::usage::{CostUsd, RepoBucket, RepoIdentity, RepoName, RepoPath};
+
+    use super::{
+        ExplorerCatalog, ExplorerDataset, ExplorerDatasetCatalog, ExplorerDimension,
+        ExplorerFilter, ExplorerMeasure, ExplorerQuery, ExplorerQueryResult, ExplorerResultRow,
+        ExplorerSavedPanelDefinition, ExplorerTableCell, ExplorerTableColumn, ExplorerTimeRange,
+        ExplorerValidationError, ExplorerVisualization, UsageRollupExplorerMeasures,
+        explorer_catalog, explorer_saved_panel, usage_rollup_explorer_panel_snapshot,
+        usage_rollup_explorer_query_for_panel, usage_rollup_explorer_result,
+    };
+
+    #[test]
+    fn usage_rollup_explorer_result_clamps_aggregated_cost_to_i64_max() {
+        let query = ExplorerQuery {
+            dataset: ExplorerDataset::UsageRollups,
+            time_range: ExplorerTimeRange {
+                start: TimestampMillis::from_millis(1),
+                end: TimestampMillis::from_millis(2),
+            },
+            measures: vec![ExplorerMeasure::CostUsd],
+            group_by: Vec::new(),
+            filters: Vec::new(),
+            visualization: ExplorerVisualization::Table,
+            limit: 10,
+        };
+        let day = RollupDay::parse("2026-06-20").expect("valid rollup day");
+        let rollups = vec![
+            CostRollup {
+                day,
+                repo: RepoBucket::no_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: CostUsd::from_nanos(i64::MAX as u64).expect("i64::MAX is representable"),
+                source: CostSource::Native,
+            },
+            CostRollup {
+                day,
+                repo: RepoBucket::no_repo(),
+                model: ModelName::new("claude-opus-4-20250514"),
+                cost_usd: CostUsd::from_nanos(1).expect("small cost is representable"),
+                source: CostSource::Native,
+            },
+        ];
+
+        let result = usage_rollup_explorer_result(query, Vec::new(), rollups);
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0]
+                .measures
+                .cost_usd
+                .expect("cost measure should be populated")
+                .as_nanos(),
+            i64::MAX as u64
+        );
+    }
+
+    #[test]
+    fn usage_rollup_explorer_query_for_panel_replaces_filters_with_runtime_filters() {
+        let catalog = explorer_catalog();
+        let mut panel = explorer_saved_panel(super::ExplorerSavedPanel::UsageRollupsOverview);
+        panel.filters = vec![ExplorerFilter::Model(ModelName::new("stale-model"))];
+        let repo = kvasir_repo();
+        let filters = vec![ExplorerFilter::Repo(repo.clone())];
+        let range = ExplorerTimeRange {
+            start: TimestampMillis::from_millis(1),
+            end: TimestampMillis::from_millis(2),
+        };
+
+        let (resolved_panel, query) = usage_rollup_explorer_query_for_panel(
+            &catalog,
+            panel.clone(),
+            range.clone(),
+            filters.clone(),
+        )
+        .expect("valid panel should produce query");
+
+        assert_eq!(resolved_panel.filters, filters);
+        assert_eq!(
+            query,
+            ExplorerQuery {
+                dataset: panel.dataset,
+                time_range: range,
+                measures: panel.measures,
+                group_by: panel.group_by,
+                filters,
+                visualization: panel.visualization,
+                limit: panel.limit,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_rollup_explorer_panel_snapshot_builds_typed_table_in_query_measure_order() {
+        let repo = kvasir_repo();
+        let day = RollupDay::parse("2026-06-20").expect("valid rollup day");
+        let panel = ExplorerSavedPanelDefinition {
+            panel: super::ExplorerSavedPanel::UsageRollupsOverview,
+            dataset: ExplorerDataset::UsageRollups,
+            measures: vec![ExplorerMeasure::CostUsd, ExplorerMeasure::TotalTokens],
+            group_by: vec![ExplorerDimension::Day, ExplorerDimension::Repo],
+            filters: vec![ExplorerFilter::Repo(repo.clone())],
+            visualization: ExplorerVisualization::Table,
+            limit: 25,
+        };
+        let query = ExplorerQuery {
+            dataset: panel.dataset,
+            time_range: ExplorerTimeRange {
+                start: TimestampMillis::from_millis(1),
+                end: TimestampMillis::from_millis(2),
+            },
+            measures: panel.measures.clone(),
+            group_by: panel.group_by.clone(),
+            filters: panel.filters.clone(),
+            visualization: panel.visualization,
+            limit: panel.limit,
+        };
+        let result = ExplorerQueryResult {
+            dataset: ExplorerDataset::UsageRollups,
+            visualization: ExplorerVisualization::Table,
+            rows: vec![ExplorerResultRow {
+                group: vec![
+                    super::ExplorerGroupValue::Day(day),
+                    super::ExplorerGroupValue::Repo(repo.clone()),
+                ],
+                measures: UsageRollupExplorerMeasures {
+                    total_tokens: Some(1_700),
+                    cost_usd: Some(
+                        CostUsd::from_nanos(54_150_000).expect("small cost is representable"),
+                    ),
+                    cost_source: Some(CostSource::Estimated),
+                },
+            }],
+        };
+
+        let snapshot = usage_rollup_explorer_panel_snapshot(panel, query, result);
+
+        assert_eq!(
+            snapshot.table.columns,
+            vec![
+                ExplorerTableColumn::Dimension {
+                    dimension: ExplorerDimension::Day,
+                },
+                ExplorerTableColumn::Dimension {
+                    dimension: ExplorerDimension::Repo,
+                },
+                ExplorerTableColumn::CostUsd,
+                ExplorerTableColumn::CostSource,
+                ExplorerTableColumn::TotalTokens,
+            ]
+        );
+        assert_eq!(
+            snapshot.table.rows[0].cells,
+            vec![
+                ExplorerTableCell::Day { value: day },
+                ExplorerTableCell::Repo { value: repo },
+                ExplorerTableCell::CostUsd {
+                    value: CostUsd::from_nanos(54_150_000).expect("small cost is representable"),
+                },
+                ExplorerTableCell::CostSource {
+                    value: CostSource::Estimated,
+                },
+                ExplorerTableCell::TotalTokens { value: 1_700 },
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_rollup_explorer_query_for_panel_reports_catalog_validation_errors() {
+        let panel = explorer_saved_panel(super::ExplorerSavedPanel::UsageRollupsOverview);
+        let range = ExplorerTimeRange {
+            start: TimestampMillis::from_millis(1),
+            end: TimestampMillis::from_millis(2),
+        };
+        let missing_catalog = ExplorerCatalog {
+            datasets: Vec::new(),
+            saved_panels: Vec::new(),
+        };
+        let errors = usage_rollup_explorer_query_for_panel(
+            &missing_catalog,
+            panel.clone(),
+            range.clone(),
+            Vec::new(),
+        )
+        .expect_err("missing catalog entries should fail");
+        assert_eq!(
+            errors.errors,
+            vec![
+                ExplorerValidationError::UnsupportedSavedPanel {
+                    panel: super::ExplorerSavedPanel::UsageRollupsOverview,
+                },
+                ExplorerValidationError::UnsupportedDataset {
+                    dataset: ExplorerDataset::UsageRollups,
+                },
+            ]
+        );
+
+        let no_measure_catalog = ExplorerCatalog {
+            datasets: vec![ExplorerDatasetCatalog {
+                dataset: ExplorerDataset::UsageRollups,
+                measures: Vec::new(),
+                dimensions: vec![
+                    ExplorerDimension::Day,
+                    ExplorerDimension::Repo,
+                    ExplorerDimension::Model,
+                ],
+                filters: vec![
+                    ExplorerDimension::Repo,
+                    ExplorerDimension::Model,
+                    ExplorerDimension::Harness,
+                ],
+                visualizations: vec![ExplorerVisualization::Table],
+                default_measures: Vec::new(),
+                default_group_by: Vec::new(),
+                default_visualization: ExplorerVisualization::Table,
+                default_limit: 50,
+                max_limit: 500,
+                max_grouping_depth: 3,
+            }],
+            saved_panels: vec![panel.clone()],
+        };
+        let errors =
+            usage_rollup_explorer_query_for_panel(&no_measure_catalog, panel, range, Vec::new())
+                .expect_err("unsupported measures should fail");
+        assert_eq!(
+            errors.errors,
+            vec![
+                ExplorerValidationError::UnsupportedMeasure {
+                    measure: ExplorerMeasure::TotalTokens,
+                },
+                ExplorerValidationError::UnsupportedMeasure {
+                    measure: ExplorerMeasure::CostUsd,
+                },
+            ]
+        );
+    }
+
+    fn kvasir_repo() -> RepoBucket {
+        RepoBucket::repo(RepoIdentity::new(
+            RepoName::new("kvasir"),
+            RepoPath::new("/repos/kvasir"),
+        ))
     }
 }
