@@ -10,9 +10,9 @@ pub(crate) enum DataUpdate {
     Cleared,
 }
 
-/// The daemon's single change-notification channel. Every mutation path
-/// announces through [`UpdateChannel::notify`]; every subscription listens
-/// through [`UpdateChannel::subscribe`].
+/// The daemon's single change-notification channel. Mutation paths that
+/// subscribers must hear about announce through [`UpdateChannel::notify`];
+/// every subscription listens through [`UpdateChannel::subscribe`].
 #[derive(Clone)]
 pub(crate) struct UpdateChannel {
     sender: broadcast::Sender<DataUpdate>,

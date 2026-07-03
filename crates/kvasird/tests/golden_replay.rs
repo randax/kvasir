@@ -1491,12 +1491,22 @@ async fn usage_update_subscriber_hears_background_raw_body_import() -> anyhow::R
         r#"{"content":[{"type":"text","text":"arrived after subscribe response"}]}"#,
     )?;
 
-    let kind = read_usage_update_kind(&mut reader)
-        .await
-        .map_err(|err| anyhow::anyhow!("subscriber never heard about the raw-body import: {err}"))?;
-    assert_eq!(kind, UsageUpdateKind::Changed);
-    assert!(!request_body_path.exists());
-    assert!(!response_body_path.exists());
+    // A scanner tick may land between the two writes and import the bodies
+    // across two passes, so keep reading change events until both are gone.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let kind = read_usage_update_kind(&mut reader).await.map_err(|err| {
+            anyhow::anyhow!("subscriber never heard about the raw-body import: {err}")
+        })?;
+        assert_eq!(kind, UsageUpdateKind::Changed);
+        if !request_body_path.exists() && !response_body_path.exists() {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "raw body files were not imported before the deadline"
+        );
+    }
 
     drop(daemon);
     Ok(())
