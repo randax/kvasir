@@ -15,7 +15,7 @@ use kvasir_core::rpc::{
     BearerToken, ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay,
     ContentReplayItem, ContentUnavailableReason, CostRollup, CostRollupQuery, CostSource,
     HarnessName, ModelName, RollupDay, RollupQuery, RpcRequest, RpcStreamEvent, TimestampMillis,
-    TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName, TraceSpanKind,
+    TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName, TraceSpanKind, UsageUpdateKind,
 };
 use kvasir_core::{
     ContentKind, ContentRetentionPolicy, ContentText, CostUsageRecord, CostUsd, ModelTokenPrices,
@@ -1434,6 +1434,128 @@ async fn claude_raw_body_files_arriving_after_otlp_are_imported_by_one_shot_scan
 
     drop(daemon);
     Ok(())
+}
+
+#[tokio::test]
+async fn usage_update_subscriber_hears_background_raw_body_import() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let raw_body_dir = temp.path().join("raw-bodies");
+    std::fs::create_dir_all(&raw_body_dir)?;
+    let request_body_path = raw_body_dir.join("subscribed-late-request.json");
+    let response_body_path = raw_body_dir.join("subscribed-late-response.json");
+
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
+    })
+    .await?;
+
+    let mut stream = tokio::net::UnixStream::connect(&rpc_socket_path).await?;
+    let mut request_bytes = serde_json::to_vec(&RpcRequest::SubscribeUsageUpdates)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+    let mut reader = BufReader::new(stream);
+    assert_eq!(
+        read_usage_update_kind(&mut reader).await?,
+        UsageUpdateKind::Initial
+    );
+
+    reqwest::Client::new()
+        .post(format!("http://{}/v1/logs", daemon.otlp_addr()))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(claude_raw_api_body_ref_logs_fixture(
+            "subscribed-late-request.json",
+            "subscribed-late-response.json",
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        read_usage_update_kind(&mut reader).await?,
+        UsageUpdateKind::Changed
+    );
+
+    std::fs::write(
+        &request_body_path,
+        r#"{"messages":[{"role":"user","content":"arrived after subscribe"}]}"#,
+    )?;
+    std::fs::write(
+        &response_body_path,
+        r#"{"content":[{"type":"text","text":"arrived after subscribe response"}]}"#,
+    )?;
+
+    let kind = read_usage_update_kind(&mut reader)
+        .await
+        .map_err(|err| anyhow::anyhow!("subscriber never heard about the raw-body import: {err}"))?;
+    assert_eq!(kind, UsageUpdateKind::Changed);
+    assert!(!request_body_path.exists());
+    assert!(!response_body_path.exists());
+
+    drop(daemon);
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_update_subscriber_hears_clear_all_data() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let _daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path: temp.path().join("usage.sqlite3"),
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
+    })
+    .await?;
+
+    let mut stream = tokio::net::UnixStream::connect(&rpc_socket_path).await?;
+    let mut request_bytes = serde_json::to_vec(&RpcRequest::SubscribeUsageUpdates)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+    let mut reader = BufReader::new(stream);
+    assert_eq!(
+        read_usage_update_kind(&mut reader).await?,
+        UsageUpdateKind::Initial
+    );
+
+    let mut clear_stream = tokio::net::UnixStream::connect(&rpc_socket_path).await?;
+    let mut clear_bytes = serde_json::to_vec(&RpcRequest::ClearAllData {
+        bearer_token: BearerToken::new("test-token"),
+    })?;
+    clear_bytes.push(b'\n');
+    clear_stream.write_all(&clear_bytes).await?;
+    let mut clear_response = Vec::new();
+    BufReader::new(clear_stream)
+        .read_until(b'\n', &mut clear_response)
+        .await?;
+
+    assert_eq!(
+        read_usage_update_kind(&mut reader).await?,
+        UsageUpdateKind::Changed
+    );
+
+    Ok(())
+}
+
+async fn read_usage_update_kind<R>(reader: &mut R) -> anyhow::Result<UsageUpdateKind>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\n', &mut line)).await??;
+    match serde_json::from_slice::<RpcStreamEvent>(&line)? {
+        RpcStreamEvent::UsageUpdate { kind } => Ok(kind),
+        other => anyhow::bail!("expected usage update stream event, got {other:?}"),
+    }
 }
 
 #[tokio::test]

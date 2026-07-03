@@ -41,6 +41,9 @@ use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 mod setup;
+mod updates;
+
+use updates::{DataUpdate, UpdateChannel};
 
 const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 16 * 1024;
@@ -424,8 +427,7 @@ struct DaemonState {
     bearer_token: BearerToken,
     content_retention_policy: ContentRetentionPolicy,
     raw_body_directory: VerifiedRawBodyDirectory,
-    overview_updates: broadcast::Sender<()>,
-    usage_updates: broadcast::Sender<()>,
+    updates: UpdateChannel,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -480,16 +482,14 @@ async fn start_with_store_key_source_at_stable_path(
         }
     };
     let raw_body_directory = prepare_raw_body_directory(&config.database_path)?;
-    let (overview_updates, _overview_update_receiver) = broadcast::channel(32);
-    let (usage_updates, _usage_update_receiver) = broadcast::channel(32);
+    let updates = UpdateChannel::new();
     let (shutdown, _shutdown_receiver) = broadcast::channel(1);
     let state = DaemonState {
         store: Arc::new(Mutex::new(store)),
         bearer_token: config.bearer_token,
         content_retention_policy: config.content_retention_policy.clone(),
         raw_body_directory,
-        overview_updates,
-        usage_updates,
+        updates,
         shutdown: shutdown.clone(),
     };
 
@@ -1296,7 +1296,7 @@ async fn ingest_otlp(
         }
     }
     import_available_raw_bodies(&state).await?;
-    let _ = state.overview_updates.send(());
+    state.updates.notify(DataUpdate::RollupsChanged);
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -1425,7 +1425,7 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     }
 
     if stores_new_body {
-        let _ = state.usage_updates.send(());
+        state.updates.notify(DataUpdate::ContentImported);
     }
     Ok(stores_new_body || !completed_event_keys.is_empty())
 }
@@ -1526,8 +1526,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             } else {
                 match state.store.lock().await.clear_all_data() {
                     Ok(()) => {
-                        let _ = state.overview_updates.send(());
-                        let _ = state.usage_updates.send(());
+                        state.updates.notify(DataUpdate::Cleared);
                         RpcResponse::ClearAllData
                     }
                     Err(err) => {
@@ -1628,7 +1627,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::SubscribeTokenRollup { query }) => {
-            let mut updates = state.overview_updates.subscribe();
+            let mut updates = state.updates.subscribe();
             let mut shutdown = state.shutdown.subscribe();
             let mut disconnect_probe = [0_u8; 1];
             let mut last_event = None;
@@ -1651,7 +1650,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     update = updates.recv() => {
                         match update {
-                            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 match write_token_rollup_event_if_changed(
                                     &mut writer,
                                     &state,
@@ -1671,7 +1670,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::SubscribeUsageUpdates) => {
-            let mut updates = state.overview_updates.subscribe();
+            let mut updates = state.updates.subscribe();
             let mut shutdown = state.shutdown.subscribe();
             let mut disconnect_probe = [0_u8; 1];
             match write_usage_update_event(&mut writer, &mut shutdown, UsageUpdateKind::Initial)
@@ -1693,7 +1692,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     update = updates.recv() => {
                         match update {
-                            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 match write_usage_update_event(
                                     &mut writer,
                                     &mut shutdown,
