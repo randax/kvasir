@@ -52,25 +52,26 @@ struct OverviewScreen: View {
         .padding(.vertical, 16)
     }
 
-    @ViewBuilder
+    private var rangePickerSelection: Binding<OverviewRangePreset> {
+        Binding(
+            get: { model.selectedRangePreset },
+            set: { preset in
+                guard preset != model.selectedRangePreset else {
+                    return
+                }
+                refreshRange(preset)
+            }
+        )
+    }
+
     private var rangePicker: some View {
-        let picker = Picker("Time range", selection: $model.selectedRangePreset) {
+        Picker("Time range", selection: rangePickerSelection) {
             ForEach(OverviewRangePreset.allCases) { preset in
                 Text(preset.label).tag(preset)
             }
         }
         .pickerStyle(.segmented)
         .frame(width: 260)
-
-        if #available(macOS 14.0, *) {
-            picker.onChange(of: model.selectedRangePreset) { _, preset in
-                refreshRange(preset)
-            }
-        } else {
-            picker.onChange(of: model.selectedRangePreset) { preset in
-                refreshRange(preset)
-            }
-        }
     }
 
     @ViewBuilder

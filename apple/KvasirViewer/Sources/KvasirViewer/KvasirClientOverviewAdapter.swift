@@ -163,7 +163,7 @@ func kvasirTimestampMillis(from date: Date) throws -> KvasirTimestampMillis {
     let millis = date.timeIntervalSince1970 * 1_000
     guard millis.isFinite,
           millis >= Double(Int64.min),
-          millis <= Double(Int64.max)
+          millis < Double(Int64.max)
     else {
         throw KvasirClientOverviewAdapterConversionError.invalidTimestamp
     }

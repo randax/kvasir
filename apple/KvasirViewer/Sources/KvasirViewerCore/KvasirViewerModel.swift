@@ -81,7 +81,7 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var selectedHarness: OverviewHarnessName?
     @Published public private(set) var selectedSession: OverviewSessionRoute?
     @Published public private(set) var selectedPrompt: OverviewPromptRoute?
-    @Published public var selectedRangePreset: OverviewRangePreset
+    @Published public private(set) var selectedRangePreset: OverviewRangePreset
 
     public var isTraceInspectorEnabled: Bool {
         traceInspector != nil
@@ -411,7 +411,7 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     private func startLiveOverviewUpdatesIfNeeded() {
-        guard liveOverviewUpdates == nil else {
+        guard liveOverviewUpdates == nil, dashboard.supportsLiveUpdates else {
             return
         }
         liveOverviewUpdates = Task { [weak self, dashboard, liveOverviewUpdateRearmDelay] in
@@ -424,6 +424,7 @@ public final class KvasirViewerModel: ObservableObject {
                     guard !Task.isCancelled else {
                         return
                     }
+                    rearmAttempt = 0
                     do {
                         try await refreshOverview()
                     } catch {

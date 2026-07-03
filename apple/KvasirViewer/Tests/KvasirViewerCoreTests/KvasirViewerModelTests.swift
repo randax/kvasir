@@ -171,6 +171,59 @@ func liveOverviewUpdatesRearmAfterUpdateStreamFinishes() async throws {
 
 @MainActor
 @Test
+func liveOverviewUpdatesDoNotRearmWithoutUpdateSource() async throws {
+    let rearmDelays = RearmDelayRecorder()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        liveOverviewUpdateRearmDelay: { attempt in rearmDelays.append(attempt) }
+    )
+
+    try await model.start()
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(rearmDelays.attempts.isEmpty)
+}
+
+@MainActor
+@Test
+func liveOverviewUpdateRearmBackoffResetsAfterStreamDeliversEvent() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let rearmDelays = RearmDelayRecorder()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        liveOverviewUpdateRearmDelay: { attempt in rearmDelays.append(attempt) }
+    )
+
+    try await model.start()
+    await updateSource.waitForSubscriptions(count: 1)
+
+    updateSource.finishCurrentStream()
+    await updateSource.waitForSubscriptions(count: 2)
+
+    updateSource.send()
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    updateSource.finishCurrentStream()
+    await updateSource.waitForSubscriptions(count: 3)
+
+    #expect(rearmDelays.attempts == [1, 1])
+}
+
+@MainActor
+@Test
 func liveOverviewListenerDoesNotRetainModel() async throws {
     let updateSource = ManualOverviewUpdateSource()
     let client = RecordingResultOverviewClient(

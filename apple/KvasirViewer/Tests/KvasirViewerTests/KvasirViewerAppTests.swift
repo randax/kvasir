@@ -650,6 +650,12 @@ func kvasirRollupQueryRejectsInvalidTimestamps() throws {
             end: Date(timeIntervalSince1970: 1)
         ))
     }
+    #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
+        _ = try kvasirRollupQuery(from: OverviewQuery(
+            start: Date(timeIntervalSince1970: 1),
+            end: Date(timeIntervalSince1970: 9_223_372_036_854_776)
+        ))
+    }
 }
 
 @Test
