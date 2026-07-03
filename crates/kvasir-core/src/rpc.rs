@@ -1,6 +1,10 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::explorer::{
+    ExplorerCatalog, ExplorerQuery, ExplorerQueryResult, ExplorerSavedPanel,
+    ExplorerSavedPanelDefinition, ExplorerSavedPanelRun, ExplorerValidationError,
+};
 use crate::usage::{ContentKind, ContentText, CostUsd, RepoBucket};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +48,7 @@ impl BearerToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelName(String);
 
 impl ModelName {
@@ -255,7 +259,7 @@ impl TimestampMillis {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RollupDay(NaiveDate);
 
 impl RollupDay {
@@ -725,6 +729,16 @@ pub enum RpcRequest {
     ClearAllData {
         bearer_token: BearerToken,
     },
+    ExplorerCatalog,
+    ExplorerSavedPanel {
+        panel: ExplorerSavedPanel,
+    },
+    ExplorerQuery {
+        query: ExplorerQuery,
+    },
+    ExplorerSavedPanelRun {
+        run: ExplorerSavedPanelRun,
+    },
     TokenRollup {
         query: RollupQuery,
     },
@@ -754,6 +768,10 @@ pub enum RpcRequest {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcResponse {
     ClearAllData,
+    ExplorerCatalog { catalog: ExplorerCatalog },
+    ExplorerSavedPanel { panel: ExplorerSavedPanelDefinition },
+    ExplorerQuery { result: ExplorerQueryResult },
+    ExplorerSavedPanelRun { result: ExplorerQueryResult },
     TokenRollup { rollups: Vec<TokenRollup> },
     OverviewRollup { rollup: OverviewRollup },
     CostRollup { rollups: Vec<CostRollup> },
@@ -785,6 +803,9 @@ pub enum RpcError {
     Internal,
     ResponseTooLarge,
     Unauthorized,
+    ExplorerValidation {
+        errors: Vec<ExplorerValidationError>,
+    },
 }
 
 #[cfg(test)]
@@ -792,6 +813,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::explorer::{
+        ExplorerDataset, ExplorerFilter, ExplorerQueryResult, ExplorerSavedPanel,
+        ExplorerSavedPanelRun, ExplorerTimeRange, ExplorerVisualization,
+    };
     use crate::usage::{CostUsd, RepoBucket};
 
     #[test]
@@ -929,6 +954,75 @@ mod tests {
                 "type": "usage_update",
                 "payload": {
                     "kind": "changed"
+                }
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn explorer_saved_panel_rpc_contract_serializes_typed_panel_and_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            serde_json::to_value(RpcRequest::ExplorerSavedPanel {
+                panel: ExplorerSavedPanel::UsageRollupsOverview,
+            })?,
+            json!({
+                "type": "explorer_saved_panel",
+                "payload": {
+                    "panel": "usage_rollups_overview"
+                }
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RpcRequest::ExplorerSavedPanelRun {
+                run: ExplorerSavedPanelRun {
+                    panel: ExplorerSavedPanel::UsageRollupsOverview,
+                    time_range: ExplorerTimeRange {
+                        start: TimestampMillis::new_for_test(1_781_956_000_000),
+                        end: TimestampMillis::new_for_test(1_781_970_000_000),
+                    },
+                    filters: vec![ExplorerFilter::Model(ModelName::new(
+                        "claude-opus-4-20250514",
+                    ))],
+                },
+            })?,
+            json!({
+                "type": "explorer_saved_panel_run",
+                "payload": {
+                    "run": {
+                        "panel": "usage_rollups_overview",
+                        "time_range": {
+                            "start": 1781956000000i64,
+                            "end": 1781970000000i64
+                        },
+                        "filters": [{
+                            "dimension": "model",
+                            "value": "claude-opus-4-20250514"
+                        }]
+                    }
+                }
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RpcResponse::ExplorerSavedPanelRun {
+                result: ExplorerQueryResult {
+                    dataset: ExplorerDataset::UsageRollups,
+                    visualization: ExplorerVisualization::Table,
+                    rows: Vec::new(),
+                },
+            })?,
+            json!({
+                "type": "explorer_saved_panel_run",
+                "payload": {
+                    "result": {
+                        "dataset": "usage_rollups",
+                        "visualization": "table",
+                        "rows": []
+                    }
                 }
             })
         );

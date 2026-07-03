@@ -29,6 +29,7 @@ enum ProductionModelFactory {
                 ),
                 updateSource: overviewUpdateSource ?? makeOverviewUpdateSource(primary: overviewClient)
             ),
+            usageRollupExplorer: makeUsageRollupExplorer(usesInjectedOverviewClient: overviewClient != nil),
             traceInspector: makeTraceInspector(client: traceInspectorClient),
             usageDataManagement: usageDataManagement
                 ?? makeUsageDataManagement(usesInjectedOverviewClient: overviewClient != nil),
@@ -39,6 +40,23 @@ enum ProductionModelFactory {
                 daemonFallbackGate.enable()
             }
         )
+    }
+
+    @MainActor
+    private static func makeUsageRollupExplorer(usesInjectedOverviewClient: Bool) -> UsageRollupExplorer? {
+        guard !usesInjectedOverviewClient else {
+            return nil
+        }
+        #if canImport(kvasir_client)
+        return UsageRollupExplorer(
+            client: KvasirClientRollupSource(
+                socketPath: rpcSocketPath,
+                setupConfig: harnessTelemetrySetupConfig
+            )
+        )
+        #else
+        return nil
+        #endif
     }
 
     @MainActor
@@ -394,6 +412,8 @@ extension HarnessTelemetrySetupWarning {
         case .WrongResponseType:
             self.init(reason: .wrongResponseType)
         case .InvalidQuery:
+            self.init(reason: .invalidQuery)
+        case .ExplorerValidation(errors: _):
             self.init(reason: .invalidQuery)
         }
     }

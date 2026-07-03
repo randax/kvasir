@@ -5,7 +5,7 @@ use crate::rpc::{
     TraceId, TraceSpanKind,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoName(String);
 
 impl RepoName {
@@ -18,7 +18,7 @@ impl RepoName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoPath(String);
 
 impl RepoPath {
@@ -31,7 +31,7 @@ impl RepoPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepoIdentity {
     pub name: Option<RepoName>,
     pub path: Option<RepoPath>,
@@ -54,7 +54,7 @@ impl RepoIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
 pub enum RepoBucket {
     NoRepo,

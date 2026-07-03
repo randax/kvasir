@@ -291,6 +291,207 @@ pub struct KvasirOverviewSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerCatalog {
+    pub datasets: Vec<KvasirExplorerDatasetCatalog>,
+    pub saved_panels: Vec<KvasirExplorerSavedPanelDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerDatasetCatalog {
+    pub dataset: KvasirExplorerDataset,
+    pub measures: Vec<KvasirExplorerMeasure>,
+    pub dimensions: Vec<KvasirExplorerDimension>,
+    pub filters: Vec<KvasirExplorerDimension>,
+    pub visualizations: Vec<KvasirExplorerVisualization>,
+    pub default_measures: Vec<KvasirExplorerMeasure>,
+    pub default_group_by: Vec<KvasirExplorerDimension>,
+    pub default_visualization: KvasirExplorerVisualization,
+    pub default_limit: u64,
+    pub max_limit: u64,
+    pub max_grouping_depth: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum KvasirExplorerDataset {
+    UsageRollups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum KvasirExplorerMeasure {
+    TotalTokens,
+    CostUsd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum KvasirExplorerDimension {
+    Day,
+    Repo,
+    Model,
+    Harness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum KvasirExplorerVisualization {
+    Table,
+    LineChart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum KvasirExplorerSavedPanel {
+    UsageRollupsOverview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerTimeRange {
+    pub start: KvasirTimestampMillis,
+    pub end: KvasirTimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerQuery {
+    pub dataset: KvasirExplorerDataset,
+    pub time_range: KvasirExplorerTimeRange,
+    pub measures: Vec<KvasirExplorerMeasure>,
+    pub group_by: Vec<KvasirExplorerDimension>,
+    pub filters: Vec<KvasirExplorerFilter>,
+    pub visualization: KvasirExplorerVisualization,
+    pub limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerFilter {
+    Repo { value: KvasirRepoBucket },
+    Model { value: KvasirModelName },
+    Harness { value: KvasirHarnessName },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerSavedPanelDefinition {
+    pub panel: KvasirExplorerSavedPanel,
+    pub dataset: KvasirExplorerDataset,
+    pub measures: Vec<KvasirExplorerMeasure>,
+    pub group_by: Vec<KvasirExplorerDimension>,
+    pub filters: Vec<KvasirExplorerFilter>,
+    pub visualization: KvasirExplorerVisualization,
+    pub limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerSavedPanelRun {
+    pub panel: KvasirExplorerSavedPanel,
+    pub time_range: KvasirExplorerTimeRange,
+    pub filters: Vec<KvasirExplorerFilter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerResult {
+    pub dataset: KvasirExplorerDataset,
+    pub visualization: KvasirExplorerVisualization,
+    pub rows: Vec<KvasirExplorerResultRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerResultRow {
+    pub group: Vec<KvasirExplorerGroupValue>,
+    pub measures: KvasirUsageRollupExplorerMeasures,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerGroupValue {
+    Day { value: KvasirRollupDay },
+    Repo { value: KvasirRepoBucket },
+    Model { value: KvasirModelName },
+    Harness { value: KvasirHarnessName },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirUsageRollupExplorerMeasures {
+    pub total_tokens: Option<u64>,
+    pub cost_usd: Option<KvasirCostUsd>,
+    pub cost_source: Option<KvasirCostSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirUsageRollupExplorerPanelRequest {
+    pub time_range: KvasirExplorerTimeRange,
+    pub filters: Vec<KvasirExplorerFilter>,
+    pub saved_panel: Option<KvasirExplorerSavedPanelDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirUsageRollupExplorerPanelSnapshot {
+    pub panel: KvasirExplorerSavedPanelDefinition,
+    pub query: KvasirExplorerQuery,
+    pub result: KvasirExplorerResult,
+    pub table: KvasirExplorerTablePresentation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerTablePresentation {
+    pub columns: Vec<KvasirExplorerTableColumn>,
+    pub rows: Vec<KvasirExplorerTableRowPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KvasirExplorerTableRowPresentation {
+    pub cells: Vec<KvasirExplorerTableCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerTableColumn {
+    Dimension { dimension: KvasirExplorerDimension },
+    TotalTokens,
+    CostUsd,
+    CostSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerTableCell {
+    Day { value: KvasirRollupDay },
+    Repo { value: KvasirRepoBucket },
+    Model { value: KvasirModelName },
+    Harness { value: KvasirHarnessName },
+    TotalTokens { value: u64 },
+    EmptyTotalTokens,
+    CostUsd { value: KvasirCostUsd },
+    EmptyCostUsd,
+    CostSource { value: KvasirCostSource },
+    EmptyCostSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirExplorerValidationError {
+    EmptyMeasureSelection,
+    UnsupportedDataset {
+        dataset: KvasirExplorerDataset,
+    },
+    UnsupportedSavedPanel {
+        panel: KvasirExplorerSavedPanel,
+    },
+    UnsupportedMeasure {
+        measure: KvasirExplorerMeasure,
+    },
+    UnsupportedDimension {
+        dimension: KvasirExplorerDimension,
+    },
+    UnsupportedFilter {
+        dimension: KvasirExplorerDimension,
+    },
+    UnsupportedVisualization {
+        visualization: KvasirExplorerVisualization,
+    },
+    InvalidLimit {
+        requested: u64,
+        max: u64,
+    },
+    InvalidTimeRange,
+    TooManyGroups {
+        requested: u8,
+        max: u8,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct KvasirTrace {
     pub session_id: KvasirSessionId,
     pub prompt_id: KvasirPromptId,

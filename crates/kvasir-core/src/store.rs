@@ -20,6 +20,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use rusqlite::{Connection, params};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::explorer::{
+    ExplorerMeasure, ExplorerQuery, ExplorerQueryResult, ExplorerSavedPanelRun,
+    ExplorerValidationErrors, explorer_query_for_saved_panel, usage_rollup_cost_query,
+    usage_rollup_explorer_result, usage_rollup_token_query, validate_explorer_query,
+};
 use crate::pricing::PriceTable;
 use crate::rpc::{
     AttributionStatus, ContentAvailability, ContentKindAvailability, ContentQuery, ContentReplay,
@@ -800,6 +805,37 @@ impl UsageStore {
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn run_explorer_query(
+        &self,
+        query: ExplorerQuery,
+    ) -> Result<Result<ExplorerQueryResult, ExplorerValidationErrors>, StoreError> {
+        if let Err(errors) = validate_explorer_query(&query) {
+            return Ok(Err(errors));
+        }
+        let token_rollups = if query.measures.contains(&ExplorerMeasure::TotalTokens) {
+            self.token_rollups(usage_rollup_token_query(&query))?
+        } else {
+            Vec::new()
+        };
+        let cost_rollups = if query.measures.contains(&ExplorerMeasure::CostUsd) {
+            self.cost_rollups(usage_rollup_cost_query(&query))?
+        } else {
+            Vec::new()
+        };
+        Ok(Ok(usage_rollup_explorer_result(
+            query,
+            token_rollups,
+            cost_rollups,
+        )))
+    }
+
+    pub fn run_explorer_saved_panel(
+        &self,
+        run: ExplorerSavedPanelRun,
+    ) -> Result<Result<ExplorerQueryResult, ExplorerValidationErrors>, StoreError> {
+        self.run_explorer_query(explorer_query_for_saved_panel(run))
     }
 
     pub fn persisted_daily_token_rollups(&self) -> Result<Vec<TokenRollup>, StoreError> {

@@ -510,6 +510,151 @@ func kvasirOverviewSnapshotMappingNormalizesInvalidRepoBuckets() {
         )
     ])
 }
+
+@Test
+func kvasirUsageRollupExplorerPanelMappingPreservesTypedRequestAndSnapshot() throws {
+    let range = OverviewTimeRange(
+        start: Date(timeIntervalSince1970: 1_782_000_000),
+        end: Date(timeIntervalSince1970: 1_782_259_200)
+    )
+    let repo = OverviewRepoBucket.repo(OverviewRepoIdentity(
+        name: OverviewRepoName("kvasir"),
+        path: OverviewRepoPath("/repos/kvasir")
+    )!)
+    let savedPanel = ExplorerSavedPanelDefinition(
+        panel: .usageRollupsOverview,
+        dataset: .usageRollups,
+        measures: [.costUsd, .totalTokens],
+        groupBy: [.day, .repo],
+        filters: [.model(OverviewModelName("stale-model"))],
+        visualization: .table,
+        limit: 25
+    )
+
+    let request = try kvasirUsageRollupExplorerPanelRequest(
+        range: range,
+        filters: [.repo(repo)],
+        savedPanel: savedPanel
+    )
+
+    #expect(request.timeRange.start == KvasirTimestampMillis(value: 1_782_000_000_000))
+    #expect(request.timeRange.end == KvasirTimestampMillis(value: 1_782_259_200_000))
+    #expect(request.filters == [
+        .repo(value: KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir"))
+    ])
+    #expect(request.savedPanel == KvasirExplorerSavedPanelDefinition(
+        panel: .usageRollupsOverview,
+        dataset: .usageRollups,
+        measures: [.costUsd, .totalTokens],
+        groupBy: [.day, .repo],
+        filters: [.model(value: "stale-model")],
+        visualization: .table,
+        limit: 25
+    ))
+
+    let mapped = usageRollupExplorerPanelSnapshotFromKvasir(
+        KvasirUsageRollupExplorerPanelSnapshot(
+            panel: KvasirExplorerSavedPanelDefinition(
+                panel: .usageRollupsOverview,
+                dataset: .usageRollups,
+                measures: [.costUsd, .totalTokens],
+                groupBy: [.day, .repo],
+                filters: [.repo(value: KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir"))],
+                visualization: .table,
+                limit: 25
+            ),
+            query: KvasirExplorerQuery(
+                dataset: .usageRollups,
+                timeRange: request.timeRange,
+                measures: [.costUsd, .totalTokens],
+                groupBy: [.day, .repo],
+                filters: [.repo(value: KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir"))],
+                visualization: .table,
+                limit: 25
+            ),
+            result: KvasirExplorerResult(
+                dataset: .usageRollups,
+                visualization: .table,
+                rows: [
+                    KvasirExplorerResultRow(
+                        group: [
+                            .day(value: KvasirRollupDay(year: 2026, month: 6, day: 20)),
+                            .repo(value: KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir")),
+                        ],
+                        measures: KvasirUsageRollupExplorerMeasures(
+                            totalTokens: 1_700,
+                            costUsd: KvasirCostUsd(nanos: 54_150_000),
+                            costSource: .estimated
+                        )
+                    )
+                ]
+            ),
+            table: KvasirExplorerTablePresentation(
+                columns: [
+                    .dimension(dimension: .day),
+                    .dimension(dimension: .repo),
+                    .costUsd,
+                    .costSource,
+                    .totalTokens,
+                ],
+                rows: [
+                    KvasirExplorerTableRowPresentation(cells: [
+                        .day(value: KvasirRollupDay(year: 2026, month: 6, day: 20)),
+                        .repo(value: KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir")),
+                        .costUsd(value: KvasirCostUsd(nanos: 54_150_000)),
+                        .costSource(value: .estimated),
+                        .totalTokens(value: 1_700),
+                    ]),
+                    KvasirExplorerTableRowPresentation(cells: [
+                        .day(value: KvasirRollupDay(year: 2026, month: 6, day: 21)),
+                        .repo(value: KvasirRepoBucket(kind: .repo, name: "kvasir", path: "/repos/kvasir")),
+                        .emptyCostUsd,
+                        .emptyCostSource,
+                        .emptyTotalTokens,
+                    ])
+                ]
+            )
+        )
+    )
+
+    #expect(mapped.panel.filters == [.repo(repo)])
+    #expect(mapped.query.filters == [.repo(repo)])
+    #expect(mapped.table.columns == [
+        .dimension(.day),
+        .dimension(.repo),
+        .costUsd,
+        .costSource,
+        .totalTokens,
+    ])
+    #expect(mapped.table.rows.first?.cells == [
+        .day(OverviewRollupDay(year: 2026, month: 6, day: 20)),
+        .repo(repo),
+        .costUsd(54_150_000),
+        .costSource(.estimated),
+        .totalTokens(1_700),
+    ])
+    #expect(mapped.table.rows.dropFirst().first?.cells == [
+        .day(OverviewRollupDay(year: 2026, month: 6, day: 21)),
+        .repo(repo),
+        .emptyCostUsd,
+        .emptyCostSource,
+        .emptyTotalTokens,
+    ])
+}
+
+@Test
+func kvasirUsageRollupExplorerPanelRequestRejectsInvalidTimestamps() throws {
+    #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
+        _ = try kvasirUsageRollupExplorerPanelRequest(
+            range: OverviewTimeRange(
+                start: Date(timeIntervalSince1970: .nan),
+                end: Date(timeIntervalSince1970: 1)
+            ),
+            filters: [],
+            savedPanel: nil
+        )
+    }
+}
 #endif
 
 @Test

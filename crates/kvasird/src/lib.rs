@@ -15,6 +15,10 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use kvasir_core::explorer::{
+    ExplorerCatalog, ExplorerQueryResult, ExplorerSavedPanel, ExplorerSavedPanelDefinition,
+    ExplorerSavedPanelRun, explorer_catalog, explorer_saved_panel,
+};
 use kvasir_core::rpc::{
     BearerToken, ContentQuery, ContentReplay, CostRollup, CostRollupQuery, OverviewRollup,
     RollupQuery, RpcError, RpcRequest, RpcResponse, RpcStreamEvent, TokenRollup, ToolCallRollup,
@@ -1034,6 +1038,101 @@ pub async fn query_tool_call_rollup(
     }
 }
 
+pub async fn query_explorer_catalog(
+    socket_path: impl Into<PathBuf>,
+) -> anyhow::Result<ExplorerCatalog> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::ExplorerCatalog;
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::ExplorerCatalog { catalog } => Ok(catalog),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
+pub async fn query_explorer_saved_panel(
+    socket_path: impl Into<PathBuf>,
+    panel: ExplorerSavedPanel,
+) -> anyhow::Result<ExplorerSavedPanelDefinition> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::ExplorerSavedPanel { panel };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::ExplorerSavedPanel { panel } => Ok(panel),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
+pub async fn query_explorer(
+    socket_path: impl Into<PathBuf>,
+    query: kvasir_core::explorer::ExplorerQuery,
+) -> anyhow::Result<ExplorerQueryResult> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::ExplorerQuery { query };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::ExplorerQuery { result } => Ok(result),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
+pub async fn run_explorer_saved_panel(
+    socket_path: impl Into<PathBuf>,
+    run: ExplorerSavedPanelRun,
+) -> anyhow::Result<ExplorerQueryResult> {
+    let mut stream = UnixStream::connect(socket_path.into()).await?;
+    let request = RpcRequest::ExplorerSavedPanelRun { run };
+    let mut request_bytes = serde_json::to_vec(&request)?;
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await?;
+
+    let mut reader = BufReader::new(stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RPC_RESPONSE_BYTES,
+        DaemonError::RpcResponseTooLarge,
+    )
+    .await?;
+    match serde_json::from_str::<RpcResponse>(&response)? {
+        RpcResponse::ExplorerSavedPanelRun { result } => Ok(result),
+        RpcResponse::Error { error } => Err(DaemonError::RpcReturnedError(error).into()),
+        _ => Err(DaemonError::RpcReturnedWrongResponse.into()),
+    }
+}
+
 pub async fn query_overview_rollup(
     socket_path: impl Into<PathBuf>,
     query: RollupQuery,
@@ -1438,6 +1537,38 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                         }
                     }
                 }
+            }
+        }
+        Ok(RpcRequest::ExplorerCatalog) => RpcResponse::ExplorerCatalog {
+            catalog: explorer_catalog(),
+        },
+        Ok(RpcRequest::ExplorerSavedPanel { panel }) => RpcResponse::ExplorerSavedPanel {
+            panel: explorer_saved_panel(panel),
+        },
+        Ok(RpcRequest::ExplorerQuery { query }) => {
+            match state.store.lock().await.run_explorer_query(query) {
+                Ok(Ok(result)) => RpcResponse::ExplorerQuery { result },
+                Ok(Err(errors)) => RpcResponse::Error {
+                    error: RpcError::ExplorerValidation {
+                        errors: errors.errors,
+                    },
+                },
+                Err(_err) => RpcResponse::Error {
+                    error: RpcError::Internal,
+                },
+            }
+        }
+        Ok(RpcRequest::ExplorerSavedPanelRun { run }) => {
+            match state.store.lock().await.run_explorer_saved_panel(run) {
+                Ok(Ok(result)) => RpcResponse::ExplorerSavedPanelRun { result },
+                Ok(Err(errors)) => RpcResponse::Error {
+                    error: RpcError::ExplorerValidation {
+                        errors: errors.errors,
+                    },
+                },
+                Err(_err) => RpcResponse::Error {
+                    error: RpcError::Internal,
+                },
             }
         }
         Ok(RpcRequest::TokenRollup { query }) => {
