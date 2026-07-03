@@ -1508,6 +1508,27 @@ async fn usage_update_subscriber_hears_background_raw_body_import() -> anyhow::R
         );
     }
 
+    // The notification must correspond to user-visible content: replay now
+    // serves the late-imported bodies without any further ingest.
+    let replay = query_content(
+        rpc_socket_path.clone(),
+        ContentQuery {
+            harness: HarnessName::new("claude_code"),
+            session_id: kvasir_core::rpc::SessionId::new("claude-session-1"),
+            prompt_id: kvasir_core::rpc::PromptId::new("claude-turn-1"),
+        },
+        BearerToken::new("test-token"),
+    )
+    .await?;
+    assert_eq!(
+        replay.items[0].content.as_str(),
+        r#"{"messages":[{"role":"user","content":"arrived after subscribe"}]}"#
+    );
+    assert_eq!(
+        replay.items[1].content.as_str(),
+        r#"{"content":[{"type":"text","text":"arrived after subscribe response"}]}"#
+    );
+
     drop(daemon);
     Ok(())
 }
@@ -1544,9 +1565,11 @@ async fn usage_update_subscriber_hears_clear_all_data() -> anyhow::Result<()> {
     clear_bytes.push(b'\n');
     clear_stream.write_all(&clear_bytes).await?;
     let mut clear_response = Vec::new();
-    BufReader::new(clear_stream)
-        .read_until(b'\n', &mut clear_response)
-        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(clear_stream).read_until(b'\n', &mut clear_response),
+    )
+    .await??;
 
     assert_eq!(
         read_usage_update_kind(&mut reader).await?,

@@ -1650,7 +1650,9 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     update = updates.recv() => {
                         match update {
-                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Ok(DataUpdate::ContentImported) => {}
+                            Ok(DataUpdate::RollupsChanged | DataUpdate::Cleared)
+                            | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 match write_token_rollup_event_if_changed(
                                     &mut writer,
                                     &state,
