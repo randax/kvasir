@@ -643,6 +643,27 @@ func kvasirUsageRollupExplorerPanelMappingPreservesTypedRequestAndSnapshot() thr
 }
 
 @Test
+func kvasirRollupQueryRejectsInvalidTimestamps() throws {
+    #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
+        _ = try kvasirRollupQuery(from: OverviewQuery(
+            start: Date(timeIntervalSince1970: .nan),
+            end: Date(timeIntervalSince1970: 1)
+        ))
+    }
+}
+
+@Test
+func kvasirRollupQueryConvertsFiniteDatesToMilliseconds() throws {
+    let query = try kvasirRollupQuery(from: OverviewQuery(
+        start: Date(timeIntervalSince1970: 1_782_000_000),
+        end: Date(timeIntervalSince1970: 1_782_259_200)
+    ))
+
+    #expect(query.start == KvasirTimestampMillis(value: 1_782_000_000_000))
+    #expect(query.end == KvasirTimestampMillis(value: 1_782_259_200_000))
+}
+
+@Test
 func kvasirUsageRollupExplorerPanelRequestRejectsInvalidTimestamps() throws {
     #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
         _ = try kvasirUsageRollupExplorerPanelRequest(
