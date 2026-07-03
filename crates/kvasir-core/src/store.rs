@@ -3161,6 +3161,8 @@ impl UsageStore {
         record: &CostUsageRecord,
     ) -> Result<(), StoreError> {
         let stored_repo = StoredRepo::from_bucket(&record.repo);
+        // Sum per group in Rust: SQL SUM raises an integer overflow error when
+        // a group's total exceeds i64::MAX, while u64 accumulation saturates.
         let mut statement = transaction.prepare(
             "SELECT
                 day,
@@ -3168,7 +3170,7 @@ impl UsageStore {
                 repo_name,
                 repo_path,
                 model,
-                SUM(cost_usd_nanos) AS cost_usd_nanos
+                cost_usd_nanos
              FROM canonical_cost_usage
              WHERE repo_bucket = ?1
                 AND repo_name = ?2
@@ -3177,10 +3179,9 @@ impl UsageStore {
                 AND model = ?5
                 AND (counter_start_ms = ?6 OR counter_start_ms IS NULL)
                 AND occurred_at_ms <= ?7
-                AND cost_source = ?8
-             GROUP BY day, repo_bucket, repo_name, repo_path, model",
+                AND cost_source = ?8",
         )?;
-        let estimated_rollups = statement
+        let estimated_rows = statement
             .query_map(
                 params![
                     stored_repo.bucket,
@@ -3193,35 +3194,43 @@ impl UsageStore {
                     ESTIMATED_COST_SOURCE,
                 ],
                 |row| {
-                    Ok(EstimatedCostRollup {
-                        day: row.get(0)?,
-                        repo_bucket: row.get(1)?,
-                        repo_name: row.get(2)?,
-                        repo_path: row.get(3)?,
-                        model: row.get(4)?,
-                        cost_usd_nanos: row.get(5)?,
-                    })
+                    Ok((
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ),
+                        unsigned_token_column(row, 5)?,
+                    ))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
 
-        for rollup in estimated_rollups {
+        let mut estimated_rollups: BTreeMap<CostRollupGroupKey, u64> = BTreeMap::new();
+        for (key, cost_usd_nanos) in estimated_rows {
+            let total = estimated_rollups.entry(key).or_insert(0);
+            *total = total.saturating_add(cost_usd_nanos);
+        }
+
+        for ((day, repo_bucket, repo_name, repo_path, model), cost_usd_nanos) in estimated_rollups {
             transaction.execute(
                 "UPDATE cost_rollups
-                 SET estimated_cost_usd_nanos = estimated_cost_usd_nanos - ?1
+                 SET estimated_cost_usd_nanos = MAX(estimated_cost_usd_nanos - ?1, 0)
                  WHERE day = ?2
                     AND repo_bucket = ?3
                     AND repo_name = ?4
                     AND repo_path = ?5
                     AND model = ?6",
                 params![
-                    rollup.cost_usd_nanos,
-                    rollup.day,
-                    rollup.repo_bucket,
-                    rollup.repo_name,
-                    rollup.repo_path,
-                    rollup.model,
+                    CostUsd::from_nanos_clamped(cost_usd_nanos).storage_value(),
+                    day,
+                    repo_bucket,
+                    repo_name,
+                    repo_path,
+                    model,
                 ],
             )?;
         }
@@ -3349,7 +3358,7 @@ impl UsageStore {
         for row in superseded {
             transaction.execute(
                 "UPDATE cost_rollups
-                 SET estimated_cost_usd_nanos = estimated_cost_usd_nanos - ?1
+                 SET estimated_cost_usd_nanos = MAX(estimated_cost_usd_nanos - ?1, 0)
                  WHERE day = ?2
                     AND repo_bucket = ?3
                     AND repo_name = ?4
@@ -5193,15 +5202,6 @@ struct CostRollupAccumulator {
     day: RollupDay,
     cost_usd_nanos: u64,
     cost_source: CostSource,
-}
-
-struct EstimatedCostRollup {
-    day: String,
-    repo_bucket: String,
-    repo_name: String,
-    repo_path: String,
-    model: String,
-    cost_usd_nanos: i64,
 }
 
 struct EstimatedCostRow {
