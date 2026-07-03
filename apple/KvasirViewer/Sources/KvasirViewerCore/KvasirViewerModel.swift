@@ -99,6 +99,7 @@ public final class KvasirViewerModel: ObservableObject {
     private let launchAgent: DaemonLaunchAgent
     private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
     private let enablePostStartupOverviewRecovery: @Sendable () -> Void
+    private let liveOverviewUpdateRearmDelay: @Sendable (Int) async throws -> Void
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
@@ -115,6 +116,7 @@ public final class KvasirViewerModel: ObservableObject {
         shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
         enablePostStartupOverviewRecovery: @escaping @Sendable () -> Void = {},
         selectedRangePreset: OverviewRangePreset = .lastSevenDays,
+        liveOverviewUpdateRearmDelay: @escaping @Sendable (Int) async throws -> Void = KvasirViewerModel.defaultLiveOverviewUpdateRearmDelay,
         now: @escaping () -> Date = Date.init,
         calendar: Calendar = .kvasirRollupUTC
     ) {
@@ -127,8 +129,14 @@ public final class KvasirViewerModel: ObservableObject {
         self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
         self.enablePostStartupOverviewRecovery = enablePostStartupOverviewRecovery
         self.selectedRangePreset = selectedRangePreset
+        self.liveOverviewUpdateRearmDelay = liveOverviewUpdateRearmDelay
         self.now = now
         self.calendar = calendar
+    }
+
+    public static func defaultLiveOverviewUpdateRearmDelay(attempt: Int) async throws {
+        let milliseconds = min(500 * attempt, 5_000)
+        try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
     }
 
     public func start() async throws {
@@ -405,18 +413,30 @@ public final class KvasirViewerModel: ObservableObject {
         guard liveOverviewUpdates == nil else {
             return
         }
-        liveOverviewUpdates = Task { [weak self, dashboard] in
-            for await _ in dashboard.overviewRefreshEvents() {
-                guard let self else {
+        liveOverviewUpdates = Task { [weak self, dashboard, liveOverviewUpdateRearmDelay] in
+            var rearmAttempt = 0
+            while !Task.isCancelled {
+                for await _ in dashboard.overviewRefreshEvents() {
+                    guard let self else {
+                        return
+                    }
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    do {
+                        try await refreshOverview()
+                    } catch {
+                        record(error: error)
+                    }
+                }
+                guard self != nil, !Task.isCancelled else {
                     return
                 }
-                guard !Task.isCancelled else {
-                    return
-                }
+                rearmAttempt += 1
                 do {
-                    try await refreshOverview()
+                    try await liveOverviewUpdateRearmDelay(rearmAttempt)
                 } catch {
-                    record(error: error)
+                    return
                 }
             }
         }

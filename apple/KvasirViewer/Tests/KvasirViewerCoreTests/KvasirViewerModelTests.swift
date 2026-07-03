@@ -140,6 +140,37 @@ func failedLiveOverviewUpdateKeepsSnapshotAndListenerRecovers() async throws {
 
 @MainActor
 @Test
+func liveOverviewUpdatesRearmAfterUpdateStreamFinishes() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let rearmDelays = RearmDelayRecorder()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        liveOverviewUpdateRearmDelay: { attempt in rearmDelays.append(attempt) }
+    )
+
+    try await model.start()
+    #expect(model.overviewSnapshot?.totals.totalTokens == 35)
+    await updateSource.waitForSubscriptions(count: 1)
+
+    updateSource.finishCurrentStream()
+    await updateSource.waitForSubscriptions(count: 2)
+    #expect(rearmDelays.attempts == [1])
+
+    updateSource.send()
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+}
+
+@MainActor
+@Test
 func liveOverviewListenerDoesNotRetainModel() async throws {
     let updateSource = ManualOverviewUpdateSource()
     let client = RecordingResultOverviewClient(
@@ -1632,6 +1663,53 @@ private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked
 
     func send() {
         continuation.yield(())
+    }
+}
+
+private final class RestartingManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [AsyncStream<Void>.Continuation] = []
+
+    func overviewRefreshEvents() -> AsyncStream<Void> {
+        AsyncStream { continuation in
+            lock.withLock {
+                continuations.append(continuation)
+            }
+        }
+    }
+
+    func send() {
+        let continuation = lock.withLock { continuations.last }
+        continuation?.yield(())
+    }
+
+    func finishCurrentStream() {
+        let continuation = lock.withLock { continuations.last }
+        continuation?.finish()
+    }
+
+    func waitForSubscriptions(
+        count: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while lock.withLock({ continuations.count < count }), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        if lock.withLock({ continuations.count < count }) {
+            Issue.record("expected \(count) update subscriptions", sourceLocation: sourceLocation)
+        }
+    }
+}
+
+private final class RearmDelayRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var attempts: [Int] = []
+
+    func append(_ attempt: Int) {
+        lock.withLock {
+            attempts.append(attempt)
+        }
     }
 }
 
