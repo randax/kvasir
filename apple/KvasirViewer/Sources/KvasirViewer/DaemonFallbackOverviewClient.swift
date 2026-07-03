@@ -11,16 +11,16 @@ struct DaemonFallbackOverviewClient: OverviewClient {
     let starter: any DaemonProcessStarter
     let shouldStartDaemonAfterError: @Sendable (any Error) -> Bool
     let maximumRetryCount: Int
-    let retryDelay: @Sendable (Int) async -> Void
+    let retryDelay: @Sendable (Int) async throws -> Void
 
     init(
         primary: any OverviewClient,
         starter: any DaemonProcessStarter,
         shouldStartDaemonAfterError: @escaping @Sendable (any Error) -> Bool,
         maximumRetryCount: Int = 20,
-        retryDelay: @escaping @Sendable (Int) async -> Void = { attempt in
+        retryDelay: @escaping @Sendable (Int) async throws -> Void = { attempt in
             let milliseconds = min(50 * attempt, 250)
-            try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+            try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
         }
     ) {
         self.primary = primary
@@ -52,7 +52,7 @@ struct DaemonFallbackOverviewClient: OverviewClient {
                     throw error
                 }
                 retry += 1
-                await retryDelay(retry)
+                try await retryDelay(retry)
             }
         }
     }

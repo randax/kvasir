@@ -986,6 +986,41 @@ func daemonFallbackOverviewClientStopsRetryingAfterBoundedRecoverableFailures() 
     #expect(await retryDelay.attempts == [1, 2])
 }
 
+@Test
+func daemonFallbackOverviewClientStopsRetryingWhenLoadIsCancelled() async throws {
+    let primary = SequenceOverviewClient(results: Array(
+        repeating: .failure(DaemonFallbackTestError.recoverable),
+        count: 30
+    ))
+    let starter = RecordingDaemonProcessStarter()
+    let client = DaemonFallbackOverviewClient(
+        primary: primary,
+        starter: starter,
+        shouldStartDaemonAfterError: { error in
+            error as? DaemonFallbackTestError == .recoverable
+        },
+        retryDelay: { _ in
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        }
+    )
+
+    let load = Task {
+        try await client.loadOverviewSnapshot(
+            query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
+        )
+    }
+    await waitForLoadCount(primary, 2)
+    load.cancel()
+
+    do {
+        _ = try await load.value
+        Issue.record("expected cancelled load to throw")
+    } catch {
+        #expect(error is CancellationError)
+    }
+    #expect(await primary.loadCount == 2)
+}
+
 #if canImport(kvasir_client)
 @MainActor
 @Test
