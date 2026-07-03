@@ -871,7 +871,21 @@ fn default_harness_for_token_signal(signal: TokenUsageSignal) -> HarnessName {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenMeasure, TokenUsageSignal};
+    use super::{CostUsd, TokenMeasure, TokenUsageSignal};
+
+    #[test]
+    fn cost_from_nanos_clamped_keeps_representable_values_and_clamps_overflow() {
+        assert_eq!(
+            CostUsd::from_nanos_clamped(240_000),
+            CostUsd::from_nanos(240_000).unwrap()
+        );
+        assert_eq!(CostUsd::from_nanos_clamped(i64::MAX as u64), CostUsd::MAX);
+        assert_eq!(
+            CostUsd::from_nanos_clamped(i64::MAX as u64 + 1),
+            CostUsd::MAX
+        );
+        assert_eq!(CostUsd::from_nanos_clamped(u64::MAX), CostUsd::MAX);
+    }
 
     #[test]
     fn token_authority_is_defined_per_measure() {

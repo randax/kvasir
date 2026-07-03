@@ -936,19 +936,23 @@ async fn overview_rollup_clamps_aggregated_cost_beyond_i64_max() -> anyhow::Resu
         let mut store = UsageStore::open(&database_path, &test_store_key())?;
         let huge_cost =
             CostUsd::from_nanos(i64::MAX as u64).expect("i64::MAX nanos is representable");
-        let occurred_at =
-            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap());
-        let counter_start =
-            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 20, 11, 0, 0).unwrap());
-        let cost_usage = ["model-alpha", "model-beta"]
+        // Two counter resets for the same model, each reporting a huge cost, so
+        // both land as full-value rows in the same summary and rollup groups.
+        let cost_usage = [(11, 12), (13, 14)]
             .into_iter()
-            .map(|model| {
+            .map(|(counter_start_hour, occurred_at_hour)| {
                 CostUsageRecord::new_with_harness(
-                    occurred_at,
-                    counter_start,
+                    TimestampMillis::from_datetime(
+                        Utc.with_ymd_and_hms(2026, 6, 20, occurred_at_hour, 0, 0)
+                            .unwrap(),
+                    ),
+                    TimestampMillis::from_datetime(
+                        Utc.with_ymd_and_hms(2026, 6, 20, counter_start_hour, 0, 0)
+                            .unwrap(),
+                    ),
                     kvasir_repo(),
                     HarnessName::new("opencode"),
-                    ModelName::new(model),
+                    ModelName::new("model-alpha"),
                     huge_cost,
                 )
             })
@@ -985,6 +989,8 @@ async fn overview_rollup_clamps_aggregated_cost_beyond_i64_max() -> anyhow::Resu
         HarnessName::new("opencode")
     );
     assert_eq!(overview.harness_summaries[0].totals.cost_usd, CostUsd::MAX);
+    assert_eq!(overview.cost_rollups.len(), 1);
+    assert_eq!(overview.cost_rollups[0].cost_usd, CostUsd::MAX);
 
     drop(daemon);
     Ok(())

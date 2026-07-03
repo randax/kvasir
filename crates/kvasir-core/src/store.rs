@@ -1,3 +1,4 @@
+use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -881,6 +882,9 @@ impl UsageStore {
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
         let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let model_filter = query.model.as_ref().map(ModelName::as_str);
+        // Sum per group in Rust: SQL SUM raises an integer overflow error when
+        // a group's total exceeds i64::MAX, while u64 accumulation saturates
+        // and clamps to the maximum representable cost.
         let mut statement = self.connection.prepare(
             "SELECT
                 day,
@@ -888,20 +892,15 @@ impl UsageStore {
                 repo_name,
                 repo_path,
                 model,
-                SUM(cost_usd_nanos) AS cost_usd_nanos,
-                CASE
-                    WHEN MIN(cost_source) = MAX(cost_source) THEN MIN(cost_source)
-                    ELSE ?6
-                END AS cost_source
+                cost_usd_nanos,
+                cost_source
              FROM canonical_cost_usage
              WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
-                AND (?7 IS NULL OR model = ?7)
-                AND (?8 IS NULL OR harness = ?8)
-             GROUP BY day, repo_bucket, repo_name, repo_path, model
-             ORDER BY day, repo_bucket, repo_name, repo_path, model",
+                AND (?6 IS NULL OR model = ?6)
+                AND (?7 IS NULL OR harness = ?7)",
         )?;
         let rows = statement.query_map(
             params![
@@ -910,33 +909,65 @@ impl UsageStore {
                 repo_name_filter,
                 repo_path_filter,
                 repo_bucket_filter,
-                MIXED_COST_SOURCE,
                 model_filter,
                 harness_filter,
             ],
             |row| {
                 let day: String = row.get(0)?;
-                let repo_bucket: String = row.get(1)?;
-                let repo_name: String = row.get(2)?;
-                let repo_path: String = row.get(3)?;
-                let model: String = row.get(4)?;
-                Ok(CostRollup {
-                    day: RollupDay::parse(&day).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?,
-                    repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
-                    model: ModelName::new(model),
-                    cost_usd: cost_column(row, 5)?,
-                    source: cost_source_column(row, 6)?,
-                })
+                let parsed_day = RollupDay::parse(&day).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?;
+                Ok((
+                    (
+                        day,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ),
+                    parsed_day,
+                    unsigned_token_column(row, 5)?,
+                    cost_source_column(row, 6)?,
+                ))
             },
         )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        // BTreeMap over string keys matches the previous SQL BINARY-collation
+        // ordering by (day, repo_bucket, repo_name, repo_path, model).
+        let mut groups: BTreeMap<CostRollupGroupKey, CostRollupAccumulator> = BTreeMap::new();
+        for row in rows {
+            let (key, day, cost_usd_nanos, cost_source) = row?;
+            match groups.entry(key) {
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(CostRollupAccumulator {
+                        day,
+                        cost_usd_nanos,
+                        cost_source,
+                    });
+                }
+                btree_map::Entry::Occupied(mut entry) => {
+                    let group = entry.get_mut();
+                    group.cost_usd_nanos = group.cost_usd_nanos.saturating_add(cost_usd_nanos);
+                    group.cost_source =
+                        combined_summary_cost_source(Some(group.cost_source), cost_source);
+                }
+            }
+        }
+        Ok(groups
+            .into_iter()
+            .map(
+                |((_, repo_bucket, repo_name, repo_path, model), group)| CostRollup {
+                    day: group.day,
+                    repo: repo_bucket_from_storage(&repo_bucket, repo_name, repo_path),
+                    model: ModelName::new(model),
+                    cost_usd: CostUsd::from_nanos_clamped(group.cost_usd_nanos),
+                    source: group.cost_source,
+                },
+            )
+            .collect())
     }
 
     pub fn tool_call_rollups(
@@ -2874,7 +2905,10 @@ impl UsageStore {
                     day, repo_bucket, repo_name, repo_path, model, native_cost_usd_nanos, estimated_cost_usd_nanos
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
                 ON CONFLICT(day, repo_bucket, repo_name, repo_path, model) DO UPDATE SET
-                    native_cost_usd_nanos = native_cost_usd_nanos + excluded.native_cost_usd_nanos",
+                    native_cost_usd_nanos = MIN(
+                        native_cost_usd_nanos + excluded.native_cost_usd_nanos,
+                        9223372036854775807
+                    )",
                 params![
                     day,
                     stored_repo.bucket,
@@ -3263,7 +3297,10 @@ impl UsageStore {
                     day, repo_bucket, repo_name, repo_path, model, native_cost_usd_nanos, estimated_cost_usd_nanos
                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
                 ON CONFLICT(day, repo_bucket, repo_name, repo_path, model) DO UPDATE SET
-                    estimated_cost_usd_nanos = estimated_cost_usd_nanos + excluded.estimated_cost_usd_nanos",
+                    estimated_cost_usd_nanos = MIN(
+                        estimated_cost_usd_nanos + excluded.estimated_cost_usd_nanos,
+                        9223372036854775807
+                    )",
                 params![
                     day,
                     stored_repo.bucket,
@@ -5148,6 +5185,16 @@ struct NativeCostCoverage {
     latest_occurred_at_by_key: HashMap<NativeCostKey, i64>,
 }
 
+/// Storage-side grouping key for cost rollups:
+/// (day, repo_bucket, repo_name, repo_path, model).
+type CostRollupGroupKey = (String, String, String, String, String);
+
+struct CostRollupAccumulator {
+    day: RollupDay,
+    cost_usd_nanos: u64,
+    cost_source: CostSource,
+}
+
 struct EstimatedCostRollup {
     day: String,
     repo_bucket: String,
@@ -5750,17 +5797,6 @@ fn unsigned_token_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Res
             index,
             rusqlite::types::Type::Integer,
             Box::new(err),
-        )
-    })
-}
-
-fn cost_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<crate::usage::CostUsd> {
-    let value = row.get::<_, i64>(index)?;
-    crate::usage::CostUsd::from_storage_value(value).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            index,
-            rusqlite::types::Type::Integer,
-            "cost must be non-negative and fit storage".into(),
         )
     })
 }
@@ -8125,6 +8161,50 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].harness, HarnessName::new("opencode"));
         assert_eq!(summaries[0].totals.cost_usd, CostUsd::MAX);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cost_rollups_clamp_aggregated_cost_beyond_i64_max() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let huge_cost = CostUsd::from_nanos(i64::MAX as u64).expect("i64::MAX fits cost storage");
+        // Two counter resets for the same model, each reporting a huge cost, so
+        // both land as full-value rows in the same (day, repo, model) group.
+        let cost_usage = [1_781_956_700_000_i64, 1_781_956_750_000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, counter_start)| {
+                CostUsageRecord::new_with_harness(
+                    TimestampMillis::new_for_test(1_781_956_800_000 + index as i64),
+                    TimestampMillis::new_for_test(counter_start),
+                    kvasir_repo("/not/persisted"),
+                    HarnessName::new("opencode"),
+                    ModelName::new("model-alpha"),
+                    huge_cost,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage,
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+            raw_body_references: Vec::new(),
+        })?;
+
+        let rollups = store.cost_rollups(CostRollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        ))?;
+
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].model, ModelName::new("model-alpha"));
+        assert_eq!(rollups[0].cost_usd, CostUsd::MAX);
 
         Ok(())
     }
