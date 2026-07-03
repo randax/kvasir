@@ -527,9 +527,7 @@ pub fn usage_rollup_explorer_result(
                     .map(|cost| cost.as_nanos())
                     .unwrap_or(0);
                 let total_cost = existing_cost.saturating_add(rollup.cost_usd.as_nanos());
-                let clamped_cost = total_cost.min(i64::MAX as u64);
-                row.measures.cost_usd =
-                    Some(CostUsd::from_nanos(clamped_cost).expect("clamped cost fits storage"));
+                row.measures.cost_usd = Some(CostUsd::from_nanos_clamped(total_cost));
                 row.measures.cost_source = Some(combined_cost_source(
                     row.measures.cost_source,
                     rollup.source,
@@ -757,9 +755,8 @@ mod tests {
             result.rows[0]
                 .measures
                 .cost_usd
-                .expect("cost measure should be populated")
-                .as_nanos(),
-            i64::MAX as u64
+                .expect("cost measure should be populated"),
+            CostUsd::MAX
         );
     }
 

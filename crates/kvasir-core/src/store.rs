@@ -1251,23 +1251,21 @@ impl UsageStore {
         let repo_path_filter = repo_filter.as_ref().map(|repo| repo.path);
         let harness_filter = query.harness.as_ref().map(HarnessName::as_str);
         let model_filter = query.model.as_ref().map(ModelName::as_str);
+        // Sum per row in Rust: SQL SUM raises an integer overflow error when a
+        // group's total exceeds i64::MAX, while the accumulator saturates.
         let mut statement = self.connection.prepare(
             "SELECT
                 harness,
-                MAX(occurred_at_ms) AS last_activity,
-                SUM(cost_usd_nanos) AS cost_usd_nanos,
-                CASE
-                    WHEN MIN(cost_source) = MAX(cost_source) THEN MIN(cost_source)
-                    ELSE ?8
-                END AS cost_source
+                occurred_at_ms AS last_activity,
+                cost_usd_nanos,
+                cost_source
              FROM canonical_cost_usage
              WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
                 AND (?3 IS NULL OR repo_name = ?3)
                 AND (?4 IS NULL OR repo_path = ?4)
                 AND (?5 IS NULL OR repo_bucket = ?5)
                 AND (?6 IS NULL OR harness = ?6)
-                AND (?7 IS NULL OR model = ?7)
-             GROUP BY harness",
+                AND (?7 IS NULL OR model = ?7)",
         )?;
         let rows = statement.query_map(
             params![
@@ -1278,7 +1276,6 @@ impl UsageStore {
                 repo_bucket_filter,
                 harness_filter,
                 model_filter,
-                MIXED_COST_SOURCE,
             ],
             |row| {
                 Ok((
@@ -5277,9 +5274,7 @@ impl SummaryAccumulator {
     fn totals(&self) -> SummaryTotals {
         SummaryTotals {
             total_tokens: self.total_tokens,
-            cost_usd: CostUsd::from_nanos(self.cost_usd_nanos).unwrap_or_else(|| {
-                CostUsd::from_nanos(u64::MAX).expect("u64::MAX fits cost storage")
-            }),
+            cost_usd: CostUsd::from_nanos_clamped(self.cost_usd_nanos),
             cost_source: self.cost_source,
             tool_calls: self.tool_calls,
         }
@@ -8089,6 +8084,47 @@ mod tests {
             page.summaries[9].route.session_id,
             SessionId::new("session-02")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn harness_summaries_clamp_aggregated_cost_beyond_i64_max()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut store = open_test_store(temp.path().join("usage.sqlite3"))?;
+        let huge_cost = CostUsd::from_nanos(i64::MAX as u64).expect("i64::MAX fits cost storage");
+        let cost_usage = ["model-alpha", "model-beta"]
+            .into_iter()
+            .map(|model| {
+                CostUsageRecord::new_with_harness(
+                    TimestampMillis::new_for_test(1_781_956_800_000),
+                    TimestampMillis::new_for_test(1_781_956_700_000),
+                    kvasir_repo("/not/persisted"),
+                    HarnessName::new("opencode"),
+                    ModelName::new(model),
+                    huge_cost,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        store.ingest_usage(&UsageRecords {
+            token_usage: Vec::new(),
+            cost_usage,
+            tool_calls: Vec::new(),
+            trace_spans: Vec::new(),
+            content: Vec::new(),
+            raw_body_references: Vec::new(),
+        })?;
+
+        let summaries = store.harness_summaries(RollupQuery::new(
+            TimestampMillis::new_for_test(1_781_956_000_000),
+            TimestampMillis::new_for_test(1_781_970_000_000),
+        ))?;
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].harness, HarnessName::new("opencode"));
+        assert_eq!(summaries[0].totals.cost_usd, CostUsd::MAX);
 
         Ok(())
     }
