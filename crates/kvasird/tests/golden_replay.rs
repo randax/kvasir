@@ -18,8 +18,8 @@ use kvasir_core::rpc::{
     TokenRollup, ToolCallRollup, ToolCallRollupQuery, ToolName, TraceSpanKind,
 };
 use kvasir_core::{
-    ContentKind, ContentRetentionPolicy, ContentText, CostUsd, ModelTokenPrices, PriceTable,
-    RepoBucket, RepoIdentity, RepoName, RepoPath, StoreKey, UsageStore,
+    ContentKind, ContentRetentionPolicy, ContentText, CostUsageRecord, CostUsd, ModelTokenPrices,
+    PriceTable, RepoBucket, RepoIdentity, RepoName, RepoPath, StoreKey, UsageRecords, UsageStore,
 };
 use kvasird::{
     ContentRetentionSchedule, DaemonConfig, RunningDaemon, StoreKeySource, query_content,
@@ -924,6 +924,75 @@ async fn daemon_content_retention_compaction_purges_replay_but_preserves_rollups
     assert_eq!(overview.tool_call_rollups.len(), 1);
     assert_eq!(overview.harness_summaries[0].totals.tool_calls, 1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn overview_rollup_clamps_aggregated_cost_beyond_i64_max() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let rpc_socket_path = temp.path().join("kvasird.sock");
+    let database_path = temp.path().join("usage.sqlite3");
+    {
+        let mut store = UsageStore::open(&database_path, &test_store_key())?;
+        let huge_cost =
+            CostUsd::from_nanos(i64::MAX as u64).expect("i64::MAX nanos is representable");
+        // Two counter resets for the same model, each reporting a huge cost, so
+        // both land as full-value rows in the same summary and rollup groups.
+        let cost_usage = [(11, 12), (13, 14)]
+            .into_iter()
+            .map(|(counter_start_hour, occurred_at_hour)| {
+                CostUsageRecord::new_with_harness(
+                    TimestampMillis::from_datetime(
+                        Utc.with_ymd_and_hms(2026, 6, 20, occurred_at_hour, 0, 0)
+                            .unwrap(),
+                    ),
+                    TimestampMillis::from_datetime(
+                        Utc.with_ymd_and_hms(2026, 6, 20, counter_start_hour, 0, 0)
+                            .unwrap(),
+                    ),
+                    kvasir_repo(),
+                    HarnessName::new("opencode"),
+                    ModelName::new("model-alpha"),
+                    huge_cost,
+                )
+            })
+            .collect::<Vec<_>>();
+        store.ingest_usage(&UsageRecords {
+            cost_usage,
+            ..UsageRecords::default()
+        })?;
+    }
+
+    let daemon = start_test_daemon(DaemonConfig {
+        otlp_bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        rpc_socket_path: rpc_socket_path.clone(),
+        database_path,
+        bearer_token: BearerToken::new("test-token"),
+        price_table: PriceTable::bundled_defaults(),
+        content_retention_policy: ContentRetentionPolicy::keep_forever(),
+        content_retention_schedule: ContentRetentionSchedule::default(),
+    })
+    .await?;
+
+    let overview = query_overview_rollup(
+        rpc_socket_path,
+        RollupQuery::new(
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap()),
+            TimestampMillis::from_datetime(Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap()),
+        ),
+    )
+    .await?;
+
+    assert_eq!(overview.harness_summaries.len(), 1);
+    assert_eq!(
+        overview.harness_summaries[0].harness,
+        HarnessName::new("opencode")
+    );
+    assert_eq!(overview.harness_summaries[0].totals.cost_usd, CostUsd::MAX);
+    assert_eq!(overview.cost_rollups.len(), 1);
+    assert_eq!(overview.cost_rollups[0].cost_usd, CostUsd::MAX);
+
+    drop(daemon);
     Ok(())
 }
 

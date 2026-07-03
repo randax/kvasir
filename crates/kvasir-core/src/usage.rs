@@ -506,8 +506,20 @@ pub struct CostUsd {
 }
 
 impl CostUsd {
+    /// The largest representable cost: `i64::MAX` nanos, the ceiling imposed
+    /// by SQLite integer storage. Aggregations clamp to this value.
+    pub const MAX: Self = Self {
+        nanos: i64::MAX as u64,
+    };
+
     pub fn from_nanos(nanos: u64) -> Option<Self> {
         i64::try_from(nanos).ok().map(|_| Self { nanos })
+    }
+
+    /// Builds a cost from aggregated nanos, clamping to [`CostUsd::MAX`] when
+    /// the total exceeds what cost storage can represent.
+    pub fn from_nanos_clamped(nanos: u64) -> Self {
+        Self::from_nanos(nanos).unwrap_or(Self::MAX)
     }
 
     pub fn from_whole_usd(value: u64) -> Option<Self> {
@@ -859,7 +871,21 @@ fn default_harness_for_token_signal(signal: TokenUsageSignal) -> HarnessName {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenMeasure, TokenUsageSignal};
+    use super::{CostUsd, TokenMeasure, TokenUsageSignal};
+
+    #[test]
+    fn cost_from_nanos_clamped_keeps_representable_values_and_clamps_overflow() {
+        assert_eq!(
+            CostUsd::from_nanos_clamped(240_000),
+            CostUsd::from_nanos(240_000).unwrap()
+        );
+        assert_eq!(CostUsd::from_nanos_clamped(i64::MAX as u64), CostUsd::MAX);
+        assert_eq!(
+            CostUsd::from_nanos_clamped(i64::MAX as u64 + 1),
+            CostUsd::MAX
+        );
+        assert_eq!(CostUsd::from_nanos_clamped(u64::MAX), CostUsd::MAX);
+    }
 
     #[test]
     fn token_authority_is_defined_per_measure() {
