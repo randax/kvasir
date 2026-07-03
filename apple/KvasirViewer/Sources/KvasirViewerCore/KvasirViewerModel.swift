@@ -162,8 +162,8 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     public func selectRangePreset(_ preset: OverviewRangePreset) async throws {
-        selectedRangePreset = preset
-        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
+        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil, rangePreset: preset) {
+            selectedRangePreset = preset
             selectedSession = nil
             selectedPrompt = nil
             clearTraceInspector()
@@ -282,11 +282,12 @@ public final class KvasirViewerModel: ObservableObject {
         harness: OverviewHarnessName?,
         session: OverviewSessionRoute? = nil,
         prompt: OverviewPromptRoute? = nil,
+        rangePreset: OverviewRangePreset? = nil,
         beforeCommit: () -> Void = {}
     ) async throws {
         overviewLoadID += 1
         let loadID = overviewLoadID
-        let range = selectedRangePreset.range(containing: now(), calendar: calendar)
+        let range = (rangePreset ?? selectedRangePreset).range(containing: now(), calendar: calendar)
         do {
             let snapshot = try await dashboard.load(
                 range: range,

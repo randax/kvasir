@@ -1226,6 +1226,40 @@ func failedRepoSelectionKeepsPreviousRepoAndSnapshot() async throws {
 
 @MainActor
 @Test
+func failedRangePresetSelectionKeepsPreviousPresetAndSnapshot() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .failure(StartupTestError.transient)
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.refreshOverview()
+    let previousSnapshot = model.overviewSnapshot
+
+    do {
+        try await model.selectRangePreset(.today)
+        Issue.record("expected failed range selection")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    #expect(model.selectedRangePreset == .lastSevenDays)
+    #expect(model.overviewSnapshot == previousSnapshot)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query,
+        OverviewRangePreset.today.range(containing: now, calendar: .kvasirRollupUTC).query
+    ])
+}
+
+@MainActor
+@Test
 func staleOverviewLoadsCannotOverwriteNewerRangeSelection() async throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
