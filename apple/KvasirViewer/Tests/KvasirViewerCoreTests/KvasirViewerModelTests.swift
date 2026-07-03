@@ -224,6 +224,40 @@ func liveOverviewUpdateRearmBackoffResetsAfterStreamDeliversEvent() async throws
 
 @MainActor
 @Test
+func liveOverviewUpdateDoesNotDropInFlightRangePresetSelection() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let client = OrderedOverviewResultClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    let start = Task { try await model.start() }
+    await client.waitForPendingLoads(count: 1)
+    client.completeLoad(at: 0)
+    try await start.value
+    await updateSource.waitForSubscriptions(count: 1)
+
+    let select = Task { try await model.selectRangePreset(.today) }
+    await client.waitForPendingLoads(count: 2)
+
+    updateSource.send()
+    try await Task.sleep(for: .milliseconds(50))
+
+    client.completeLoad(at: 1)
+    try await select.value
+
+    #expect(model.selectedRangePreset == .today)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+}
+
+@MainActor
+@Test
 func liveOverviewListenerDoesNotRetainModel() async throws {
     let updateSource = ManualOverviewUpdateSource()
     let client = RecordingResultOverviewClient(

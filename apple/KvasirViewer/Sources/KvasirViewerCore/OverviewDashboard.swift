@@ -654,16 +654,7 @@ public struct OverviewDashboard: Sendable {
         return try await client.loadOverviewSnapshot(query: query)
     }
 
-    public var supportsLiveUpdates: Bool {
-        updateSource != nil
-    }
-
-    public func overviewRefreshEvents() -> AsyncStream<Void> {
-        guard let updateSource else {
-            return AsyncStream { continuation in
-                continuation.finish()
-            }
-        }
-        return updateSource.overviewRefreshEvents()
+    public func overviewRefreshEvents() -> AsyncStream<Void>? {
+        updateSource?.overviewRefreshEvents()
     }
 }

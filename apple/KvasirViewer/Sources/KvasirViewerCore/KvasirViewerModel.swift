@@ -103,6 +103,7 @@ public final class KvasirViewerModel: ObservableObject {
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
+    private var inFlightOverviewLoads = 0
     private var traceInspectorLoadID: UInt64 = 0
     private var liveOverviewUpdates: Task<Void, Never>?
 
@@ -287,6 +288,8 @@ public final class KvasirViewerModel: ObservableObject {
     ) async throws {
         overviewLoadID += 1
         let loadID = overviewLoadID
+        inFlightOverviewLoads += 1
+        defer { inFlightOverviewLoads -= 1 }
         let range = (rangePreset ?? selectedRangePreset).range(containing: now(), calendar: calendar)
         do {
             let snapshot = try await dashboard.load(
@@ -411,13 +414,16 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     private func startLiveOverviewUpdatesIfNeeded() {
-        guard liveOverviewUpdates == nil, dashboard.supportsLiveUpdates else {
+        guard liveOverviewUpdates == nil else {
             return
         }
         liveOverviewUpdates = Task { [weak self, dashboard, liveOverviewUpdateRearmDelay] in
             var rearmAttempt = 0
             while !Task.isCancelled {
-                for await _ in dashboard.overviewRefreshEvents() {
+                guard let refreshEvents = dashboard.overviewRefreshEvents() else {
+                    return
+                }
+                for await _ in refreshEvents {
                     guard let self else {
                         return
                     }
@@ -425,6 +431,9 @@ public final class KvasirViewerModel: ObservableObject {
                         return
                     }
                     rearmAttempt = 0
+                    guard inFlightOverviewLoads == 0 else {
+                        continue
+                    }
                     do {
                         try await refreshOverview()
                     } catch {
