@@ -61,6 +61,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("sqlite refused to enable wal journal mode")]
     WalNotEnabled,
+    #[error("wal checkpoint was blocked by a concurrent reader")]
+    WalCheckpointBlocked,
     #[error("sqlite schema version {found} is newer than supported version {supported}")]
     IncompatibleSchema { found: i64, supported: i64 },
     #[error("non-monotonic cumulative tool-call counter")]
@@ -5143,7 +5145,13 @@ fn enable_wal_journal_mode(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn truncate_wal(connection: &Connection) -> Result<(), StoreError> {
-    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    // A blocked checkpoint reports busy=1 in its result row instead of
+    // erroring, so the flag must be checked explicitly.
+    let busy: i64 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(StoreError::WalCheckpointBlocked);
+    }
     Ok(())
 }
 
@@ -6209,6 +6217,33 @@ mod tests {
         store.clear_all_data()?;
 
         assert_eq!(std::fs::metadata(&wal_path)?.len(), 0);
+        Ok(())
+    }
+
+    // Slow by design: the checkpoint retries against the held snapshot for
+    // the full busy timeout before reporting itself blocked.
+    #[test]
+    fn clear_all_data_reports_a_blocked_wal_truncation() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let mut store = open_test_store(&database_path)?;
+        store.ingest_token_usage(&[usage_record(
+            "claude-opus-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            100,
+        )])?;
+
+        let snapshot_holder = UsageStore::open_reader(&database_path, &test_store_key())?;
+        snapshot_holder
+            .connection
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM token_rollups;")?;
+
+        let outcome = store.clear_all_data();
+
+        snapshot_holder.connection.execute_batch("COMMIT;")?;
+        assert!(matches!(outcome, Err(StoreError::WalCheckpointBlocked)));
         Ok(())
     }
 
