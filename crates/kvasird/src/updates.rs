@@ -7,6 +7,7 @@ const UPDATE_CHANNEL_CAPACITY: usize = 32;
 pub(crate) enum DataUpdate {
     RollupsChanged,
     ContentImported,
+    ContentEvicted,
     Cleared,
 }
 

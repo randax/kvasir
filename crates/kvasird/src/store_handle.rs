@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use kvasir_core::{StoreError, StoreKey, UsageStore};
+use kvasir_core::{PriceTable, StoreError, StoreKey, UsageStore};
 
 const MAX_READ_CONNECTIONS: usize = 4;
 
@@ -20,11 +20,16 @@ pub(crate) struct StoreHandle {
 }
 
 impl StoreHandle {
-    pub(crate) fn new(store: UsageStore, database_path: PathBuf, key: StoreKey) -> Self {
+    pub(crate) fn new(
+        store: UsageStore,
+        database_path: PathBuf,
+        key: StoreKey,
+        price_table: PriceTable,
+    ) -> Self {
         Self {
             writer: Arc::new(Mutex::new(store)),
             write_turn: Arc::new(tokio::sync::Semaphore::new(1)),
-            readers: ReaderPool::new(database_path, key),
+            readers: ReaderPool::new(database_path, key, price_table),
         }
     }
 
@@ -67,15 +72,17 @@ impl StoreHandle {
 struct ReaderPool {
     database_path: Arc<PathBuf>,
     key: StoreKey,
+    price_table: PriceTable,
     idle: Arc<Mutex<Vec<UsageStore>>>,
     permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl ReaderPool {
-    fn new(database_path: PathBuf, key: StoreKey) -> Self {
+    fn new(database_path: PathBuf, key: StoreKey, price_table: PriceTable) -> Self {
         Self {
             database_path: Arc::new(database_path),
             key,
+            price_table,
             idle: Arc::new(Mutex::new(Vec::new())),
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_READ_CONNECTIONS)),
         }
@@ -93,6 +100,7 @@ impl ReaderPool {
         let idle = Arc::clone(&self.idle);
         let database_path = Arc::clone(&self.database_path);
         let key = self.key.clone();
+        let price_table = self.price_table.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let pooled = idle
@@ -101,7 +109,7 @@ impl ReaderPool {
                 .pop();
             let reader = match pooled {
                 Some(reader) => reader,
-                None => UsageStore::open_reader(database_path.as_path(), &key)?,
+                None => UsageStore::open_reader(database_path.as_path(), &key, price_table)?,
             };
             let result = reader.with_read_snapshot(operation);
             // A failed operation may indicate a broken connection; drop it

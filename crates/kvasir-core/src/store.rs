@@ -54,6 +54,7 @@ const MIXED_COST_SOURCE: i64 = 3;
 const MILLIS_PER_DAY: i64 = 86_400_000;
 const CONTENT_RETENTION_EVICTION_BATCH_SIZE: i64 = 512;
 const POST_COMMIT_VACUUM_TASK: &str = "post_commit_vacuum";
+const POST_VACUUM_WAL_TRUNCATE_TASK: &str = "post_vacuum_wal_truncate";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -63,6 +64,8 @@ pub enum StoreError {
     WalNotEnabled,
     #[error("wal checkpoint was blocked by a concurrent reader")]
     WalCheckpointBlocked,
+    #[error("data was cleared but the wal purge failed")]
+    WalPurgeFailed(#[source] Box<StoreError>),
     #[error("sqlite schema version {found} is newer than supported version {supported}")]
     IncompatibleSchema { found: i64, supported: i64 },
     #[error("non-monotonic cumulative tool-call counter")]
@@ -379,8 +382,13 @@ impl UsageStore {
 
     /// Opens a read-only connection for serving queries concurrently with a
     /// write connection on the same database. Never migrates; the writer must
-    /// have been opened first so the schema exists.
-    pub fn open_reader(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
+    /// have been opened first so the schema exists. Takes the same price
+    /// table as the writer so the two connections never disagree.
+    pub fn open_reader(
+        path: impl AsRef<Path>,
+        key: &StoreKey,
+        price_table: PriceTable,
+    ) -> Result<Self, StoreError> {
         let connection = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -397,7 +405,7 @@ impl UsageStore {
         }
         Ok(Self {
             connection,
-            price_table: PriceTable::bundled_defaults(),
+            price_table,
         })
     }
 
@@ -739,7 +747,10 @@ impl UsageStore {
         // secure_delete overwrites deleted rows in the main database, but the
         // pre-delete page images persist in the WAL until a checkpoint;
         // truncating honors the clear-my-data guarantee for the sidecar too.
-        truncate_wal(&self.connection)?;
+        // The wrapping variant marks the failure as post-commit: the rows are
+        // gone even though the purge did not complete.
+        truncate_wal(&self.connection)
+            .map_err(|error| StoreError::WalPurgeFailed(Box::new(error)))?;
         Ok(())
     }
 
@@ -759,6 +770,7 @@ impl UsageStore {
 
     pub fn run_pending_maintenance(&mut self) {
         attempt_pending_vacuum(&self.connection);
+        attempt_pending_wal_truncation(&self.connection);
     }
 
     pub fn token_rollups(&self, query: RollupQuery) -> Result<Vec<TokenRollup>, StoreError> {
@@ -5218,12 +5230,17 @@ fn attempt_pending_vacuum(connection: &Connection) {
 
     match connection.execute_batch("VACUUM;") {
         Ok(()) => {
-            // Drop the evicted pages' pre-images from the WAL sidecar before
-            // retiring the task; a blocked truncation keeps the task pending
-            // so the next maintenance pass retries it.
-            if let Err(error) = truncate_wal(connection) {
-                record_vacuum_task_failure(connection, &error.to_string());
-                eprintln!("post-VACUUM WAL truncation failed: {error:?}");
+            // The vacuumed pages' pre-images still sit in the WAL sidecar;
+            // hand the purge to its own task so a blocked truncation is
+            // retried on the next maintenance pass without re-running the
+            // whole VACUUM.
+            if let Err(error) = connection.execute(
+                "INSERT INTO store_maintenance_tasks (task, requested_at_ms)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(task) DO UPDATE SET requested_at_ms = excluded.requested_at_ms",
+                params![POST_VACUUM_WAL_TRUNCATE_TASK, current_unix_millis()],
+            ) {
+                eprintln!("post-VACUUM WAL truncation scheduling failed: {error:?}");
                 return;
             }
             if let Err(error) = connection.execute(
@@ -5234,21 +5251,63 @@ fn attempt_pending_vacuum(connection: &Connection) {
             }
         }
         Err(error) => {
-            record_vacuum_task_failure(connection, &format!("{error:?}"));
+            record_maintenance_task_failure(
+                connection,
+                POST_COMMIT_VACUUM_TASK,
+                &format!("{error:?}"),
+            );
             eprintln!("post-commit VACUUM failed: {error:?}");
         }
     }
 }
 
-fn record_vacuum_task_failure(connection: &Connection, last_error: &str) {
+fn attempt_pending_wal_truncation(connection: &Connection) {
+    let has_pending = match connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM store_maintenance_tasks WHERE task = ?1
+        )",
+        params![POST_VACUUM_WAL_TRUNCATE_TASK],
+        |row| row.get::<_, bool>(0),
+    ) {
+        Ok(has_pending) => has_pending,
+        Err(error) => {
+            eprintln!("post-VACUUM WAL truncation pending check failed: {error:?}");
+            return;
+        }
+    };
+    if !has_pending {
+        return;
+    }
+
+    match truncate_wal(connection) {
+        Ok(()) => {
+            if let Err(error) = connection.execute(
+                "DELETE FROM store_maintenance_tasks WHERE task = ?1",
+                params![POST_VACUUM_WAL_TRUNCATE_TASK],
+            ) {
+                eprintln!("post-VACUUM WAL truncation task cleanup failed: {error:?}");
+            }
+        }
+        Err(error) => {
+            record_maintenance_task_failure(
+                connection,
+                POST_VACUUM_WAL_TRUNCATE_TASK,
+                &format!("{error:?}"),
+            );
+            eprintln!("post-VACUUM WAL truncation failed: {error:?}");
+        }
+    }
+}
+
+fn record_maintenance_task_failure(connection: &Connection, task: &str, last_error: &str) {
     let attempted_at_ms = current_unix_millis();
     if let Err(update_error) = connection.execute(
         "UPDATE store_maintenance_tasks
          SET last_attempt_ms = ?2, last_error = ?3
          WHERE task = ?1",
-        params![POST_COMMIT_VACUUM_TASK, attempted_at_ms, last_error],
+        params![task, attempted_at_ms, last_error],
     ) {
-        eprintln!("post-commit VACUUM failure recording failed: {update_error:?}");
+        eprintln!("maintenance task {task} failure recording failed: {update_error:?}");
     }
 }
 
@@ -6115,7 +6174,8 @@ mod tests {
         let store_key = test_store_key();
         let mut writer = UsageStore::open(&database_path, &store_key)?;
 
-        let reader = UsageStore::open_reader(&database_path, &store_key)?;
+        let reader =
+            UsageStore::open_reader(&database_path, &store_key, PriceTable::bundled_defaults())?;
         assert_eq!(reader.persisted_daily_token_rollups()?, vec![]);
 
         writer.ingest_token_usage(&[usage_record(
@@ -6148,7 +6208,8 @@ mod tests {
         let store_key = test_store_key();
         let _writer = UsageStore::open(&database_path, &store_key)?;
 
-        let mut reader = UsageStore::open_reader(&database_path, &store_key)?;
+        let mut reader =
+            UsageStore::open_reader(&database_path, &store_key, PriceTable::bundled_defaults())?;
 
         let outcome = reader.ingest_token_usage(&[usage_record(
             "claude-opus-4-20250514",
@@ -6178,7 +6239,8 @@ mod tests {
         let database_path = temp.path().join("usage.sqlite3");
         let store_key = test_store_key();
         let mut writer = UsageStore::open(&database_path, &store_key)?;
-        let reader = UsageStore::open_reader(&database_path, &store_key)?;
+        let reader =
+            UsageStore::open_reader(&database_path, &store_key, PriceTable::bundled_defaults())?;
 
         let (snapshot_entered_sender, snapshot_entered_receiver) = std::sync::mpsc::channel();
         let (commit_done_sender, commit_done_receiver) = std::sync::mpsc::channel::<()>();
@@ -6250,7 +6312,11 @@ mod tests {
             100,
         )])?;
 
-        let snapshot_holder = UsageStore::open_reader(&database_path, &test_store_key())?;
+        let snapshot_holder = UsageStore::open_reader(
+            &database_path,
+            &test_store_key(),
+            PriceTable::bundled_defaults(),
+        )?;
         snapshot_holder
             .connection
             .execute_batch("BEGIN; SELECT COUNT(*) FROM token_rollups;")?;
@@ -6258,18 +6324,22 @@ mod tests {
         let outcome = store.clear_all_data();
 
         snapshot_holder.connection.execute_batch("COMMIT;")?;
-        assert!(matches!(outcome, Err(StoreError::WalCheckpointBlocked)));
+        assert!(matches!(
+            outcome,
+            Err(StoreError::WalPurgeFailed(inner))
+                if matches!(*inner, StoreError::WalCheckpointBlocked)
+        ));
         Ok(())
     }
 
     // Slow by design: the blocked WAL truncation retries against the held
     // snapshot for the full busy timeout before reporting itself blocked.
     #[test]
-    fn blocked_wal_truncation_keeps_the_post_vacuum_task_pending()
+    fn blocked_wal_truncation_is_retried_without_rerunning_the_vacuum()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let database_path = temp.path().join("usage.sqlite3");
-        let store = open_test_store(&database_path)?;
+        let mut store = open_test_store(&database_path)?;
         store.connection.execute(
             "INSERT INTO store_maintenance_tasks (
                 task,
@@ -6278,32 +6348,44 @@ mod tests {
             params![POST_COMMIT_VACUUM_TASK, 1_i64],
         )?;
 
-        let snapshot_holder = UsageStore::open_reader(&database_path, &test_store_key())?;
+        let snapshot_holder = UsageStore::open_reader(
+            &database_path,
+            &test_store_key(),
+            PriceTable::bundled_defaults(),
+        )?;
         snapshot_holder
             .connection
             .execute_batch("BEGIN; SELECT COUNT(*) FROM token_rollups;")?;
 
-        attempt_pending_vacuum(&store.connection);
+        store.run_pending_maintenance();
 
         snapshot_holder.connection.execute_batch("COMMIT;")?;
-        let blocked_error: Option<String> = store.connection.query_row(
-            "SELECT last_error
-             FROM store_maintenance_tasks
-             WHERE task = ?1",
-            params![POST_COMMIT_VACUUM_TASK],
-            |row| row.get(0),
-        )?;
-        assert!(blocked_error.is_some_and(|error| !error.is_empty()));
-
-        attempt_pending_vacuum(&store.connection);
-        let pending_count: i64 = store.connection.query_row(
+        let vacuum_pending: i64 = store.connection.query_row(
             "SELECT COUNT(*)
              FROM store_maintenance_tasks
              WHERE task = ?1",
             params![POST_COMMIT_VACUUM_TASK],
             |row| row.get(0),
         )?;
-        assert_eq!(pending_count, 0);
+        assert_eq!(vacuum_pending, 0);
+        let blocked_error: Option<String> = store.connection.query_row(
+            "SELECT last_error
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_VACUUM_WAL_TRUNCATE_TASK],
+            |row| row.get(0),
+        )?;
+        assert!(blocked_error.is_some_and(|error| !error.is_empty()));
+
+        store.run_pending_maintenance();
+        let truncation_pending: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_VACUUM_WAL_TRUNCATE_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(truncation_pending, 0);
         Ok(())
     }
 
@@ -6316,7 +6398,11 @@ mod tests {
             .connection
             .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)?;
 
-        let outcome = UsageStore::open_reader(&database_path, &test_store_key());
+        let outcome = UsageStore::open_reader(
+            &database_path,
+            &test_store_key(),
+            PriceTable::bundled_defaults(),
+        );
 
         assert!(matches!(
             outcome,

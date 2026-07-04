@@ -490,6 +490,7 @@ async fn start_with_store_key_source_at_stable_path(
             store,
             stable_database_path.clone(),
             resolved_store_key.key.clone(),
+            config.price_table.clone(),
         ),
         bearer_token: config.bearer_token,
         content_retention_policy: config.content_retention_policy.clone(),
@@ -612,16 +613,20 @@ async fn compact_content_retention(
     run_maintenance: bool,
 ) -> Result<ContentRetentionReport, StoreError> {
     let policy = policy.clone();
-    state
+    let report = state
         .store
-        .write(move |store| {
+        .write(move |store| -> Result<ContentRetentionReport, StoreError> {
             let report = store.compact_content_retention(&policy, compacted_at)?;
             if run_maintenance {
                 store.run_pending_maintenance();
             }
             Ok(report)
         })
-        .await
+        .await?;
+    if report.inline_blobs_evicted > 0 || report.raw_body_blobs_evicted > 0 {
+        state.updates.notify(DataUpdate::ContentEvicted);
+    }
+    Ok(report)
 }
 
 fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
@@ -1294,23 +1299,40 @@ async fn ingest_otlp(
     // A client disconnect drops this handler future, but a write that already
     // reached the store must still be followed by the raw-body import and the
     // subscriber notification; run the sequence on a task that outlives the
-    // request.
+    // request. Such a task may also outlive daemon shutdown — accepted: the
+    // write is idempotent by event key, and WAL plus the busy timeout keep a
+    // restarted instance safe against the straggler.
     let ingest = tokio::spawn(async move {
-        state
-            .store
-            .write(move |store| -> Result<(), StoreError> {
-                store.ingest_usage(&records)?;
-                store.record_raw_body_references(&records.raw_body_references)?;
-                if let Some(policy) = retention_policy {
-                    store.compact_content_retention(&policy, compacted_at)?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| IngestError::StoreWriteFailed)?;
-        import_available_raw_bodies(&state).await?;
-        state.updates.notify(DataUpdate::RollupsChanged);
-        Ok(StatusCode::ACCEPTED)
+        let outcome = async {
+            state
+                .store
+                .write(move |store| -> Result<(), StoreError> {
+                    store.ingest_usage(&records)?;
+                    store.record_raw_body_references(&records.raw_body_references)?;
+                    if let Some(policy) = retention_policy {
+                        store.compact_content_retention(&policy, compacted_at)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|error| {
+                    eprintln!("otlp ingest store write failed: {error:?}");
+                    IngestError::StoreWriteFailed
+                })?;
+            // Notify before the raw-body import: the write is committed, so
+            // subscribers must refresh even if the import fails. A successful
+            // import announces itself with ContentImported.
+            state.updates.notify(DataUpdate::RollupsChanged);
+            import_available_raw_bodies(&state).await?;
+            Ok(StatusCode::ACCEPTED)
+        }
+        .await;
+        // With the client disconnected this task's result is discarded, so a
+        // failure must leave a trace of its own.
+        if let Err(error) = &outcome {
+            eprintln!("otlp ingest failed: {error:?}");
+        }
+        outcome
     });
     ingest.await.expect("otlp ingest task panicked")
 }
@@ -1556,10 +1578,10 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     Err(err) => {
                         eprintln!("clear_all_data failed: {err:?}");
-                        // A blocked WAL checkpoint fails the purge after the
-                        // delete transaction has committed; the rows are gone,
-                        // so viewers must still refresh.
-                        if matches!(err, StoreError::WalCheckpointBlocked) {
+                        // A failed WAL purge happens after the delete
+                        // transaction has committed; the rows are gone, so
+                        // viewers must still refresh.
+                        if matches!(err, StoreError::WalPurgeFailed(_)) {
                             state.updates.notify(DataUpdate::Cleared);
                         }
                         RpcResponse::Error {
@@ -1710,7 +1732,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     update = updates.recv() => {
                         match update {
-                            Ok(DataUpdate::ContentImported) => {}
+                            Ok(DataUpdate::ContentImported | DataUpdate::ContentEvicted) => {}
                             Ok(DataUpdate::RollupsChanged | DataUpdate::Cleared)
                             | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 match write_token_rollup_event_if_changed(
