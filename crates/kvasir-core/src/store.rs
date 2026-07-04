@@ -6004,9 +6004,10 @@ mod tests {
         let temp = tempdir()?;
         let store = open_test_store(temp.path().join("usage.sqlite3"))?;
 
-        let journal_mode: String = store
-            .connection
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let journal_mode: String =
+            store
+                .connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
         assert_eq!(journal_mode, "wal");
         Ok(())
