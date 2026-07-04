@@ -104,6 +104,7 @@ public final class KvasirViewerModel: ObservableObject {
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
     private var inFlightOverviewLoads = 0
+    private var pendingLiveOverviewRefresh = false
     private var traceInspectorLoadID: UInt64 = 0
     private var liveOverviewUpdates: Task<Void, Never>?
 
@@ -286,6 +287,46 @@ public final class KvasirViewerModel: ObservableObject {
         rangePreset: OverviewRangePreset? = nil,
         beforeCommit: () -> Void = {}
     ) async throws {
+        defer {
+            schedulePendingLiveOverviewRefreshIfNeeded()
+        }
+        try await performOverviewRefresh(
+            repo: repo,
+            model: model,
+            harness: harness,
+            session: session,
+            prompt: prompt,
+            rangePreset: rangePreset,
+            beforeCommit: beforeCommit
+        )
+    }
+
+    private func schedulePendingLiveOverviewRefreshIfNeeded() {
+        guard pendingLiveOverviewRefresh, inFlightOverviewLoads == 0 else {
+            return
+        }
+        pendingLiveOverviewRefresh = false
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await refreshOverview()
+            } catch {
+                record(error: error)
+            }
+        }
+    }
+
+    private func performOverviewRefresh(
+        repo: OverviewRepoBucket?,
+        model: OverviewModelName?,
+        harness: OverviewHarnessName?,
+        session: OverviewSessionRoute?,
+        prompt: OverviewPromptRoute?,
+        rangePreset: OverviewRangePreset?,
+        beforeCommit: () -> Void
+    ) async throws {
         overviewLoadID += 1
         let loadID = overviewLoadID
         inFlightOverviewLoads += 1
@@ -432,6 +473,7 @@ public final class KvasirViewerModel: ObservableObject {
                     }
                     rearmAttempt = 0
                     guard inFlightOverviewLoads == 0 else {
+                        pendingLiveOverviewRefresh = true
                         continue
                     }
                     do {
