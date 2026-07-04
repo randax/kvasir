@@ -387,6 +387,14 @@ impl UsageStore {
         )?;
         apply_database_key(&connection, key)?;
         apply_busy_timeout(&connection)?;
+        let schema_version =
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        if schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::IncompatibleSchema {
+                found: schema_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
         Ok(Self {
             connection,
             price_table: PriceTable::bundled_defaults(),
@@ -5210,30 +5218,37 @@ fn attempt_pending_vacuum(connection: &Connection) {
 
     match connection.execute_batch("VACUUM;") {
         Ok(()) => {
+            // Drop the evicted pages' pre-images from the WAL sidecar before
+            // retiring the task; a blocked truncation keeps the task pending
+            // so the next maintenance pass retries it.
+            if let Err(error) = truncate_wal(connection) {
+                record_vacuum_task_failure(connection, &error.to_string());
+                eprintln!("post-VACUUM WAL truncation failed: {error:?}");
+                return;
+            }
             if let Err(error) = connection.execute(
                 "DELETE FROM store_maintenance_tasks WHERE task = ?1",
                 params![POST_COMMIT_VACUUM_TASK],
             ) {
                 eprintln!("post-commit VACUUM task cleanup failed: {error:?}");
             }
-            // Drop the evicted pages' pre-images from the WAL sidecar as well.
-            if let Err(error) = truncate_wal(connection) {
-                eprintln!("post-VACUUM WAL truncation failed: {error:?}");
-            }
         }
         Err(error) => {
-            let attempted_at_ms = current_unix_millis();
-            let last_error = format!("{error:?}");
-            if let Err(update_error) = connection.execute(
-                "UPDATE store_maintenance_tasks
-                 SET last_attempt_ms = ?2, last_error = ?3
-                 WHERE task = ?1",
-                params![POST_COMMIT_VACUUM_TASK, attempted_at_ms, last_error],
-            ) {
-                eprintln!("post-commit VACUUM failure recording failed: {update_error:?}");
-            }
+            record_vacuum_task_failure(connection, &format!("{error:?}"));
             eprintln!("post-commit VACUUM failed: {error:?}");
         }
+    }
+}
+
+fn record_vacuum_task_failure(connection: &Connection, last_error: &str) {
+    let attempted_at_ms = current_unix_millis();
+    if let Err(update_error) = connection.execute(
+        "UPDATE store_maintenance_tasks
+         SET last_attempt_ms = ?2, last_error = ?3
+         WHERE task = ?1",
+        params![POST_COMMIT_VACUUM_TASK, attempted_at_ms, last_error],
+    ) {
+        eprintln!("post-commit VACUUM failure recording failed: {update_error:?}");
     }
 }
 
@@ -6244,6 +6259,70 @@ mod tests {
 
         snapshot_holder.connection.execute_batch("COMMIT;")?;
         assert!(matches!(outcome, Err(StoreError::WalCheckpointBlocked)));
+        Ok(())
+    }
+
+    // Slow by design: the blocked WAL truncation retries against the held
+    // snapshot for the full busy timeout before reporting itself blocked.
+    #[test]
+    fn blocked_wal_truncation_keeps_the_post_vacuum_task_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store = open_test_store(&database_path)?;
+        store.connection.execute(
+            "INSERT INTO store_maintenance_tasks (
+                task,
+                requested_at_ms
+            ) VALUES (?1, ?2)",
+            params![POST_COMMIT_VACUUM_TASK, 1_i64],
+        )?;
+
+        let snapshot_holder = UsageStore::open_reader(&database_path, &test_store_key())?;
+        snapshot_holder
+            .connection
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM token_rollups;")?;
+
+        attempt_pending_vacuum(&store.connection);
+
+        snapshot_holder.connection.execute_batch("COMMIT;")?;
+        let blocked_error: Option<String> = store.connection.query_row(
+            "SELECT last_error
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert!(blocked_error.is_some_and(|error| !error.is_empty()));
+
+        attempt_pending_vacuum(&store.connection);
+        let pending_count: i64 = store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM store_maintenance_tasks
+             WHERE task = ?1",
+            params![POST_COMMIT_VACUUM_TASK],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_a_newer_schema_version() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store = open_test_store(&database_path)?;
+        store
+            .connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)?;
+
+        let outcome = UsageStore::open_reader(&database_path, &test_store_key());
+
+        assert!(matches!(
+            outcome,
+            Err(StoreError::IncompatibleSchema { found, supported })
+                if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION
+        ));
         Ok(())
     }
 

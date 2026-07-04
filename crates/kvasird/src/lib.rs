@@ -1291,22 +1291,28 @@ async fn ingest_otlp(
     let retention_policy = (!state.content_retention_policy.keeps_forever())
         .then(|| state.content_retention_policy.clone());
     let compacted_at = current_timestamp_millis();
-    state
-        .store
-        .write(move |store| -> Result<(), StoreError> {
-            store.ingest_usage(&records)?;
-            store.record_raw_body_references(&records.raw_body_references)?;
-            if let Some(policy) = retention_policy {
-                store.compact_content_retention(&policy, compacted_at)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| IngestError::StoreWriteFailed)?;
-    import_available_raw_bodies(&state).await?;
-    state.updates.notify(DataUpdate::RollupsChanged);
-
-    Ok(StatusCode::ACCEPTED)
+    // A client disconnect drops this handler future, but a write that already
+    // reached the store must still be followed by the raw-body import and the
+    // subscriber notification; run the sequence on a task that outlives the
+    // request.
+    let ingest = tokio::spawn(async move {
+        state
+            .store
+            .write(move |store| -> Result<(), StoreError> {
+                store.ingest_usage(&records)?;
+                store.record_raw_body_references(&records.raw_body_references)?;
+                if let Some(policy) = retention_policy {
+                    store.compact_content_retention(&policy, compacted_at)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| IngestError::StoreWriteFailed)?;
+        import_available_raw_bodies(&state).await?;
+        state.updates.notify(DataUpdate::RollupsChanged);
+        Ok(StatusCode::ACCEPTED)
+    });
+    ingest.await.expect("otlp ingest task panicked")
 }
 
 async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, IngestError> {
@@ -1550,6 +1556,12 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     Err(err) => {
                         eprintln!("clear_all_data failed: {err:?}");
+                        // A blocked WAL checkpoint fails the purge after the
+                        // delete transaction has committed; the rows are gone,
+                        // so viewers must still refresh.
+                        if matches!(err, StoreError::WalCheckpointBlocked) {
+                            state.updates.notify(DataUpdate::Cleared);
+                        }
                         RpcResponse::Error {
                             error: RpcError::Internal,
                         }
@@ -2049,6 +2061,123 @@ mod tests {
 
         assert_eq!(rollups, vec![]);
         long_write.await?;
+        Ok(())
+    }
+
+    // Slow by design: the WAL checkpoint retries against the held snapshot
+    // for the full busy timeout before reporting itself blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clear_all_data_notifies_viewers_even_when_wal_purge_is_blocked() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let bearer_token = BearerToken::generate()?;
+        let config = DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse()?,
+            rpc_socket_path: temp.path().join("rpc.sock"),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: bearer_token.clone(),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([29; 32]))
+                .await?;
+        let mut updates = daemon.state.updates.subscribe();
+
+        let (snapshot_held_sender, snapshot_held_receiver) = tokio::sync::oneshot::channel();
+        let store = daemon.state.store.clone();
+        let snapshot_holder = tokio::spawn(async move {
+            store
+                .read(move |store| {
+                    let query = RollupQuery::new(
+                        kvasir_core::rpc::TimestampMillis::from_millis(0),
+                        kvasir_core::rpc::TimestampMillis::from_millis(i64::MAX),
+                    );
+                    store.token_rollups(query)?;
+                    snapshot_held_sender.send(()).expect("test channel closed");
+                    std::thread::sleep(Duration::from_secs(7));
+                    Ok(())
+                })
+                .await
+        });
+        snapshot_held_receiver.await?;
+
+        let mut stream = UnixStream::connect(daemon.rpc_socket_path.clone()).await?;
+        let mut request_bytes = serde_json::to_vec(&RpcRequest::ClearAllData { bearer_token })?;
+        request_bytes.push(b'\n');
+        stream.write_all(&request_bytes).await?;
+        let mut reader = BufReader::new(stream);
+        let response = read_bounded_line(
+            &mut reader,
+            MAX_RPC_RESPONSE_BYTES,
+            DaemonError::RpcResponseTooLarge,
+        )
+        .await?;
+        assert!(matches!(
+            serde_json::from_str::<RpcResponse>(&response)?,
+            RpcResponse::Error {
+                error: RpcError::Internal
+            }
+        ));
+
+        assert_eq!(updates.recv().await?, DataUpdate::Cleared);
+        snapshot_holder.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_ingest_notifies_subscribers_even_when_the_client_disconnects_mid_queue()
+    -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let bearer_token = BearerToken::new("test-token");
+        let config = DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse()?,
+            rpc_socket_path: temp.path().join("rpc.sock"),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token,
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([31; 32]))
+                .await?;
+        let mut updates = daemon.state.updates.subscribe();
+
+        let (write_held_sender, write_held_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let store = daemon.state.store.clone();
+        let write_holder = tokio::spawn(async move {
+            store
+                .write(move |_store| {
+                    write_held_sender.send(()).expect("test channel closed");
+                    release_receiver.recv().expect("test channel closed");
+                })
+                .await
+        });
+        write_held_receiver.await?;
+
+        let body = include_str!("../tests/fixtures/claude_token_usage_otlp.json");
+        let request = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            daemon.otlp_addr(),
+            body.len(),
+            body
+        );
+        let mut stream = tokio::net::TcpStream::connect(daemon.otlp_addr()).await?;
+        stream.write_all(request.as_bytes()).await?;
+        // Give the server time to dispatch the handler, which then queues
+        // behind the held write turn; disconnecting at that point drops the
+        // handler future, but the commit and notification must still happen.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release_sender.send(())?;
+
+        let update = tokio::time::timeout(Duration::from_secs(10), updates.recv()).await??;
+        assert_eq!(update, DataUpdate::RollupsChanged);
+        write_holder.await?;
         Ok(())
     }
 
