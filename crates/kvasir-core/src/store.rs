@@ -352,15 +352,7 @@ impl StoreKey {
 
 impl UsageStore {
     pub fn open(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
-        let connection = Connection::open(path)?;
-        apply_database_key(&connection, key)?;
-        enable_secure_delete(&connection)?;
-        let mut store = Self {
-            connection,
-            price_table: PriceTable::bundled_defaults(),
-        };
-        store.migrate()?;
-        Ok(store)
+        Self::open_with_price_table(path, key, PriceTable::bundled_defaults())
     }
 
     pub fn open_with_price_table(
@@ -371,6 +363,8 @@ impl UsageStore {
         let connection = Connection::open(path)?;
         apply_database_key(&connection, key)?;
         enable_secure_delete(&connection)?;
+        apply_busy_timeout(&connection)?;
+        enable_wal_journal_mode(&connection)?;
         let mut store = Self {
             connection,
             price_table,
@@ -380,7 +374,7 @@ impl UsageStore {
     }
 
     pub fn ingest_token_usage(&mut self, records: &[TokenUsageRecord]) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         let token_deltas = Self::ingest_token_usage_in_transaction(&transaction, records)?;
         Self::ingest_estimated_cost_usage_in_transaction(
             &transaction,
@@ -392,7 +386,7 @@ impl UsageStore {
     }
 
     pub fn ingest_usage(&mut self, records: &UsageRecords) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         let token_deltas =
             Self::ingest_token_usage_in_transaction(&transaction, &records.token_usage)?;
         Self::ingest_estimated_cost_usage_in_transaction(
@@ -417,7 +411,7 @@ impl UsageStore {
         }
 
         let mut seen_event_keys = HashSet::new();
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         for record in records {
             if !seen_event_keys.insert(record.event_key.as_str().to_owned())
                 || supported_raw_body_event_exists(&transaction, record.event_key.as_str())?
@@ -567,7 +561,7 @@ impl UsageStore {
         policy: &ContentRetentionPolicy,
         compacted_at: TimestampMillis,
     ) -> Result<Vec<String>, StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         let mut inserted_event_keys = Vec::new();
         for prepared in prepared_imports {
             let Some(compressed_body) = prepared.compressed_body.as_ref() else {
@@ -630,7 +624,7 @@ impl UsageStore {
             return Ok(());
         }
 
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         for event_key in event_keys {
             transaction.execute(
                 "DELETE FROM raw_body_import_queue WHERE event_key = ?1",
@@ -650,7 +644,7 @@ impl UsageStore {
         }
 
         let attempted_at_ms = current_unix_millis();
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         for failure in failures {
             let state = if failure.failure_kind.quarantines() {
                 "quarantined"
@@ -678,7 +672,7 @@ impl UsageStore {
     }
 
     pub fn clear_all_data(&mut self) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         transaction.execute_batch(
             "DELETE FROM raw_body_import_queue;
              DELETE FROM canonical_raw_body_records;
@@ -704,7 +698,7 @@ impl UsageStore {
         policy: &ContentRetentionPolicy,
         compacted_at: TimestampMillis,
     ) -> Result<ContentRetentionReport, StoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         let report = compact_content_retention_in_transaction(&transaction, policy, compacted_at)?;
         if report.bytes_evicted > 0 {
             request_post_commit_vacuum_in_transaction(&transaction, compacted_at.value())?;
@@ -2291,7 +2285,7 @@ impl UsageStore {
             });
         }
 
-        let transaction = self.connection.transaction()?;
+        let transaction = begin_write_transaction(&mut self.connection)?;
         match schema_version {
             CURRENT_SCHEMA_VERSION => {}
             10 => {}
@@ -5097,6 +5091,27 @@ fn enable_secure_delete(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn enable_wal_journal_mode(connection: &Connection) -> Result<(), StoreError> {
+    connection.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    Ok(())
+}
+
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn apply_busy_timeout(connection: &Connection) -> Result<(), StoreError> {
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(())
+}
+
+// Write transactions take the write lock at BEGIN so the busy timeout
+// applies; a deferred transaction upgrading read->write under WAL fails
+// with SQLITE_BUSY immediately, without consulting the busy handler.
+fn begin_write_transaction(
+    connection: &mut Connection,
+) -> Result<rusqlite::Transaction<'_>, rusqlite::Error> {
+    connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
 fn request_post_commit_vacuum_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     requested_at_ms: i64,
@@ -5963,6 +5978,54 @@ mod tests {
             .query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
 
         assert_eq!(secure_delete, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn store_opens_in_wal_journal_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let store = open_test_store(temp.path().join("usage.sqlite3"))?;
+
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+
+        assert_eq!(journal_mode, "wal");
+        Ok(())
+    }
+
+    #[test]
+    fn write_succeeds_while_another_connection_briefly_holds_the_write_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let lock_holder = open_test_store(&database_path)?;
+        let mut writer = open_test_store(&database_path)?;
+
+        let (lock_held_sender, lock_held_receiver) = std::sync::mpsc::channel();
+        let holder_thread = std::thread::spawn(move || -> Result<(), StoreError> {
+            lock_holder.connection.execute_batch("BEGIN IMMEDIATE;")?;
+            lock_held_sender.send(()).expect("test channel closed");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            lock_holder.connection.execute_batch("COMMIT;")?;
+            Ok(())
+        });
+        lock_held_receiver.recv()?;
+
+        writer
+            .ingest_token_usage(&[usage_record(
+                "claude-opus-4-20250514",
+                TokenMeasure::Input,
+                1_781_956_800_000,
+                1_781_956_700_000,
+                100,
+            )])
+            .map_err(|error| format!("writer ingest failed: {error:?}"))?;
+
+        holder_thread
+            .join()
+            .expect("lock holder thread panicked")
+            .map_err(|error| format!("lock holder failed: {error:?}"))?;
         Ok(())
     }
 
