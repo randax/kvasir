@@ -105,6 +105,7 @@ public final class KvasirViewerModel: ObservableObject {
     private var overviewLoadID: UInt64 = 0
     private var inFlightOverviewLoads = 0
     private var pendingLiveOverviewRefresh = false
+    private var pendingLiveOverviewRefreshTask: Task<Void, Never>?
     private var traceInspectorLoadID: UInt64 = 0
     private var liveOverviewUpdates: Task<Void, Never>?
 
@@ -302,12 +303,20 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     private func schedulePendingLiveOverviewRefreshIfNeeded() {
-        guard pendingLiveOverviewRefresh, inFlightOverviewLoads == 0 else {
+        guard pendingLiveOverviewRefresh,
+              inFlightOverviewLoads == 0,
+              pendingLiveOverviewRefreshTask == nil else {
             return
         }
         pendingLiveOverviewRefresh = false
-        Task { [weak self] in
+        pendingLiveOverviewRefreshTask = Task { @MainActor [weak self] in
             guard let self else {
+                return
+            }
+            pendingLiveOverviewRefreshTask = nil
+            guard inFlightOverviewLoads == 0 else {
+                // A load started before this task ran; its completion reschedules.
+                pendingLiveOverviewRefresh = true
                 return
             }
             do {
@@ -497,6 +506,7 @@ public final class KvasirViewerModel: ObservableObject {
 
     deinit {
         liveOverviewUpdates?.cancel()
+        pendingLiveOverviewRefreshTask?.cancel()
     }
 }
 
