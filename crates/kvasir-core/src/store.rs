@@ -395,6 +395,14 @@ impl UsageStore {
         )?;
         apply_database_key(&connection, key)?;
         apply_busy_timeout(&connection)?;
+        // A read-only connection cannot switch journal modes, so verify the
+        // writer already left the database in WAL instead of updating the
+        // pragma.
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::WalNotEnabled);
+        }
         let schema_version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         if schema_version > CURRENT_SCHEMA_VERSION {
@@ -6415,6 +6423,28 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(truncation_pending, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_a_database_that_is_not_in_wal_mode() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        {
+            // A raw connection leaves the fresh database in its default
+            // rollback journal mode.
+            let connection = open_raw_test_connection(&database_path)?;
+            connection.execute_batch("CREATE TABLE placeholder (id INTEGER);")?;
+        }
+
+        let outcome = UsageStore::open_reader(
+            &database_path,
+            &test_store_key(),
+            PriceTable::bundled_defaults(),
+        );
+
+        assert!(matches!(outcome, Err(StoreError::WalNotEnabled)));
         Ok(())
     }
 

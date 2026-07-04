@@ -71,7 +71,9 @@ impl StoreHandle {
 #[derive(Clone)]
 struct ReaderPool {
     database_path: Arc<PathBuf>,
-    key: StoreKey,
+    // Shared rather than cloned: the SQLCipher key material should not be
+    // duplicated every time the handle or a read closure is cloned.
+    key: Arc<StoreKey>,
     price_table: PriceTable,
     idle: Arc<Mutex<Vec<UsageStore>>>,
     permits: Arc<tokio::sync::Semaphore>,
@@ -81,7 +83,7 @@ impl ReaderPool {
     fn new(database_path: PathBuf, key: StoreKey, price_table: PriceTable) -> Self {
         Self {
             database_path: Arc::new(database_path),
-            key,
+            key: Arc::new(key),
             price_table,
             idle: Arc::new(Mutex::new(Vec::new())),
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_READ_CONNECTIONS)),
@@ -99,7 +101,7 @@ impl ReaderPool {
             .expect("reader pool semaphore closed");
         let idle = Arc::clone(&self.idle);
         let database_path = Arc::clone(&self.database_path);
-        let key = self.key.clone();
+        let key = Arc::clone(&self.key);
         let price_table = self.price_table.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
