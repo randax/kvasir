@@ -373,6 +373,24 @@ impl UsageStore {
         Ok(store)
     }
 
+    /// Opens a read-only connection for serving queries concurrently with a
+    /// write connection on the same database. Never migrates; the writer must
+    /// have been opened first so the schema exists.
+    pub fn open_reader(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        apply_database_key(&connection, key)?;
+        apply_busy_timeout(&connection)?;
+        Ok(Self {
+            connection,
+            price_table: PriceTable::bundled_defaults(),
+        })
+    }
+
     pub fn ingest_token_usage(&mut self, records: &[TokenUsageRecord]) -> Result<(), StoreError> {
         let transaction = begin_write_transaction(&mut self.connection)?;
         let token_deltas = Self::ingest_token_usage_in_transaction(&transaction, records)?;
@@ -6026,6 +6044,60 @@ mod tests {
             .join()
             .expect("lock holder thread panicked")
             .map_err(|error| format!("lock holder failed: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reader_sees_writes_committed_after_it_opened() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store_key = test_store_key();
+        let mut writer = UsageStore::open(&database_path, &store_key)?;
+
+        let reader = UsageStore::open_reader(&database_path, &store_key)?;
+        assert_eq!(reader.persisted_daily_token_rollups()?, vec![]);
+
+        writer.ingest_token_usage(&[usage_record(
+            "claude-opus-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            100,
+        )])?;
+
+        let rollups = reader.persisted_daily_token_rollups()?;
+        assert_eq!(
+            rollups,
+            vec![TokenRollup {
+                day: RollupDay::parse("2026-06-20")?,
+                repo: kvasir_repo("/not/persisted"),
+                model: ModelName::new("claude-opus-4-20250514"),
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_tokens: 0,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store_key = test_store_key();
+        let _writer = UsageStore::open(&database_path, &store_key)?;
+
+        let mut reader = UsageStore::open_reader(&database_path, &store_key)?;
+
+        let outcome = reader.ingest_token_usage(&[usage_record(
+            "claude-opus-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            100,
+        )]);
+
+        assert!(outcome.is_err());
         Ok(())
     }
 
