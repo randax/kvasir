@@ -10,8 +10,8 @@ use kvasir_core::{SetupCredential, prepare_setup_config};
 use crate::client::KvasirClient;
 use crate::error::KvasirClientError;
 use crate::types::{
-    KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirContentReplayQuery,
-    KvasirSocketPath,
+    KvasirBearerToken, KvasirClearAllDataOutcome, KvasirContentQuery, KvasirContentReplay,
+    KvasirContentReplayQuery, KvasirSocketPath,
 };
 
 mod fs_atomic;
@@ -148,7 +148,7 @@ pub fn load_kvasir_content_replay(
 pub fn clear_kvasir_data(
     socket_path: KvasirSocketPath,
     config: KvasirHarnessTelemetrySetup,
-) -> Result<(), KvasirClientError> {
+) -> Result<KvasirClearAllDataOutcome, KvasirClientError> {
     clear_kvasir_data_from_source(
         socket_path,
         config,
@@ -214,8 +214,11 @@ fn clear_kvasir_data_from_source(
     socket_path: KvasirSocketPath,
     config: KvasirHarnessTelemetrySetup,
     environment_token: impl FnOnce() -> Option<String>,
-    clear_all_data: impl FnOnce(KvasirSocketPath, KvasirBearerToken) -> Result<(), KvasirClientError>,
-) -> Result<(), KvasirClientError> {
+    clear_all_data: impl FnOnce(
+        KvasirSocketPath,
+        KvasirBearerToken,
+    ) -> Result<KvasirClearAllDataOutcome, KvasirClientError>,
+) -> Result<KvasirClearAllDataOutcome, KvasirClientError> {
     let bearer_token = resolve_kvasir_bearer_token_from_source(config, environment_token)?;
     clear_all_data(socket_path, bearer_token)
 }
@@ -939,7 +942,7 @@ mod tests {
                 clear_calls.set(clear_calls.get() + 1);
                 assert_eq!(received_socket_path, socket_path);
                 assert_eq!(String::from(bearer_token), "operator-token");
-                Ok(())
+                Ok(KvasirClearAllDataOutcome::Cleared)
             },
         )?;
 

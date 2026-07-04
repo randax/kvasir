@@ -465,11 +465,19 @@ async fn start_with_store_key_source_at_stable_path(
         Ok(bootstrap_cleanup) => bootstrap_cleanup,
         Err(err) => return Err(err.into()),
     };
-    let store = match UsageStore::open_with_price_table(
-        &stable_database_path,
-        &resolved_store_key.key,
-        config.price_table.clone(),
-    ) {
+    // Opening runs migrations, which can be long on a large database; keep
+    // that off the async runtime like every other synchronous SQLite call.
+    let open_outcome = {
+        let database_path = stable_database_path.clone();
+        let key = resolved_store_key.key.clone();
+        let price_table = config.price_table.clone();
+        tokio::task::spawn_blocking(move || {
+            UsageStore::open_with_price_table(&database_path, &key, price_table)
+        })
+        .await
+        .expect("store open panicked")
+    };
+    let store = match open_outcome {
         Ok(store) => store,
         Err(err) => {
             if resolved_store_key.was_generated {
@@ -627,6 +635,37 @@ async fn compact_content_retention(
         state.updates.notify(DataUpdate::ContentEvicted);
     }
     Ok(report)
+}
+
+const WAL_PURGE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Drives store maintenance until the WAL truncation owed by a blocked
+/// clear-all-data purge completes; without this, a keep-forever retention
+/// policy would leave cleared rows' pre-images in the sidecar indefinitely.
+fn spawn_wal_purge_retrier(state: DaemonState) {
+    tokio::spawn(async move {
+        let mut shutdown = state.shutdown.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => return,
+                _ = tokio::time::sleep(WAL_PURGE_RETRY_INTERVAL) => {}
+            }
+            let outcome = state
+                .store
+                .write(|store| -> Result<bool, StoreError> {
+                    store.run_pending_maintenance();
+                    store.wal_truncation_pending()
+                })
+                .await;
+            match outcome {
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(error) => {
+                    eprintln!("wal purge retry failed: {error:?}");
+                }
+            }
+        }
+    });
 }
 
 fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
@@ -1315,10 +1354,7 @@ async fn ingest_otlp(
                     Ok(())
                 })
                 .await
-                .map_err(|error| {
-                    eprintln!("otlp ingest store write failed: {error:?}");
-                    IngestError::StoreWriteFailed
-                })?;
+                .map_err(IngestError::StoreWriteFailed)?;
             // Notify before the raw-body import: the write is committed, so
             // subscribers must refresh even if the import fails. A successful
             // import announces itself with ContentImported.
@@ -1342,10 +1378,7 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
         .store
         .read(|store| store.raw_body_import_candidates(RAW_BODY_IMPORT_BATCH_SIZE))
         .await
-        .map_err(|error| {
-            eprintln!("raw body candidate query failed: {error:?}");
-            IngestError::StoreWriteFailed
-        })?;
+        .map_err(IngestError::StoreWriteFailed)?;
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -1418,10 +1451,7 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
                 Ok((inserted, prepared_imports))
             })
             .await
-            .map_err(|error| {
-                eprintln!("raw body import commit failed: {error:?}");
-                IngestError::StoreWriteFailed
-            })?
+            .map_err(IngestError::StoreWriteFailed)?
     };
     let inserted_event_keys: HashSet<String> = inserted_event_keys.into_iter().collect();
     let mut cleanup_imports = Vec::new();
@@ -1456,16 +1486,10 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
             .write(move |store| -> Result<(), IngestError> {
                 store
                     .complete_raw_body_imports(&completed_event_keys)
-                    .map_err(|error| {
-                        eprintln!("raw body import completion failed: {error:?}");
-                        IngestError::StoreWriteFailed
-                    })?;
+                    .map_err(IngestError::StoreWriteFailed)?;
                 store
                     .record_raw_body_import_failures(&import_failures)
-                    .map_err(|error| {
-                        eprintln!("raw body import failure recording failed: {error:?}");
-                        IngestError::StoreWriteFailed
-                    })?;
+                    .map_err(IngestError::StoreWriteFailed)?;
                 Ok(())
             })
             .await?;
@@ -1574,16 +1598,20 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                 match state.store.write(|store| store.clear_all_data()).await {
                     Ok(()) => {
                         state.updates.notify(DataUpdate::Cleared);
-                        RpcResponse::ClearAllData
+                        RpcResponse::ClearAllData { wal_purged: true }
+                    }
+                    // A failed WAL purge happens after the delete transaction
+                    // has committed: the rows are gone, so viewers must still
+                    // refresh and the client hears a typed partial success
+                    // while a background task finishes the owed purge.
+                    Err(StoreError::WalPurgeFailed(error)) => {
+                        eprintln!("clear_all_data wal purge failed: {error:?}");
+                        state.updates.notify(DataUpdate::Cleared);
+                        spawn_wal_purge_retrier(state.clone());
+                        RpcResponse::ClearAllData { wal_purged: false }
                     }
                     Err(err) => {
                         eprintln!("clear_all_data failed: {err:?}");
-                        // A failed WAL purge happens after the delete
-                        // transaction has committed; the rows are gone, so
-                        // viewers must still refresh.
-                        if matches!(err, StoreError::WalPurgeFailed(_)) {
-                            state.updates.notify(DataUpdate::Cleared);
-                        }
                         RpcResponse::Error {
                             error: RpcError::Internal,
                         }
@@ -1994,7 +2022,7 @@ enum IngestError {
     #[error("metrics payload is too large")]
     PayloadTooLarge,
     #[error("metrics store write failed")]
-    StoreWriteFailed,
+    StoreWriteFailed(#[source] StoreError),
 }
 
 impl IntoResponse for IngestError {
@@ -2004,7 +2032,7 @@ impl IntoResponse for IngestError {
             Self::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::InvalidPayload => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::StoreWriteFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::StoreWriteFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
         .into_response()
     }
@@ -2138,13 +2166,30 @@ mod tests {
         .await?;
         assert!(matches!(
             serde_json::from_str::<RpcResponse>(&response)?,
-            RpcResponse::Error {
-                error: RpcError::Internal
-            }
+            RpcResponse::ClearAllData { wal_purged: false }
         ));
 
         assert_eq!(updates.recv().await?, DataUpdate::Cleared);
         snapshot_holder.await??;
+
+        // Once the blocking snapshot is gone, the background retrier
+        // completes the owed WAL purge and retires the maintenance task.
+        let purge_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let pending = daemon
+                .state
+                .store
+                .read(|store| store.wal_truncation_pending())
+                .await?;
+            if !pending {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < purge_deadline,
+                "wal purge retrier did not complete the owed truncation in time"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         Ok(())
     }
 

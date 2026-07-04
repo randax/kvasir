@@ -1,9 +1,17 @@
 import Combine
 import Foundation
 
+/// How thoroughly a clear-all-data request completed. The rows are deleted
+/// in both cases; `walPurgePending` means the daemon is still scrubbing the
+/// database journal in the background.
+public enum UsageDataClearance: Equatable, Sendable {
+    case complete
+    case walPurgePending
+}
+
 public protocol UsageDataManagement: Sendable {
     var canClearAllData: Bool { get }
-    func clearAllData() async throws
+    func clearAllData() async throws -> UsageDataClearance
 }
 
 public struct UnavailableUsageDataManagement: UsageDataManagement {
@@ -11,7 +19,7 @@ public struct UnavailableUsageDataManagement: UsageDataManagement {
 
     public var canClearAllData: Bool { false }
 
-    public func clearAllData() async throws {
+    public func clearAllData() async throws -> UsageDataClearance {
         throw UsageDataManagementError.unavailable
     }
 }
@@ -27,9 +35,14 @@ public enum UsageDataManagementError: LocalizedError {
     }
 }
 
-public enum ClearAllDataOutcome: Equatable, Sendable {
-    case refreshed
-    case refreshFailed
+public struct ClearAllDataOutcome: Equatable, Sendable {
+    public let clearance: UsageDataClearance
+    public let refreshed: Bool
+
+    public init(clearance: UsageDataClearance, refreshed: Bool) {
+        self.clearance = clearance
+        self.refreshed = refreshed
+    }
 }
 
 public enum OverviewRangePreset: String, CaseIterable, Identifiable, Sendable {
@@ -242,7 +255,7 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     public func clearAllData() async throws -> ClearAllDataOutcome {
-        try await usageDataManagement.clearAllData()
+        let clearance = try await usageDataManagement.clearAllData()
         selectedRepo = nil
         selectedModel = nil
         selectedHarness = nil
@@ -255,10 +268,10 @@ public final class KvasirViewerModel: ObservableObject {
         clearTraceInspector()
         do {
             try await refreshOverview(repo: nil, model: nil, harness: nil, session: nil, prompt: nil)
-            return .refreshed
+            return ClearAllDataOutcome(clearance: clearance, refreshed: true)
         } catch {
             errorMessage = "All data was cleared, but the overview could not be refreshed: \(error.localizedDescription)"
-            return .refreshFailed
+            return ClearAllDataOutcome(clearance: clearance, refreshed: false)
         }
     }
 

@@ -771,7 +771,7 @@ func clearAllDataDeletesThroughDataManagerAndReloadsUnfilteredOverview() async t
     let outcome = try await viewer.clearAllData()
 
     #expect(usageDataManagement.clearCount == 1)
-    #expect(outcome == .refreshed)
+    #expect(outcome == ClearAllDataOutcome(clearance: .complete, refreshed: true))
     #expect(viewer.selectedHarness == nil)
     #expect(viewer.selectedSession == nil)
     #expect(viewer.selectedPrompt == nil)
@@ -782,6 +782,33 @@ func clearAllDataDeletesThroughDataManagerAndReloadsUnfilteredOverview() async t
             .query(harness: prompt.session.harness, session: session, prompt: prompt),
         OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query
     ])
+}
+
+@MainActor
+@Test
+func clearAllDataSurfacesAPendingWalPurge() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 5)),
+            .success(overviewSnapshot(totalTokens: 0))
+        ]
+    )
+    let usageDataManagement = RecordingUsageDataManagement()
+    usageDataManagement.clearance = .walPurgePending
+    let viewer = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        usageDataManagement: usageDataManagement,
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await viewer.refreshOverview()
+    let outcome = try await viewer.clearAllData()
+
+    #expect(usageDataManagement.clearCount == 1)
+    #expect(outcome == ClearAllDataOutcome(clearance: .walPurgePending, refreshed: true))
+    #expect(viewer.overviewSnapshot?.totals.totalTokens == 0)
 }
 
 @MainActor
@@ -814,7 +841,7 @@ func clearAllDataRefreshFailureStillReportsDeleteSuccessAndClearsLocalState() as
     let outcome = try await viewer.clearAllData()
 
     #expect(usageDataManagement.clearCount == 1)
-    #expect(outcome == .refreshFailed)
+    #expect(outcome == ClearAllDataOutcome(clearance: .complete, refreshed: false))
     #expect(viewer.selectedHarness == nil)
     #expect(viewer.selectedSession == nil)
     #expect(viewer.selectedPrompt == nil)
@@ -1543,11 +1570,13 @@ private struct RecordedModelUsageRollupExplorerPanelRequest: Equatable {
 
 private final class RecordingUsageDataManagement: UsageDataManagement, @unchecked Sendable {
     private(set) var clearCount = 0
+    var clearance: UsageDataClearance = .complete
 
     var canClearAllData: Bool { true }
 
-    func clearAllData() async throws {
+    func clearAllData() async throws -> UsageDataClearance {
         clearCount += 1
+        return clearance
     }
 }
 
@@ -1561,7 +1590,7 @@ private final class FailingUsageDataManagement: UsageDataManagement, @unchecked 
         self.error = error
     }
 
-    func clearAllData() async throws {
+    func clearAllData() async throws -> UsageDataClearance {
         clearCount += 1
         throw error
     }

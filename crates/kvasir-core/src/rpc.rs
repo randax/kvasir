@@ -767,7 +767,7 @@ pub enum RpcRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcResponse {
-    ClearAllData,
+    ClearAllData { wal_purged: bool },
     ExplorerCatalog { catalog: ExplorerCatalog },
     ExplorerSavedPanel { panel: ExplorerSavedPanelDefinition },
     ExplorerQuery { result: ExplorerQueryResult },
@@ -1045,9 +1045,12 @@ mod tests {
         );
 
         assert_eq!(
-            serde_json::to_value(RpcResponse::ClearAllData)?,
+            serde_json::to_value(RpcResponse::ClearAllData { wal_purged: true })?,
             json!({
-                "type": "clear_all_data"
+                "type": "clear_all_data",
+                "payload": {
+                    "wal_purged": true
+                }
             })
         );
 

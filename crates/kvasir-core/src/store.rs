@@ -54,7 +54,7 @@ const MIXED_COST_SOURCE: i64 = 3;
 const MILLIS_PER_DAY: i64 = 86_400_000;
 const CONTENT_RETENTION_EVICTION_BATCH_SIZE: i64 = 512;
 const POST_COMMIT_VACUUM_TASK: &str = "post_commit_vacuum";
-const POST_VACUUM_WAL_TRUNCATE_TASK: &str = "post_vacuum_wal_truncate";
+const WAL_TRUNCATE_TASK: &str = "wal_truncate";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -748,10 +748,29 @@ impl UsageStore {
         // pre-delete page images persist in the WAL until a checkpoint;
         // truncating honors the clear-my-data guarantee for the sidecar too.
         // The wrapping variant marks the failure as post-commit: the rows are
-        // gone even though the purge did not complete.
-        truncate_wal(&self.connection)
-            .map_err(|error| StoreError::WalPurgeFailed(Box::new(error)))?;
+        // gone even though the purge did not complete. Scheduling the
+        // truncation task keeps the purge owed until a later maintenance pass
+        // completes it.
+        if let Err(error) = truncate_wal(&self.connection) {
+            if let Err(schedule_error) = schedule_wal_truncation(&self.connection) {
+                eprintln!("blocked WAL purge could not be scheduled for retry: {schedule_error:?}");
+            }
+            return Err(StoreError::WalPurgeFailed(Box::new(error)));
+        }
         Ok(())
+    }
+
+    /// Reports whether a WAL truncation owed by a blocked purge is still
+    /// pending; drive [`Self::run_pending_maintenance`] until this clears.
+    pub fn wal_truncation_pending(&self) -> Result<bool, StoreError> {
+        let pending = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM store_maintenance_tasks WHERE task = ?1
+            )",
+            params![WAL_TRUNCATE_TASK],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(pending)
     }
 
     pub fn compact_content_retention(
@@ -5234,12 +5253,7 @@ fn attempt_pending_vacuum(connection: &Connection) {
             // hand the purge to its own task so a blocked truncation is
             // retried on the next maintenance pass without re-running the
             // whole VACUUM.
-            if let Err(error) = connection.execute(
-                "INSERT INTO store_maintenance_tasks (task, requested_at_ms)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(task) DO UPDATE SET requested_at_ms = excluded.requested_at_ms",
-                params![POST_VACUUM_WAL_TRUNCATE_TASK, current_unix_millis()],
-            ) {
+            if let Err(error) = schedule_wal_truncation(connection) {
                 eprintln!("post-VACUUM WAL truncation scheduling failed: {error:?}");
                 return;
             }
@@ -5261,12 +5275,25 @@ fn attempt_pending_vacuum(connection: &Connection) {
     }
 }
 
+fn schedule_wal_truncation(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO store_maintenance_tasks (task, requested_at_ms)
+         VALUES (?1, ?2)
+         ON CONFLICT(task) DO UPDATE SET
+            requested_at_ms = excluded.requested_at_ms,
+            last_attempt_ms = NULL,
+            last_error = NULL",
+        params![WAL_TRUNCATE_TASK, current_unix_millis()],
+    )?;
+    Ok(())
+}
+
 fn attempt_pending_wal_truncation(connection: &Connection) {
     let has_pending = match connection.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM store_maintenance_tasks WHERE task = ?1
         )",
-        params![POST_VACUUM_WAL_TRUNCATE_TASK],
+        params![WAL_TRUNCATE_TASK],
         |row| row.get::<_, bool>(0),
     ) {
         Ok(has_pending) => has_pending,
@@ -5283,17 +5310,13 @@ fn attempt_pending_wal_truncation(connection: &Connection) {
         Ok(()) => {
             if let Err(error) = connection.execute(
                 "DELETE FROM store_maintenance_tasks WHERE task = ?1",
-                params![POST_VACUUM_WAL_TRUNCATE_TASK],
+                params![WAL_TRUNCATE_TASK],
             ) {
                 eprintln!("post-VACUUM WAL truncation task cleanup failed: {error:?}");
             }
         }
         Err(error) => {
-            record_maintenance_task_failure(
-                connection,
-                POST_VACUUM_WAL_TRUNCATE_TASK,
-                &format!("{error:?}"),
-            );
+            record_maintenance_task_failure(connection, WAL_TRUNCATE_TASK, &format!("{error:?}"));
             eprintln!("post-VACUUM WAL truncation failed: {error:?}");
         }
     }
@@ -6329,6 +6352,12 @@ mod tests {
             Err(StoreError::WalPurgeFailed(inner))
                 if matches!(*inner, StoreError::WalCheckpointBlocked)
         ));
+
+        // The blocked purge stays owed as a maintenance task until a later
+        // pass completes it.
+        assert!(store.wal_truncation_pending()?);
+        store.run_pending_maintenance();
+        assert!(!store.wal_truncation_pending()?);
         Ok(())
     }
 
@@ -6372,7 +6401,7 @@ mod tests {
             "SELECT last_error
              FROM store_maintenance_tasks
              WHERE task = ?1",
-            params![POST_VACUUM_WAL_TRUNCATE_TASK],
+            params![WAL_TRUNCATE_TASK],
             |row| row.get(0),
         )?;
         assert!(blocked_error.is_some_and(|error| !error.is_empty()));
@@ -6382,7 +6411,7 @@ mod tests {
             "SELECT COUNT(*)
              FROM store_maintenance_tasks
              WHERE task = ?1",
-            params![POST_VACUUM_WAL_TRUNCATE_TASK],
+            params![WAL_TRUNCATE_TASK],
             |row| row.get(0),
         )?;
         assert_eq!(truncation_pending, 0);

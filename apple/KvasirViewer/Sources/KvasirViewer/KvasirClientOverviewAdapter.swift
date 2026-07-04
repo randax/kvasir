@@ -86,13 +86,19 @@ struct KvasirClientUsageDataManagement: UsageDataManagement {
 
     var canClearAllData: Bool { true }
 
-    func clearAllData() async throws {
-        try await Task.detached(priority: .userInitiated) { [self] in
+    func clearAllData() async throws -> UsageDataClearance {
+        let outcome = try await Task.detached(priority: .userInitiated) { [self] in
             try clearKvasirData(
                 socketPath: socketPath,
                 config: kvasirHarnessTelemetrySetup(from: setupConfig)
             )
         }.value
+        switch outcome {
+        case .cleared:
+            return .complete
+        case .clearedWalPurgePending:
+            return .walPurgePending
+        }
     }
 }
 
