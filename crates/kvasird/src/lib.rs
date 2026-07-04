@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -430,6 +431,7 @@ struct DaemonState {
     raw_body_directory: VerifiedRawBodyDirectory,
     updates: UpdateChannel,
     shutdown: broadcast::Sender<()>,
+    wal_purge_kick: Arc<tokio::sync::Notify>,
 }
 
 pub async fn start(config: DaemonConfig) -> anyhow::Result<RunningDaemon> {
@@ -471,14 +473,18 @@ async fn start_with_store_key_source_at_stable_path(
         let database_path = stable_database_path.clone();
         let key = resolved_store_key.key.clone();
         let price_table = config.price_table.clone();
-        tokio::task::spawn_blocking(move || {
-            UsageStore::open_with_price_table(&database_path, &key, price_table)
+        tokio::task::spawn_blocking(move || -> Result<(UsageStore, bool), StoreError> {
+            let store = UsageStore::open_with_price_table(&database_path, &key, price_table)?;
+            // A blocked clear-all-data purge persists as a maintenance task;
+            // pick it up across restarts.
+            let wal_purge_owed = store.wal_truncation_pending()?;
+            Ok((store, wal_purge_owed))
         })
         .await
         .expect("store open panicked")
     };
-    let store = match open_outcome {
-        Ok(store) => store,
+    let (store, wal_purge_owed) = match open_outcome {
+        Ok(opened) => opened,
         Err(err) => {
             if resolved_store_key.was_generated {
                 rollback_failed_generated_key_bootstrap(
@@ -505,6 +511,7 @@ async fn start_with_store_key_source_at_stable_path(
         raw_body_directory,
         updates,
         shutdown: shutdown.clone(),
+        wal_purge_kick: Arc::new(tokio::sync::Notify::new()),
     };
 
     remove_stale_socket(&config.rpc_socket_path)?;
@@ -548,6 +555,11 @@ async fn start_with_store_key_source_at_stable_path(
         )
         .await;
     });
+    let wal_purge_state = state.clone();
+    let wal_purge_shutdown = shutdown.clone();
+    let wal_purge_task = tokio::spawn(async move {
+        run_wal_purge_retrier(wal_purge_state, wal_purge_shutdown, wal_purge_owed).await;
+    });
 
     Ok(RunningDaemon {
         otlp_addr,
@@ -558,6 +570,7 @@ async fn start_with_store_key_source_at_stable_path(
             rpc_task,
             raw_body_import_task,
             content_retention_task,
+            wal_purge_task,
         ],
         state,
     })
@@ -638,34 +651,50 @@ async fn compact_content_retention(
 }
 
 const WAL_PURGE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const WAL_PURGE_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Drives store maintenance until the WAL truncation owed by a blocked
-/// clear-all-data purge completes; without this, a keep-forever retention
-/// policy would leave cleared rows' pre-images in the sidecar indefinitely.
-fn spawn_wal_purge_retrier(state: DaemonState) {
-    tokio::spawn(async move {
-        let mut shutdown = state.shutdown.subscribe();
+/// Completes the WAL truncation owed by a blocked clear-all-data purge;
+/// without this, a keep-forever retention policy would leave cleared rows'
+/// pre-images in the sidecar indefinitely. One task runs for the daemon's
+/// lifetime: it settles a purge left over from a previous run at startup and
+/// waits for `wal_purge_kick` afterwards, so repeated blocked clears cannot
+/// stack retry loops. Retries attempt only the truncation — never a VACUUM —
+/// and back off while a snapshot keeps blocking the checkpoint.
+async fn run_wal_purge_retrier(
+    state: DaemonState,
+    shutdown: broadcast::Sender<()>,
+    owed_at_startup: bool,
+) {
+    let mut shutdown = shutdown.subscribe();
+    let mut owed = owed_at_startup;
+    loop {
+        if !owed {
+            tokio::select! {
+                _ = shutdown.recv() => return,
+                _ = state.wal_purge_kick.notified() => {}
+            }
+        }
+        let mut delay = WAL_PURGE_RETRY_INTERVAL;
         loop {
             tokio::select! {
                 _ = shutdown.recv() => return,
-                _ = tokio::time::sleep(WAL_PURGE_RETRY_INTERVAL) => {}
+                _ = tokio::time::sleep(delay) => {}
             }
-            let outcome = state
+            match state
                 .store
-                .write(|store| -> Result<bool, StoreError> {
-                    store.run_pending_maintenance();
-                    store.wal_truncation_pending()
-                })
-                .await;
-            match outcome {
-                Ok(false) => return,
+                .write(|store| store.retry_wal_truncation())
+                .await
+            {
+                Ok(false) => break,
                 Ok(true) => {}
                 Err(error) => {
                     eprintln!("wal purge retry failed: {error:?}");
                 }
             }
+            delay = (delay * 2).min(WAL_PURGE_RETRY_MAX_INTERVAL);
         }
-    });
+        owed = false;
+    }
 }
 
 fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
@@ -1607,7 +1636,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     Err(StoreError::WalPurgeFailed(error)) => {
                         eprintln!("clear_all_data wal purge failed: {error:?}");
                         state.updates.notify(DataUpdate::Cleared);
-                        spawn_wal_purge_retrier(state.clone());
+                        state.wal_purge_kick.notify_one();
                         RpcResponse::ClearAllData { wal_purged: false }
                     }
                     Err(err) => {
@@ -2190,6 +2219,144 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        Ok(())
+    }
+
+    // Slow by design: drives a real blocked purge (5s busy timeout) in the
+    // first daemon, then waits for the second daemon's startup recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_daemon_completes_a_wal_purge_owed_by_a_blocked_clear() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let bearer_token = BearerToken::generate()?;
+        let config = |socket: &str| DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse().expect("test bind address"),
+            rpc_socket_path: temp.path().join(socket),
+            database_path: database_path.clone(),
+            bearer_token: bearer_token.clone(),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon = start_with_store_key_source(
+            config("rpc-first.sock"),
+            StoreKeySource::static_key_for_test([37; 32]),
+        )
+        .await?;
+
+        let (snapshot_held_sender, snapshot_held_receiver) = tokio::sync::oneshot::channel();
+        let store = daemon.state.store.clone();
+        let snapshot_holder = tokio::spawn(async move {
+            store
+                .read(move |store| {
+                    let query = RollupQuery::new(
+                        kvasir_core::rpc::TimestampMillis::from_millis(0),
+                        kvasir_core::rpc::TimestampMillis::from_millis(i64::MAX),
+                    );
+                    store.token_rollups(query)?;
+                    snapshot_held_sender.send(()).expect("test channel closed");
+                    std::thread::sleep(Duration::from_secs(7));
+                    Ok(())
+                })
+                .await
+        });
+        snapshot_held_receiver.await?;
+
+        let mut stream = UnixStream::connect(daemon.rpc_socket_path.clone()).await?;
+        let mut request_bytes = serde_json::to_vec(&RpcRequest::ClearAllData {
+            bearer_token: bearer_token.clone(),
+        })?;
+        request_bytes.push(b'\n');
+        stream.write_all(&request_bytes).await?;
+        let mut reader = BufReader::new(stream);
+        let response = read_bounded_line(
+            &mut reader,
+            MAX_RPC_RESPONSE_BYTES,
+            DaemonError::RpcResponseTooLarge,
+        )
+        .await?;
+        assert!(matches!(
+            serde_json::from_str::<RpcResponse>(&response)?,
+            RpcResponse::ClearAllData { wal_purged: false }
+        ));
+
+        // Simulate a crash before the retrier completes the owed purge.
+        drop(daemon);
+        snapshot_holder.await??;
+
+        let restarted = start_with_store_key_source(
+            config("rpc-second.sock"),
+            StoreKeySource::static_key_for_test([37; 32]),
+        )
+        .await?;
+        let purge_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let pending = restarted
+                .state
+                .store
+                .read(|store| store.wal_truncation_pending())
+                .await?;
+            if !pending {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < purge_deadline,
+                "restarted daemon did not complete the owed wal purge in time"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_update_subscription_forwards_content_evictions() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let config = DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse()?,
+            rpc_socket_path: temp.path().join("rpc.sock"),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::generate()?,
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([41; 32]))
+                .await?;
+
+        let mut stream = UnixStream::connect(daemon.rpc_socket_path.clone()).await?;
+        let mut request_bytes = serde_json::to_vec(&RpcRequest::SubscribeUsageUpdates)?;
+        request_bytes.push(b'\n');
+        stream.write_all(&request_bytes).await?;
+        let mut reader = BufReader::new(stream);
+        let initial = read_bounded_line(
+            &mut reader,
+            MAX_RPC_RESPONSE_BYTES,
+            DaemonError::RpcResponseTooLarge,
+        )
+        .await?;
+        assert!(matches!(
+            serde_json::from_str::<RpcStreamEvent>(&initial)?,
+            RpcStreamEvent::UsageUpdate {
+                kind: UsageUpdateKind::Initial
+            }
+        ));
+
+        daemon.state.updates.notify(DataUpdate::ContentEvicted);
+
+        let changed = read_bounded_line(
+            &mut reader,
+            MAX_RPC_RESPONSE_BYTES,
+            DaemonError::RpcResponseTooLarge,
+        )
+        .await?;
+        assert!(matches!(
+            serde_json::from_str::<RpcStreamEvent>(&changed)?,
+            RpcStreamEvent::UsageUpdate {
+                kind: UsageUpdateKind::Changed
+            }
+        ));
         Ok(())
     }
 

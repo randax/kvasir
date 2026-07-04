@@ -64,6 +64,8 @@ pub enum StoreError {
     WalNotEnabled,
     #[error("wal checkpoint was blocked by a concurrent reader")]
     WalCheckpointBlocked,
+    #[error("database is not in wal journal mode")]
+    NotInWalJournalMode,
     #[error("data was cleared but the wal purge failed")]
     WalPurgeFailed(#[source] Box<StoreError>),
     #[error("sqlite schema version {found} is newer than supported version {supported}")]
@@ -401,7 +403,7 @@ impl UsageStore {
         let journal_mode: String =
             connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if !journal_mode.eq_ignore_ascii_case("wal") {
-            return Err(StoreError::WalNotEnabled);
+            return Err(StoreError::NotInWalJournalMode);
         }
         let schema_version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
@@ -765,7 +767,33 @@ impl UsageStore {
             }
             return Err(StoreError::WalPurgeFailed(Box::new(error)));
         }
+        // An inline truncation also settles any purge still owed from an
+        // earlier blocked clear.
+        retire_wal_truncation_task(&self.connection);
         Ok(())
+    }
+
+    /// Retries the owed WAL truncation directly — deliberately not gated on
+    /// the maintenance task row, so a purge whose scheduling failed cannot be
+    /// stranded. Returns whether a truncation is still owed.
+    pub fn retry_wal_truncation(&mut self) -> Result<bool, StoreError> {
+        match truncate_wal(&self.connection) {
+            Ok(()) => {
+                retire_wal_truncation_task(&self.connection);
+                Ok(false)
+            }
+            Err(error) => {
+                if !self.wal_truncation_pending()? {
+                    schedule_wal_truncation(&self.connection)?;
+                }
+                record_maintenance_task_failure(
+                    &self.connection,
+                    WAL_TRUNCATE_TASK,
+                    &format!("{error:?}"),
+                );
+                Ok(true)
+            }
+        }
     }
 
     /// Reports whether a WAL truncation owed by a blocked purge is still
@@ -5315,18 +5343,20 @@ fn attempt_pending_wal_truncation(connection: &Connection) {
     }
 
     match truncate_wal(connection) {
-        Ok(()) => {
-            if let Err(error) = connection.execute(
-                "DELETE FROM store_maintenance_tasks WHERE task = ?1",
-                params![WAL_TRUNCATE_TASK],
-            ) {
-                eprintln!("post-VACUUM WAL truncation task cleanup failed: {error:?}");
-            }
-        }
+        Ok(()) => retire_wal_truncation_task(connection),
         Err(error) => {
             record_maintenance_task_failure(connection, WAL_TRUNCATE_TASK, &format!("{error:?}"));
             eprintln!("post-VACUUM WAL truncation failed: {error:?}");
         }
+    }
+}
+
+fn retire_wal_truncation_task(connection: &Connection) {
+    if let Err(error) = connection.execute(
+        "DELETE FROM store_maintenance_tasks WHERE task = ?1",
+        params![WAL_TRUNCATE_TASK],
+    ) {
+        eprintln!("wal truncation task cleanup failed: {error:?}");
     }
 }
 
@@ -6444,7 +6474,7 @@ mod tests {
             PriceTable::bundled_defaults(),
         );
 
-        assert!(matches!(outcome, Err(StoreError::WalNotEnabled)));
+        assert!(matches!(outcome, Err(StoreError::NotInWalJournalMode)));
         Ok(())
     }
 
