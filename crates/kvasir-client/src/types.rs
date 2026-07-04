@@ -132,6 +132,15 @@ pub struct KvasirTokenRollupUpdate {
     pub rollups: Vec<KvasirTokenRollup>,
 }
 
+/// Outcome of a clear-all-data request. The rows are deleted in both cases;
+/// `ClearedWalPurgePending` means the WAL sidecar still holds pre-delete page
+/// images and the daemon is finishing the purge in the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KvasirClearAllDataOutcome {
+    Cleared,
+    ClearedWalPurgePending,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum KvasirUsageUpdateKind {
     Initial,

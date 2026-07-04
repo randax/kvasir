@@ -6,7 +6,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -36,13 +35,15 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 mod setup;
+mod store_handle;
 mod updates;
 
+use store_handle::StoreHandle;
 use updates::{DataUpdate, UpdateChannel};
 
 const MAX_OTLP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -423,7 +424,7 @@ impl Drop for RunningDaemon {
 
 #[derive(Clone)]
 struct DaemonState {
-    store: Arc<Mutex<UsageStore>>,
+    store: StoreHandle,
     bearer_token: BearerToken,
     content_retention_policy: ContentRetentionPolicy,
     raw_body_directory: VerifiedRawBodyDirectory,
@@ -464,11 +465,19 @@ async fn start_with_store_key_source_at_stable_path(
         Ok(bootstrap_cleanup) => bootstrap_cleanup,
         Err(err) => return Err(err.into()),
     };
-    let store = match UsageStore::open_with_price_table(
-        &stable_database_path,
-        &resolved_store_key.key,
-        config.price_table.clone(),
-    ) {
+    // Opening runs migrations, which can be long on a large database; keep
+    // that off the async runtime like every other synchronous SQLite call.
+    let open_outcome = {
+        let database_path = stable_database_path.clone();
+        let key = resolved_store_key.key.clone();
+        let price_table = config.price_table.clone();
+        tokio::task::spawn_blocking(move || {
+            UsageStore::open_with_price_table(&database_path, &key, price_table)
+        })
+        .await
+        .expect("store open panicked")
+    };
+    let store = match open_outcome {
         Ok(store) => store,
         Err(err) => {
             if resolved_store_key.was_generated {
@@ -485,7 +494,12 @@ async fn start_with_store_key_source_at_stable_path(
     let updates = UpdateChannel::new();
     let (shutdown, _shutdown_receiver) = broadcast::channel(1);
     let state = DaemonState {
-        store: Arc::new(Mutex::new(store)),
+        store: StoreHandle::new(
+            store,
+            stable_database_path.clone(),
+            resolved_store_key.key.clone(),
+            config.price_table.clone(),
+        ),
         bearer_token: config.bearer_token,
         content_retention_policy: config.content_retention_policy.clone(),
         raw_body_directory,
@@ -606,12 +620,52 @@ async fn compact_content_retention(
     compacted_at: kvasir_core::rpc::TimestampMillis,
     run_maintenance: bool,
 ) -> Result<ContentRetentionReport, StoreError> {
-    let mut store = state.store.lock().await;
-    let report = store.compact_content_retention(policy, compacted_at)?;
-    if run_maintenance {
-        store.run_pending_maintenance();
+    let policy = policy.clone();
+    let report = state
+        .store
+        .write(move |store| -> Result<ContentRetentionReport, StoreError> {
+            let report = store.compact_content_retention(&policy, compacted_at)?;
+            if run_maintenance {
+                store.run_pending_maintenance();
+            }
+            Ok(report)
+        })
+        .await?;
+    if report.inline_blobs_evicted > 0 || report.raw_body_blobs_evicted > 0 {
+        state.updates.notify(DataUpdate::ContentEvicted);
     }
     Ok(report)
+}
+
+const WAL_PURGE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Drives store maintenance until the WAL truncation owed by a blocked
+/// clear-all-data purge completes; without this, a keep-forever retention
+/// policy would leave cleared rows' pre-images in the sidecar indefinitely.
+fn spawn_wal_purge_retrier(state: DaemonState) {
+    tokio::spawn(async move {
+        let mut shutdown = state.shutdown.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => return,
+                _ = tokio::time::sleep(WAL_PURGE_RETRY_INTERVAL) => {}
+            }
+            let outcome = state
+                .store
+                .write(|store| -> Result<bool, StoreError> {
+                    store.run_pending_maintenance();
+                    store.wal_truncation_pending()
+                })
+                .await;
+            match outcome {
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(error) => {
+                    eprintln!("wal purge retry failed: {error:?}");
+                }
+            }
+        }
+    });
 }
 
 fn current_timestamp_millis() -> kvasir_core::rpc::TimestampMillis {
@@ -1278,39 +1332,53 @@ async fn ingest_otlp(
     }
     .map_err(|_| IngestError::InvalidPayload)?;
 
-    {
-        let mut store = state.store.lock().await;
-        store
-            .ingest_usage(&records)
-            .map_err(|_| IngestError::StoreWriteFailed)?;
-        store
-            .record_raw_body_references(&records.raw_body_references)
-            .map_err(|_| IngestError::StoreWriteFailed)?;
-        if !state.content_retention_policy.keeps_forever() {
-            store
-                .compact_content_retention(
-                    &state.content_retention_policy,
-                    current_timestamp_millis(),
-                )
-                .map_err(|_| IngestError::StoreWriteFailed)?;
+    let retention_policy = (!state.content_retention_policy.keeps_forever())
+        .then(|| state.content_retention_policy.clone());
+    let compacted_at = current_timestamp_millis();
+    // A client disconnect drops this handler future, but a write that already
+    // reached the store must still be followed by the raw-body import and the
+    // subscriber notification; run the sequence on a task that outlives the
+    // request. Such a task may also outlive daemon shutdown — accepted: the
+    // write is idempotent by event key, and WAL plus the busy timeout keep a
+    // restarted instance safe against the straggler.
+    let ingest = tokio::spawn(async move {
+        let outcome = async {
+            state
+                .store
+                .write(move |store| -> Result<(), StoreError> {
+                    store.ingest_usage(&records)?;
+                    store.record_raw_body_references(&records.raw_body_references)?;
+                    if let Some(policy) = retention_policy {
+                        store.compact_content_retention(&policy, compacted_at)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(IngestError::StoreWriteFailed)?;
+            // Notify before the raw-body import: the write is committed, so
+            // subscribers must refresh even if the import fails. A successful
+            // import announces itself with ContentImported.
+            state.updates.notify(DataUpdate::RollupsChanged);
+            import_available_raw_bodies(&state).await?;
+            Ok(StatusCode::ACCEPTED)
         }
-    }
-    import_available_raw_bodies(&state).await?;
-    state.updates.notify(DataUpdate::RollupsChanged);
-
-    Ok(StatusCode::ACCEPTED)
+        .await;
+        // With the client disconnected this task's result is discarded, so a
+        // failure must leave a trace of its own.
+        if let Err(error) = &outcome {
+            eprintln!("otlp ingest failed: {error:?}");
+        }
+        outcome
+    });
+    ingest.await.expect("otlp ingest task panicked")
 }
 
 async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, IngestError> {
-    let candidates = {
-        let store = state.store.lock().await;
-        store
-            .raw_body_import_candidates(RAW_BODY_IMPORT_BATCH_SIZE)
-            .map_err(|error| {
-                eprintln!("raw body candidate query failed: {error:?}");
-                IngestError::StoreWriteFailed
-            })?
-    };
+    let candidates = state
+        .store
+        .read(|store| store.raw_body_import_candidates(RAW_BODY_IMPORT_BATCH_SIZE))
+        .await
+        .map_err(IngestError::StoreWriteFailed)?;
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -1367,20 +1435,23 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     let stores_new_body = prepared_imports
         .iter()
         .any(|prepared| prepared.stores_body());
-    let inserted_event_keys = if prepared_imports.is_empty() {
-        Vec::new()
+    let (inserted_event_keys, prepared_imports) = if prepared_imports.is_empty() {
+        (Vec::new(), prepared_imports)
     } else {
-        let mut store = state.store.lock().await;
-        store
-            .commit_prepared_raw_body_imports_with_retention(
-                &prepared_imports,
-                &state.content_retention_policy,
-                current_timestamp_millis(),
-            )
-            .map_err(|error| {
-                eprintln!("raw body import commit failed: {error:?}");
-                IngestError::StoreWriteFailed
-            })?
+        let policy = state.content_retention_policy.clone();
+        let compacted_at = current_timestamp_millis();
+        state
+            .store
+            .write(move |store| -> Result<_, StoreError> {
+                let inserted = store.commit_prepared_raw_body_imports_with_retention(
+                    &prepared_imports,
+                    &policy,
+                    compacted_at,
+                )?;
+                Ok((inserted, prepared_imports))
+            })
+            .await
+            .map_err(IngestError::StoreWriteFailed)?
     };
     let inserted_event_keys: HashSet<String> = inserted_event_keys.into_iter().collect();
     let mut cleanup_imports = Vec::new();
@@ -1408,26 +1479,26 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     }
     completed_event_keys.extend(cleanup_report.completed_event_keys);
 
-    if !completed_event_keys.is_empty() || !import_failures.is_empty() {
-        let mut store = state.store.lock().await;
-        store
-            .complete_raw_body_imports(&completed_event_keys)
-            .map_err(|error| {
-                eprintln!("raw body import completion failed: {error:?}");
-                IngestError::StoreWriteFailed
-            })?;
-        store
-            .record_raw_body_import_failures(&import_failures)
-            .map_err(|error| {
-                eprintln!("raw body import failure recording failed: {error:?}");
-                IngestError::StoreWriteFailed
-            })?;
+    let has_completed_event_keys = !completed_event_keys.is_empty();
+    if has_completed_event_keys || !import_failures.is_empty() {
+        state
+            .store
+            .write(move |store| -> Result<(), IngestError> {
+                store
+                    .complete_raw_body_imports(&completed_event_keys)
+                    .map_err(IngestError::StoreWriteFailed)?;
+                store
+                    .record_raw_body_import_failures(&import_failures)
+                    .map_err(IngestError::StoreWriteFailed)?;
+                Ok(())
+            })
+            .await?;
     }
 
     if stores_new_body {
         state.updates.notify(DataUpdate::ContentImported);
     }
-    Ok(stores_new_body || !completed_event_keys.is_empty())
+    Ok(stores_new_body || has_completed_event_keys)
 }
 
 fn raw_body_failure_kind(error: &StoreError) -> RawBodyImportFailureKind {
@@ -1524,10 +1595,20 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     error: RpcError::Unauthorized,
                 }
             } else {
-                match state.store.lock().await.clear_all_data() {
+                match state.store.write(|store| store.clear_all_data()).await {
                     Ok(()) => {
                         state.updates.notify(DataUpdate::Cleared);
-                        RpcResponse::ClearAllData
+                        RpcResponse::ClearAllData { wal_purged: true }
+                    }
+                    // A failed WAL purge happens after the delete transaction
+                    // has committed: the rows are gone, so viewers must still
+                    // refresh and the client hears a typed partial success
+                    // while a background task finishes the owed purge.
+                    Err(StoreError::WalPurgeFailed(error)) => {
+                        eprintln!("clear_all_data wal purge failed: {error:?}");
+                        state.updates.notify(DataUpdate::Cleared);
+                        spawn_wal_purge_retrier(state.clone());
+                        RpcResponse::ClearAllData { wal_purged: false }
                     }
                     Err(err) => {
                         eprintln!("clear_all_data failed: {err:?}");
@@ -1545,7 +1626,11 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             panel: explorer_saved_panel(panel),
         },
         Ok(RpcRequest::ExplorerQuery { query }) => {
-            match state.store.lock().await.run_explorer_query(query) {
+            match state
+                .store
+                .read(move |store| store.run_explorer_query(query))
+                .await
+            {
                 Ok(Ok(result)) => RpcResponse::ExplorerQuery { result },
                 Ok(Err(errors)) => RpcResponse::Error {
                     error: RpcError::ExplorerValidation {
@@ -1558,7 +1643,11 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::ExplorerSavedPanelRun { run }) => {
-            match state.store.lock().await.run_explorer_saved_panel(run) {
+            match state
+                .store
+                .read(move |store| store.run_explorer_saved_panel(run))
+                .await
+            {
                 Ok(Ok(result)) => RpcResponse::ExplorerSavedPanelRun { result },
                 Ok(Err(errors)) => RpcResponse::Error {
                     error: RpcError::ExplorerValidation {
@@ -1571,7 +1660,11 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::TokenRollup { query }) => {
-            match state.store.lock().await.token_rollups(query) {
+            match state
+                .store
+                .read(move |store| store.token_rollups(query))
+                .await
+            {
                 Ok(rollups) => RpcResponse::TokenRollup { rollups },
                 Err(_err) => RpcResponse::Error {
                     error: RpcError::Internal,
@@ -1579,8 +1672,11 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::OverviewRollup { query }) => {
-            let store = state.store.lock().await;
-            match overview_rollups(&store, query) {
+            match state
+                .store
+                .read(move |store| overview_rollups(store, query))
+                .await
+            {
                 Ok(rollup) => RpcResponse::OverviewRollup { rollup },
                 Err(_err) => RpcResponse::Error {
                     error: RpcError::Internal,
@@ -1588,7 +1684,11 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::CostRollup { query }) => {
-            match state.store.lock().await.cost_rollups(query) {
+            match state
+                .store
+                .read(move |store| store.cost_rollups(query))
+                .await
+            {
                 Ok(rollups) => RpcResponse::CostRollup { rollups },
                 Err(_err) => RpcResponse::Error {
                     error: RpcError::Internal,
@@ -1596,19 +1696,25 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
             }
         }
         Ok(RpcRequest::ToolCallRollup { query }) => {
-            match state.store.lock().await.tool_call_rollups(query) {
+            match state
+                .store
+                .read(move |store| store.tool_call_rollups(query))
+                .await
+            {
                 Ok(rollups) => RpcResponse::ToolCallRollup { rollups },
                 Err(_err) => RpcResponse::Error {
                     error: RpcError::Internal,
                 },
             }
         }
-        Ok(RpcRequest::Trace { query }) => match state.store.lock().await.traces(query) {
-            Ok(traces) => RpcResponse::Trace { traces },
-            Err(_err) => RpcResponse::Error {
-                error: RpcError::Internal,
-            },
-        },
+        Ok(RpcRequest::Trace { query }) => {
+            match state.store.read(move |store| store.traces(query)).await {
+                Ok(traces) => RpcResponse::Trace { traces },
+                Err(_err) => RpcResponse::Error {
+                    error: RpcError::Internal,
+                },
+            }
+        }
         Ok(RpcRequest::Content {
             query,
             bearer_token,
@@ -1618,7 +1724,11 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     error: RpcError::Unauthorized,
                 }
             } else {
-                match state.store.lock().await.content_replay(query) {
+                match state
+                    .store
+                    .read(move |store| store.content_replay(query))
+                    .await
+                {
                     Ok(replay) => RpcResponse::Content { replay },
                     Err(_err) => RpcResponse::Error {
                         error: RpcError::Internal,
@@ -1650,7 +1760,7 @@ async fn handle_rpc_connection(stream: UnixStream, state: DaemonState) -> anyhow
                     }
                     update = updates.recv() => {
                         match update {
-                            Ok(DataUpdate::ContentImported) => {}
+                            Ok(DataUpdate::ContentImported | DataUpdate::ContentEvicted) => {}
                             Ok(DataUpdate::RollupsChanged | DataUpdate::Cleared)
                             | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 match write_token_rollup_event_if_changed(
@@ -1796,7 +1906,11 @@ async fn write_token_rollup_event_if_changed<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let event = match state.store.lock().await.token_rollups(query) {
+    let event = match state
+        .store
+        .read(move |store| store.token_rollups(query))
+        .await
+    {
         Ok(rollups) => RpcStreamEvent::TokenRollup { rollups },
         Err(_err) => RpcStreamEvent::Error {
             error: RpcError::Internal,
@@ -1908,7 +2022,7 @@ enum IngestError {
     #[error("metrics payload is too large")]
     PayloadTooLarge,
     #[error("metrics store write failed")]
-    StoreWriteFailed,
+    StoreWriteFailed(#[source] StoreError),
 }
 
 impl IntoResponse for IngestError {
@@ -1918,7 +2032,7 @@ impl IntoResponse for IngestError {
             Self::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::InvalidPayload => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::StoreWriteFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::StoreWriteFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
         .into_response()
     }
@@ -1954,6 +2068,185 @@ mod tests {
 
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_queries_are_served_while_a_long_store_write_is_in_flight() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let config = DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse()?,
+            rpc_socket_path: temp.path().join("rpc.sock"),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: BearerToken::generate()?,
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([23; 32]))
+                .await?;
+
+        let (busy_sender, busy_receiver) = tokio::sync::oneshot::channel();
+        let store = daemon.state.store.clone();
+        let long_write = tokio::spawn(async move {
+            store
+                .write(move |store| {
+                    busy_sender.send(()).expect("test channel closed");
+                    std::thread::sleep(Duration::from_secs(2));
+                    store.run_pending_maintenance();
+                })
+                .await;
+        });
+        busy_receiver.await?;
+
+        let query = RollupQuery::new(
+            kvasir_core::rpc::TimestampMillis::from_millis(0),
+            kvasir_core::rpc::TimestampMillis::from_millis(i64::MAX),
+        );
+        let rollups = tokio::time::timeout(
+            Duration::from_secs(1),
+            query_token_rollup(daemon.rpc_socket_path.clone(), query),
+        )
+        .await
+        .expect("rpc query stalled behind the long store write")?;
+
+        assert_eq!(rollups, vec![]);
+        long_write.await?;
+        Ok(())
+    }
+
+    // Slow by design: the WAL checkpoint retries against the held snapshot
+    // for the full busy timeout before reporting itself blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clear_all_data_notifies_viewers_even_when_wal_purge_is_blocked() -> anyhow::Result<()>
+    {
+        let temp = tempdir()?;
+        let bearer_token = BearerToken::generate()?;
+        let config = DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse()?,
+            rpc_socket_path: temp.path().join("rpc.sock"),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token: bearer_token.clone(),
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([29; 32]))
+                .await?;
+        let mut updates = daemon.state.updates.subscribe();
+
+        let (snapshot_held_sender, snapshot_held_receiver) = tokio::sync::oneshot::channel();
+        let store = daemon.state.store.clone();
+        let snapshot_holder = tokio::spawn(async move {
+            store
+                .read(move |store| {
+                    let query = RollupQuery::new(
+                        kvasir_core::rpc::TimestampMillis::from_millis(0),
+                        kvasir_core::rpc::TimestampMillis::from_millis(i64::MAX),
+                    );
+                    store.token_rollups(query)?;
+                    snapshot_held_sender.send(()).expect("test channel closed");
+                    std::thread::sleep(Duration::from_secs(7));
+                    Ok(())
+                })
+                .await
+        });
+        snapshot_held_receiver.await?;
+
+        let mut stream = UnixStream::connect(daemon.rpc_socket_path.clone()).await?;
+        let mut request_bytes = serde_json::to_vec(&RpcRequest::ClearAllData { bearer_token })?;
+        request_bytes.push(b'\n');
+        stream.write_all(&request_bytes).await?;
+        let mut reader = BufReader::new(stream);
+        let response = read_bounded_line(
+            &mut reader,
+            MAX_RPC_RESPONSE_BYTES,
+            DaemonError::RpcResponseTooLarge,
+        )
+        .await?;
+        assert!(matches!(
+            serde_json::from_str::<RpcResponse>(&response)?,
+            RpcResponse::ClearAllData { wal_purged: false }
+        ));
+
+        assert_eq!(updates.recv().await?, DataUpdate::Cleared);
+        snapshot_holder.await??;
+
+        // Once the blocking snapshot is gone, the background retrier
+        // completes the owed WAL purge and retires the maintenance task.
+        let purge_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let pending = daemon
+                .state
+                .store
+                .read(|store| store.wal_truncation_pending())
+                .await?;
+            if !pending {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < purge_deadline,
+                "wal purge retrier did not complete the owed truncation in time"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_ingest_notifies_subscribers_even_when_the_client_disconnects_mid_queue()
+    -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let bearer_token = BearerToken::new("test-token");
+        let config = DaemonConfig {
+            otlp_bind: "127.0.0.1:0".parse()?,
+            rpc_socket_path: temp.path().join("rpc.sock"),
+            database_path: temp.path().join("usage.sqlite3"),
+            bearer_token,
+            price_table: PriceTable::bundled_defaults(),
+            content_retention_policy: ContentRetentionPolicy::default(),
+            content_retention_schedule: ContentRetentionSchedule::default(),
+        };
+        let daemon =
+            start_with_store_key_source(config, StoreKeySource::static_key_for_test([31; 32]))
+                .await?;
+        let mut updates = daemon.state.updates.subscribe();
+
+        let (write_held_sender, write_held_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let store = daemon.state.store.clone();
+        let write_holder = tokio::spawn(async move {
+            store
+                .write(move |_store| {
+                    write_held_sender.send(()).expect("test channel closed");
+                    release_receiver.recv().expect("test channel closed");
+                })
+                .await
+        });
+        write_held_receiver.await?;
+
+        let body = include_str!("../tests/fixtures/claude_token_usage_otlp.json");
+        let request = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            daemon.otlp_addr(),
+            body.len(),
+            body
+        );
+        let mut stream = tokio::net::TcpStream::connect(daemon.otlp_addr()).await?;
+        stream.write_all(request.as_bytes()).await?;
+        // Give the server time to dispatch the handler, which then queues
+        // behind the held write turn; disconnecting at that point drops the
+        // handler future, but the commit and notification must still happen.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release_sender.send(())?;
+
+        let update = tokio::time::timeout(Duration::from_secs(10), updates.recv()).await??;
+        assert_eq!(update, DataUpdate::RollupsChanged);
+        write_holder.await?;
+        Ok(())
+    }
 
     #[test]
     fn store_key_resolver_generates_once_and_reuses_stored_key() -> anyhow::Result<()> {

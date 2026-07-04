@@ -103,9 +103,15 @@ struct KvasirSettingsScreen: View {
         do {
             let outcome = try await model.clearAllData()
             confirmationText = ""
-            clearAllDataStatusMessage = "All data cleared"
+            switch outcome.clearance {
+            case .complete:
+                clearAllDataStatusMessage = "All data cleared"
+            case .walPurgePending:
+                clearAllDataStatusMessage =
+                    "All data cleared. Secure cleanup of the database journal is finishing in the background."
+            }
             isConfirmingClearAllData = false
-            if case .refreshFailed = outcome {
+            if !outcome.refreshed {
                 clearAllDataErrorMessage = model.errorMessage
                     ?? "All data was cleared, but the overview could not be refreshed."
             }

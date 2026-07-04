@@ -16,13 +16,13 @@ use kvasir_core::rpc::{RpcRequest, RpcResponse, RpcStreamEvent};
 use crate::error::KvasirClientError;
 use crate::transport::{connect_with_retries, read_rpc_stream_event, send_rpc_request};
 use crate::types::{
-    KvasirBearerToken, KvasirContentQuery, KvasirContentReplay, KvasirCostRollup,
-    KvasirExplorerCatalog, KvasirExplorerQuery, KvasirExplorerResult, KvasirExplorerSavedPanel,
-    KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun, KvasirOverviewRollup,
-    KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath, KvasirTokenRollup,
-    KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace, KvasirTraceQuery,
-    KvasirUsageRollupExplorerPanelRequest, KvasirUsageRollupExplorerPanelSnapshot,
-    KvasirUsageUpdateKind,
+    KvasirBearerToken, KvasirClearAllDataOutcome, KvasirContentQuery, KvasirContentReplay,
+    KvasirCostRollup, KvasirExplorerCatalog, KvasirExplorerQuery, KvasirExplorerResult,
+    KvasirExplorerSavedPanel, KvasirExplorerSavedPanelDefinition, KvasirExplorerSavedPanelRun,
+    KvasirOverviewRollup, KvasirOverviewSnapshot, KvasirRollupQuery, KvasirSocketPath,
+    KvasirTokenRollup, KvasirTokenRollupUpdate, KvasirToolCallRollup, KvasirTrace,
+    KvasirTraceQuery, KvasirUsageRollupExplorerPanelRequest,
+    KvasirUsageRollupExplorerPanelSnapshot, KvasirUsageUpdateKind,
 };
 
 #[derive(Debug, uniffi::Object)]
@@ -83,7 +83,10 @@ impl KvasirClient {
         }
     }
 
-    pub fn clear_all_data(&self, bearer_token: KvasirBearerToken) -> Result<(), KvasirClientError> {
+    pub fn clear_all_data(
+        &self,
+        bearer_token: KvasirBearerToken,
+    ) -> Result<KvasirClearAllDataOutcome, KvasirClientError> {
         let response = send_rpc_request(
             &self.socket_path,
             RpcRequest::ClearAllData {
@@ -91,7 +94,12 @@ impl KvasirClient {
             },
         )?;
         match response {
-            RpcResponse::ClearAllData => Ok(()),
+            RpcResponse::ClearAllData { wal_purged: true } => {
+                Ok(KvasirClearAllDataOutcome::Cleared)
+            }
+            RpcResponse::ClearAllData { wal_purged: false } => {
+                Ok(KvasirClearAllDataOutcome::ClearedWalPurgePending)
+            }
             RpcResponse::Error { error } => Err(error.into()),
             _ => Err(KvasirClientError::WrongResponseType),
         }
