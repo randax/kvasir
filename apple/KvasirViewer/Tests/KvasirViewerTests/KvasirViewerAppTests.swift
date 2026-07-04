@@ -643,6 +643,33 @@ func kvasirUsageRollupExplorerPanelMappingPreservesTypedRequestAndSnapshot() thr
 }
 
 @Test
+func kvasirRollupQueryRejectsInvalidTimestamps() throws {
+    #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
+        _ = try kvasirRollupQuery(from: OverviewQuery(
+            start: Date(timeIntervalSince1970: .nan),
+            end: Date(timeIntervalSince1970: 1)
+        ))
+    }
+    #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
+        _ = try kvasirRollupQuery(from: OverviewQuery(
+            start: Date(timeIntervalSince1970: 1),
+            end: Date(timeIntervalSince1970: 9_223_372_036_854_776)
+        ))
+    }
+}
+
+@Test
+func kvasirRollupQueryConvertsFiniteDatesToMilliseconds() throws {
+    let query = try kvasirRollupQuery(from: OverviewQuery(
+        start: Date(timeIntervalSince1970: 1_782_000_000),
+        end: Date(timeIntervalSince1970: 1_782_259_200)
+    ))
+
+    #expect(query.start == KvasirTimestampMillis(value: 1_782_000_000_000))
+    #expect(query.end == KvasirTimestampMillis(value: 1_782_259_200_000))
+}
+
+@Test
 func kvasirUsageRollupExplorerPanelRequestRejectsInvalidTimestamps() throws {
     #expect(throws: KvasirClientOverviewAdapterConversionError.self) {
         _ = try kvasirUsageRollupExplorerPanelRequest(
@@ -984,6 +1011,41 @@ func daemonFallbackOverviewClientStopsRetryingAfterBoundedRecoverableFailures() 
     #expect(await primary.loadCount == 4)
     #expect(starter.startCount == 1)
     #expect(await retryDelay.attempts == [1, 2])
+}
+
+@Test
+func daemonFallbackOverviewClientStopsRetryingWhenLoadIsCancelled() async throws {
+    let primary = SequenceOverviewClient(results: Array(
+        repeating: .failure(DaemonFallbackTestError.recoverable),
+        count: 30
+    ))
+    let starter = RecordingDaemonProcessStarter()
+    let client = DaemonFallbackOverviewClient(
+        primary: primary,
+        starter: starter,
+        shouldStartDaemonAfterError: { error in
+            error as? DaemonFallbackTestError == .recoverable
+        },
+        retryDelay: { _ in
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        }
+    )
+
+    let load = Task {
+        try await client.loadOverviewSnapshot(
+            query: .init(start: Date(timeIntervalSince1970: 0), end: Date(timeIntervalSince1970: 1))
+        )
+    }
+    await waitForLoadCount(primary, 2)
+    load.cancel()
+
+    do {
+        _ = try await load.value
+        Issue.record("expected cancelled load to throw")
+    } catch {
+        #expect(error is CancellationError)
+    }
+    #expect(await primary.loadCount == 2)
 }
 
 #if canImport(kvasir_client)

@@ -11,7 +11,7 @@ struct KvasirClientRollupSource: OverviewRollupSource, TraceInspectorSource, Usa
         try await Task.detached(priority: .userInitiated) { [self] in
             let client = try KvasirClient.connect(socketPath: socketPath)
             return try overviewSnapshotFromKvasir(
-                client.overviewSnapshot(query: kvasirRollupQuery(from: query))
+                client.overviewSnapshot(query: try kvasirRollupQuery(from: query))
             )
         }.value
     }
@@ -122,10 +122,10 @@ private final class KvasirOverviewRefreshSubscriptionBox: @unchecked Sendable {
     }
 }
 
-func kvasirRollupQuery(from query: OverviewQuery) -> KvasirRollupQuery {
+func kvasirRollupQuery(from query: OverviewQuery) throws -> KvasirRollupQuery {
     KvasirRollupQuery(
-        start: KvasirTimestampMillis(value: Int64(query.start.timeIntervalSince1970 * 1_000)),
-        end: KvasirTimestampMillis(value: Int64(query.end.timeIntervalSince1970 * 1_000)),
+        start: try kvasirTimestampMillis(from: query.start),
+        end: try kvasirTimestampMillis(from: query.end),
         repo: query.repo?.kvasirRepoBucket,
         harness: query.harness?.displayName(),
         model: query.model?.displayName(),
@@ -163,7 +163,7 @@ func kvasirTimestampMillis(from date: Date) throws -> KvasirTimestampMillis {
     let millis = date.timeIntervalSince1970 * 1_000
     guard millis.isFinite,
           millis >= Double(Int64.min),
-          millis <= Double(Int64.max)
+          millis < Double(Int64.max)
     else {
         throw KvasirClientOverviewAdapterConversionError.invalidTimestamp
     }

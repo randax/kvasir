@@ -140,6 +140,163 @@ func failedLiveOverviewUpdateKeepsSnapshotAndListenerRecovers() async throws {
 
 @MainActor
 @Test
+func liveOverviewUpdatesRearmAfterUpdateStreamFinishes() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let rearmDelays = RearmDelayRecorder()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        liveOverviewUpdateRearmDelay: { attempt in rearmDelays.append(attempt) }
+    )
+
+    try await model.start()
+    #expect(model.overviewSnapshot?.totals.totalTokens == 35)
+    await updateSource.waitForSubscriptions(count: 1)
+
+    updateSource.finishCurrentStream()
+    await updateSource.waitForSubscriptions(count: 2)
+    #expect(rearmDelays.attempts == [1])
+
+    updateSource.send()
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+}
+
+@MainActor
+@Test
+func liveOverviewUpdatesDoNotRearmWithoutUpdateSource() async throws {
+    let rearmDelays = RearmDelayRecorder()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        liveOverviewUpdateRearmDelay: { attempt in rearmDelays.append(attempt) }
+    )
+
+    try await model.start()
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(rearmDelays.attempts.isEmpty)
+}
+
+@MainActor
+@Test
+func liveOverviewUpdateRearmBackoffResetsAfterStreamDeliversEvent() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let rearmDelays = RearmDelayRecorder()
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        liveOverviewUpdateRearmDelay: { attempt in rearmDelays.append(attempt) }
+    )
+
+    try await model.start()
+    await updateSource.waitForSubscriptions(count: 1)
+
+    updateSource.finishCurrentStream()
+    await updateSource.waitForSubscriptions(count: 2)
+
+    updateSource.send()
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 42)
+
+    updateSource.finishCurrentStream()
+    await updateSource.waitForSubscriptions(count: 3)
+
+    #expect(rearmDelays.attempts == [1, 1])
+}
+
+@MainActor
+@Test
+func liveOverviewUpdateDoesNotDropInFlightRangePresetSelection() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let client = OrderedOverviewResultClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    let start = Task { try await model.start() }
+    await client.waitForPendingLoads(count: 1)
+    client.completeLoad(at: 0)
+    try await start.value
+    await updateSource.waitForSubscriptions(count: 1)
+
+    let select = Task { try await model.selectRangePreset(.today) }
+    await client.waitForPendingLoads(count: 2)
+
+    updateSource.send()
+    try await Task.sleep(for: .milliseconds(50))
+
+    client.completeLoad(at: 1)
+    try await select.value
+
+    #expect(model.selectedRangePreset == .today)
+    #expect(model.overviewSnapshot?.totals.totalTokens == 42)
+}
+
+@MainActor
+@Test
+func liveOverviewUpdateSkippedDuringInFlightLoadRunsAfterItCompletes() async throws {
+    let updateSource = RestartingManualOverviewUpdateSource()
+    let client = OrderedOverviewResultClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .success(overviewSnapshot(totalTokens: 42)),
+            .success(overviewSnapshot(totalTokens: 50))
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client, updateSource: updateSource),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled))
+    )
+
+    let start = Task { try await model.start() }
+    await client.waitForPendingLoads(count: 1)
+    client.completeLoad(at: 0)
+    try await start.value
+    await updateSource.waitForSubscriptions(count: 1)
+
+    let select = Task { try await model.selectRangePreset(.today) }
+    await client.waitForPendingLoads(count: 2)
+
+    updateSource.send()
+    try await Task.sleep(for: .milliseconds(50))
+
+    client.completeLoad(at: 1)
+    try await select.value
+    #expect(model.selectedRangePreset == .today)
+
+    await client.waitForPendingLoads(count: 3)
+    client.completeLoad(at: 2)
+    await waitUntil(model.overviewSnapshot?.totals.totalTokens == 50)
+
+    #expect(model.overviewSnapshot?.totals.totalTokens == 50)
+}
+
+@MainActor
+@Test
 func liveOverviewListenerDoesNotRetainModel() async throws {
     let updateSource = ManualOverviewUpdateSource()
     let client = RecordingResultOverviewClient(
@@ -1195,6 +1352,40 @@ func failedRepoSelectionKeepsPreviousRepoAndSnapshot() async throws {
 
 @MainActor
 @Test
+func failedRangePresetSelectionKeepsPreviousPresetAndSnapshot() async throws {
+    let now = Date(timeIntervalSince1970: 1_782_259_200)
+    let client = RecordingResultOverviewClient(
+        results: [
+            .success(overviewSnapshot(totalTokens: 35)),
+            .failure(StartupTestError.transient)
+        ]
+    )
+    let model = KvasirViewerModel(
+        dashboard: OverviewDashboard(client: client),
+        launchAgent: DaemonLaunchAgent(registry: RecordingStartupLaunchAgentRegistry(status: .enabled)),
+        now: { now }
+    )
+
+    try await model.refreshOverview()
+    let previousSnapshot = model.overviewSnapshot
+
+    do {
+        try await model.selectRangePreset(.today)
+        Issue.record("expected failed range selection")
+    } catch {
+        #expect(error.localizedDescription == "transient")
+    }
+
+    #expect(model.selectedRangePreset == .lastSevenDays)
+    #expect(model.overviewSnapshot == previousSnapshot)
+    #expect(client.queries == [
+        OverviewRangePreset.lastSevenDays.range(containing: now, calendar: .kvasirRollupUTC).query,
+        OverviewRangePreset.today.range(containing: now, calendar: .kvasirRollupUTC).query
+    ])
+}
+
+@MainActor
+@Test
 func staleOverviewLoadsCannotOverwriteNewerRangeSelection() async throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -1433,14 +1624,26 @@ private final class OrderedTraceInspectorClient: TraceInspectorClient, @unchecke
         return responses[index]
     }
 
-    func waitForPendingLoads(count: Int) async {
-        while !lock.withLock({ pendingContinuations.count >= count && pendingContinuations.prefix(count).allSatisfy { $0 != nil } }) {
-            await Task.yield()
+    func waitForPendingLoads(
+        count: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let ready = { self.lock.withLock {
+            self.pendingContinuations.count >= count && self.pendingContinuations.prefix(count).allSatisfy { $0 != nil }
+        } }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !ready(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        if !ready() {
+            Issue.record("expected \(count) pending loads", sourceLocation: sourceLocation)
         }
     }
 
     func completeLoad(at index: Int) {
-        let continuation = lock.withLock { pendingContinuations[index] }
+        let continuation = lock.withLock {
+            pendingContinuations.indices.contains(index) ? pendingContinuations[index] : nil
+        }
         continuation?.resume()
     }
 }
@@ -1489,14 +1692,26 @@ private final class OrderedOverviewClient: OverviewClient, @unchecked Sendable {
         return responses[index]
     }
 
-    func waitForPendingLoads(count: Int) async {
-        while !lock.withLock({ pendingContinuations.count >= count && pendingContinuations.prefix(count).allSatisfy { $0 != nil } }) {
-            await Task.yield()
+    func waitForPendingLoads(
+        count: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let ready = { self.lock.withLock {
+            self.pendingContinuations.count >= count && self.pendingContinuations.prefix(count).allSatisfy { $0 != nil }
+        } }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !ready(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        if !ready() {
+            Issue.record("expected \(count) pending loads", sourceLocation: sourceLocation)
         }
     }
 
     func completeLoad(at index: Int) {
-        let continuation = lock.withLock { pendingContinuations[index] }
+        let continuation = lock.withLock {
+            pendingContinuations.indices.contains(index) ? pendingContinuations[index] : nil
+        }
         continuation?.resume()
     }
 }
@@ -1524,14 +1739,26 @@ private final class OrderedOverviewResultClient: OverviewClient, @unchecked Send
         return try results[index].get()
     }
 
-    func waitForPendingLoads(count: Int) async {
-        while !lock.withLock({ pendingContinuations.count >= count && pendingContinuations.prefix(count).allSatisfy { $0 != nil } }) {
-            await Task.yield()
+    func waitForPendingLoads(
+        count: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let ready = { self.lock.withLock {
+            self.pendingContinuations.count >= count && self.pendingContinuations.prefix(count).allSatisfy { $0 != nil }
+        } }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !ready(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        if !ready() {
+            Issue.record("expected \(count) pending loads", sourceLocation: sourceLocation)
         }
     }
 
     func completeLoad(at index: Int) {
-        let continuation = lock.withLock { pendingContinuations[index] }
+        let continuation = lock.withLock {
+            pendingContinuations.indices.contains(index) ? pendingContinuations[index] : nil
+        }
         continuation?.resume()
     }
 }
@@ -1632,6 +1859,53 @@ private final class ManualOverviewUpdateSource: OverviewUpdateSource, @unchecked
 
     func send() {
         continuation.yield(())
+    }
+}
+
+private final class RestartingManualOverviewUpdateSource: OverviewUpdateSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [AsyncStream<Void>.Continuation] = []
+
+    func overviewRefreshEvents() -> AsyncStream<Void> {
+        AsyncStream { continuation in
+            lock.withLock {
+                continuations.append(continuation)
+            }
+        }
+    }
+
+    func send() {
+        let continuation = lock.withLock { continuations.last }
+        continuation?.yield(())
+    }
+
+    func finishCurrentStream() {
+        let continuation = lock.withLock { continuations.last }
+        continuation?.finish()
+    }
+
+    func waitForSubscriptions(
+        count: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while lock.withLock({ continuations.count < count }), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        if lock.withLock({ continuations.count < count }) {
+            Issue.record("expected \(count) update subscriptions", sourceLocation: sourceLocation)
+        }
+    }
+}
+
+private final class RearmDelayRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var attempts: [Int] = []
+
+    func append(_ attempt: Int) {
+        lock.withLock {
+            attempts.append(attempt)
+        }
     }
 }
 

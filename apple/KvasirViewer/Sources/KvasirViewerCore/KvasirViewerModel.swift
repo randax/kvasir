@@ -81,7 +81,7 @@ public final class KvasirViewerModel: ObservableObject {
     @Published public private(set) var selectedHarness: OverviewHarnessName?
     @Published public private(set) var selectedSession: OverviewSessionRoute?
     @Published public private(set) var selectedPrompt: OverviewPromptRoute?
-    @Published public var selectedRangePreset: OverviewRangePreset
+    @Published public private(set) var selectedRangePreset: OverviewRangePreset
 
     public var isTraceInspectorEnabled: Bool {
         traceInspector != nil
@@ -99,9 +99,13 @@ public final class KvasirViewerModel: ObservableObject {
     private let launchAgent: DaemonLaunchAgent
     private let shouldRefreshLaunchAgentAfterStartupOverviewError: (any Error) -> Bool
     private let enablePostStartupOverviewRecovery: @Sendable () -> Void
+    private let liveOverviewUpdateRearmDelay: @Sendable (Int) async throws -> Void
     private let now: () -> Date
     private let calendar: Calendar
     private var overviewLoadID: UInt64 = 0
+    private var inFlightOverviewLoads = 0
+    private var pendingLiveOverviewRefresh = false
+    private var pendingLiveOverviewRefreshTask: Task<Void, Never>?
     private var traceInspectorLoadID: UInt64 = 0
     private var liveOverviewUpdates: Task<Void, Never>?
 
@@ -115,6 +119,7 @@ public final class KvasirViewerModel: ObservableObject {
         shouldRefreshLaunchAgentAfterStartupOverviewError: @escaping (any Error) -> Bool = { _ in false },
         enablePostStartupOverviewRecovery: @escaping @Sendable () -> Void = {},
         selectedRangePreset: OverviewRangePreset = .lastSevenDays,
+        liveOverviewUpdateRearmDelay: @escaping @Sendable (Int) async throws -> Void = KvasirViewerModel.defaultLiveOverviewUpdateRearmDelay,
         now: @escaping () -> Date = Date.init,
         calendar: Calendar = .kvasirRollupUTC
     ) {
@@ -127,8 +132,14 @@ public final class KvasirViewerModel: ObservableObject {
         self.shouldRefreshLaunchAgentAfterStartupOverviewError = shouldRefreshLaunchAgentAfterStartupOverviewError
         self.enablePostStartupOverviewRecovery = enablePostStartupOverviewRecovery
         self.selectedRangePreset = selectedRangePreset
+        self.liveOverviewUpdateRearmDelay = liveOverviewUpdateRearmDelay
         self.now = now
         self.calendar = calendar
+    }
+
+    public static func defaultLiveOverviewUpdateRearmDelay(attempt: Int) async throws {
+        let milliseconds = min(500 * attempt, 5_000)
+        try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
     }
 
     public func start() async throws {
@@ -154,8 +165,8 @@ public final class KvasirViewerModel: ObservableObject {
     }
 
     public func selectRangePreset(_ preset: OverviewRangePreset) async throws {
-        selectedRangePreset = preset
-        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil) {
+        try await refreshOverview(repo: selectedRepo, model: selectedModel, harness: selectedHarness, session: nil, prompt: nil, rangePreset: preset) {
+            selectedRangePreset = preset
             selectedSession = nil
             selectedPrompt = nil
             clearTraceInspector()
@@ -274,11 +285,62 @@ public final class KvasirViewerModel: ObservableObject {
         harness: OverviewHarnessName?,
         session: OverviewSessionRoute? = nil,
         prompt: OverviewPromptRoute? = nil,
+        rangePreset: OverviewRangePreset? = nil,
         beforeCommit: () -> Void = {}
+    ) async throws {
+        defer {
+            schedulePendingLiveOverviewRefreshIfNeeded()
+        }
+        try await performOverviewRefresh(
+            repo: repo,
+            model: model,
+            harness: harness,
+            session: session,
+            prompt: prompt,
+            rangePreset: rangePreset,
+            beforeCommit: beforeCommit
+        )
+    }
+
+    private func schedulePendingLiveOverviewRefreshIfNeeded() {
+        guard pendingLiveOverviewRefresh,
+              inFlightOverviewLoads == 0,
+              pendingLiveOverviewRefreshTask == nil else {
+            return
+        }
+        pendingLiveOverviewRefresh = false
+        pendingLiveOverviewRefreshTask = Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            pendingLiveOverviewRefreshTask = nil
+            guard inFlightOverviewLoads == 0 else {
+                // A load started before this task ran; its completion reschedules.
+                pendingLiveOverviewRefresh = true
+                return
+            }
+            do {
+                try await refreshOverview()
+            } catch {
+                record(error: error)
+            }
+        }
+    }
+
+    private func performOverviewRefresh(
+        repo: OverviewRepoBucket?,
+        model: OverviewModelName?,
+        harness: OverviewHarnessName?,
+        session: OverviewSessionRoute?,
+        prompt: OverviewPromptRoute?,
+        rangePreset: OverviewRangePreset?,
+        beforeCommit: () -> Void
     ) async throws {
         overviewLoadID += 1
         let loadID = overviewLoadID
-        let range = selectedRangePreset.range(containing: now(), calendar: calendar)
+        inFlightOverviewLoads += 1
+        defer { inFlightOverviewLoads -= 1 }
+        let range = (rangePreset ?? selectedRangePreset).range(containing: now(), calendar: calendar)
         do {
             let snapshot = try await dashboard.load(
                 range: range,
@@ -405,18 +467,38 @@ public final class KvasirViewerModel: ObservableObject {
         guard liveOverviewUpdates == nil else {
             return
         }
-        liveOverviewUpdates = Task { [weak self, dashboard] in
-            for await _ in dashboard.overviewRefreshEvents() {
-                guard let self else {
+        liveOverviewUpdates = Task { [weak self, dashboard, liveOverviewUpdateRearmDelay] in
+            var rearmAttempt = 0
+            while !Task.isCancelled {
+                guard let refreshEvents = dashboard.overviewRefreshEvents() else {
                     return
                 }
-                guard !Task.isCancelled else {
+                for await _ in refreshEvents {
+                    guard let self else {
+                        return
+                    }
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    rearmAttempt = 0
+                    guard inFlightOverviewLoads == 0 else {
+                        pendingLiveOverviewRefresh = true
+                        continue
+                    }
+                    do {
+                        try await refreshOverview()
+                    } catch {
+                        record(error: error)
+                    }
+                }
+                guard self != nil, !Task.isCancelled else {
                     return
                 }
+                rearmAttempt += 1
                 do {
-                    try await refreshOverview()
+                    try await liveOverviewUpdateRearmDelay(rearmAttempt)
                 } catch {
-                    record(error: error)
+                    return
                 }
             }
         }
@@ -424,6 +506,7 @@ public final class KvasirViewerModel: ObservableObject {
 
     deinit {
         liveOverviewUpdates?.cancel()
+        pendingLiveOverviewRefreshTask?.cancel()
     }
 }
 
