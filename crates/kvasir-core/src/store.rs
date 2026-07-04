@@ -59,6 +59,8 @@ const POST_COMMIT_VACUUM_TASK: &str = "post_commit_vacuum";
 pub enum StoreError {
     #[error("sqlite failed")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("sqlite refused to enable wal journal mode")]
+    WalNotEnabled,
     #[error("sqlite schema version {found} is newer than supported version {supported}")]
     IncompatibleSchema { found: i64, supported: i64 },
     #[error("non-monotonic cumulative tool-call counter")]
@@ -379,9 +381,7 @@ impl UsageStore {
     pub fn open_reader(path: impl AsRef<Path>, key: &StoreKey) -> Result<Self, StoreError> {
         let connection = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         apply_database_key(&connection, key)?;
         apply_busy_timeout(&connection)?;
@@ -389,6 +389,24 @@ impl UsageStore {
             connection,
             price_table: PriceTable::bundled_defaults(),
         })
+    }
+
+    /// Runs a read-only operation inside a single deferred transaction so
+    /// every statement sees one WAL snapshot, even while a writer on another
+    /// connection commits concurrently.
+    pub fn with_read_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.connection.execute_batch("BEGIN DEFERRED;")?;
+        let result = operation(self);
+        let end = self.connection.execute_batch(match result {
+            Ok(_) => "COMMIT;",
+            Err(_) => "ROLLBACK;",
+        });
+        let value = result?;
+        end?;
+        Ok(value)
     }
 
     pub fn ingest_token_usage(&mut self, records: &[TokenUsageRecord]) -> Result<(), StoreError> {
@@ -708,6 +726,10 @@ impl UsageStore {
              DELETE FROM canonical_token_usage;",
         )?;
         transaction.commit()?;
+        // secure_delete overwrites deleted rows in the main database, but the
+        // pre-delete page images persist in the WAL until a checkpoint;
+        // truncating honors the clear-my-data guarantee for the sidecar too.
+        truncate_wal(&self.connection)?;
         Ok(())
     }
 
@@ -5110,7 +5132,18 @@ fn enable_secure_delete(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn enable_wal_journal_mode(connection: &Connection) -> Result<(), StoreError> {
-    connection.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    // The pragma reports the resulting mode instead of erroring when WAL
+    // cannot be enabled, so the result must be checked explicitly.
+    let mode = connection
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(StoreError::WalNotEnabled);
+    }
+    Ok(())
+}
+
+fn truncate_wal(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
 }
 
@@ -5174,6 +5207,10 @@ fn attempt_pending_vacuum(connection: &Connection) {
                 params![POST_COMMIT_VACUUM_TASK],
             ) {
                 eprintln!("post-commit VACUUM task cleanup failed: {error:?}");
+            }
+            // Drop the evicted pages' pre-images from the WAL sidecar as well.
+            if let Err(error) = truncate_wal(connection) {
+                eprintln!("post-VACUUM WAL truncation failed: {error:?}");
             }
         }
         Err(error) => {
@@ -6098,7 +6135,80 @@ mod tests {
             100,
         )]);
 
-        assert!(outcome.is_err());
+        assert!(matches!(
+            outcome,
+            Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::ReadOnly,
+                    ..
+                },
+                _,
+            )))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn read_snapshot_is_stable_across_concurrent_commits() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let store_key = test_store_key();
+        let mut writer = UsageStore::open(&database_path, &store_key)?;
+        let reader = UsageStore::open_reader(&database_path, &store_key)?;
+
+        let (snapshot_entered_sender, snapshot_entered_receiver) = std::sync::mpsc::channel();
+        let (commit_done_sender, commit_done_receiver) = std::sync::mpsc::channel::<()>();
+        let snapshot_thread = std::thread::spawn(move || {
+            let snapshot = reader.with_read_snapshot(|store| {
+                let before = store.persisted_daily_token_rollups()?;
+                snapshot_entered_sender
+                    .send(())
+                    .expect("test channel closed");
+                commit_done_receiver.recv().expect("test channel closed");
+                let after = store.persisted_daily_token_rollups()?;
+                Ok((before, after))
+            });
+            (snapshot, reader)
+        });
+
+        snapshot_entered_receiver.recv()?;
+        writer.ingest_token_usage(&[usage_record(
+            "claude-opus-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            100,
+        )])?;
+        commit_done_sender.send(())?;
+
+        let (snapshot, reader) = snapshot_thread.join().expect("snapshot thread panicked");
+        let (before, after) = snapshot?;
+        assert_eq!(before, after);
+        assert_eq!(after, vec![]);
+        assert_eq!(reader.persisted_daily_token_rollups()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_all_data_truncates_the_wal_file() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database_path = temp.path().join("usage.sqlite3");
+        let wal_path = temp.path().join("usage.sqlite3-wal");
+        let mut store = open_test_store(&database_path)?;
+
+        store.ingest_token_usage(&[usage_record(
+            "claude-opus-4-20250514",
+            TokenMeasure::Input,
+            1_781_956_800_000,
+            1_781_956_700_000,
+            100,
+        )])?;
+        assert!(std::fs::metadata(&wal_path)?.len() > 0);
+
+        store.clear_all_data()?;
+
+        assert_eq!(std::fs::metadata(&wal_path)?.len(), 0);
         Ok(())
     }
 

@@ -6,12 +6,16 @@ use kvasir_core::{StoreError, StoreKey, UsageStore};
 const MAX_READ_CONNECTIONS: usize = 4;
 
 /// Runs store operations off the async runtime. Writes serialize on the
-/// single write connection behind a blocking mutex; reads run on pooled
-/// read-only connections so queries never queue behind ingest or
-/// maintenance. All SQLite work executes on the blocking thread pool.
+/// single write connection; reads run on pooled read-only connections so
+/// queries never queue behind ingest or maintenance. All SQLite work
+/// executes on the blocking thread pool.
 #[derive(Clone)]
 pub(crate) struct StoreHandle {
     writer: Arc<Mutex<UsageStore>>,
+    // Queues pending writes on the async side; without it every waiting
+    // write would park one blocking-pool thread on the mutex for the whole
+    // duration of an in-flight VACUUM.
+    write_turn: Arc<tokio::sync::Semaphore>,
     readers: ReaderPool,
 }
 
@@ -19,6 +23,7 @@ impl StoreHandle {
     pub(crate) fn new(store: UsageStore, database_path: PathBuf, key: StoreKey) -> Self {
         Self {
             writer: Arc::new(Mutex::new(store)),
+            write_turn: Arc::new(tokio::sync::Semaphore::new(1)),
             readers: ReaderPool::new(database_path, key),
         }
     }
@@ -29,8 +34,13 @@ impl StoreHandle {
         F: FnOnce(&mut UsageStore) -> T + Send + 'static,
         T: Send + 'static,
     {
+        let permit = Arc::clone(&self.write_turn)
+            .acquire_owned()
+            .await
+            .expect("store write semaphore closed");
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             // A poisoning panic cannot leave the store inconsistent: rusqlite
             // rolls back any transaction dropped mid-flight.
             let mut store = writer
@@ -42,7 +52,8 @@ impl StoreHandle {
         .expect("store write operation panicked")
     }
 
-    /// Runs a query on a pooled read-only connection.
+    /// Runs a query on a pooled read-only connection. Every statement in
+    /// `operation` sees one consistent snapshot of the database.
     pub(crate) async fn read<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         F: FnOnce(&UsageStore) -> Result<T, StoreError> + Send + 'static,
@@ -92,10 +103,14 @@ impl ReaderPool {
                 Some(reader) => reader,
                 None => UsageStore::open_reader(database_path.as_path(), &key)?,
             };
-            let result = operation(&reader);
-            idle.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(reader);
+            let result = reader.with_read_snapshot(operation);
+            // A failed operation may indicate a broken connection; drop it
+            // and let the next read open a fresh one.
+            if result.is_ok() {
+                idle.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(reader);
+            }
             result
         })
         .await

@@ -1425,16 +1425,22 @@ async fn import_available_raw_bodies(state: &DaemonState) -> Result<bool, Ingest
     if has_completed_event_keys || !import_failures.is_empty() {
         state
             .store
-            .write(move |store| -> Result<(), StoreError> {
-                store.complete_raw_body_imports(&completed_event_keys)?;
-                store.record_raw_body_import_failures(&import_failures)?;
+            .write(move |store| -> Result<(), IngestError> {
+                store
+                    .complete_raw_body_imports(&completed_event_keys)
+                    .map_err(|error| {
+                        eprintln!("raw body import completion failed: {error:?}");
+                        IngestError::StoreWriteFailed
+                    })?;
+                store
+                    .record_raw_body_import_failures(&import_failures)
+                    .map_err(|error| {
+                        eprintln!("raw body import failure recording failed: {error:?}");
+                        IngestError::StoreWriteFailed
+                    })?;
                 Ok(())
             })
-            .await
-            .map_err(|error| {
-                eprintln!("raw body import completion failed: {error:?}");
-                IngestError::StoreWriteFailed
-            })?;
+            .await?;
     }
 
     if stores_new_body {
